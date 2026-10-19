@@ -56,7 +56,9 @@ pub struct Hello {
 pub enum Packet {
     Hello(Hello),
     /// входящий звонок (host -> joiner), joiner ждёт решения
-    Incoming { modes: Vec<u8> },
+    Incoming {
+        modes: Vec<u8>,
+    },
     Accept {
         mode: u8,
         host_pub: [u8; 32],
@@ -67,17 +69,42 @@ pub enum Packet {
         /// имя хоста (до name_to_bytes максимум)
         name: String,
     },
-    Decline { reason: u8 },
-    Ping { msg_id: u64, ts_ms: u64 },
-    Pong { msg_id: u64, ts_ms: u64 },
+    Decline {
+        reason: u8,
+    },
+    Ping {
+        msg_id: u64,
+        ts_ms: u64,
+    },
+    Pong {
+        msg_id: u64,
+        ts_ms: u64,
+    },
     /// готовый opus-кадр (payload < AUDIO_PAYLOAD_MAX)
-    Audio { ssrc: u32, seq: u32, payload: Vec<u8> },
-    Text { msg_id: u32, text: String },
-    Ack { msg_id: u32 },
-    Status { mute_mic: bool, deaf: bool, lvl: u8 },
-    Bye { reason: u8 },
+    Audio {
+        ssrc: u32,
+        seq: u32,
+        payload: Vec<u8>,
+    },
+    Text {
+        msg_id: u32,
+        text: String,
+    },
+    Ack {
+        msg_id: u32,
+    },
+    Status {
+        mute_mic: bool,
+        deaf: bool,
+        lvl: u8,
+    },
+    Bye {
+        reason: u8,
+    },
     /// регистрация комнаты на ретрансляторе (`remember-me --server`)
-    RelayReg { room: [u8; 4] },
+    RelayReg {
+        room: [u8; 4],
+    },
 }
 
 /// Класс пакетов по первому байту — нужна ли расшифровка
@@ -103,7 +130,9 @@ pub fn name_to_bytes(name: &str) -> [u8; NAME_BYTES] {
     let mut out = [0u8; NAME_BYTES];
     let mut copy = String::new();
     for c in name.chars() {
-        if copy.len() + c.len_utf8() > NAME_BYTES { break; }
+        if copy.len() + c.len_utf8() > NAME_BYTES {
+            break;
+        }
         copy.push(c);
     }
     out[..copy.len()].copy_from_slice(copy.as_bytes());
@@ -117,7 +146,9 @@ pub fn name_from_bytes(b: &[u8]) -> String {
 
 fn modes_to_wire(modes: &[u8], buf: &mut Vec<u8>) {
     buf.push(modes.len().min(4) as u8);
-    for m in modes.iter().take(4) { buf.push(*m); }
+    for m in modes.iter().take(4) {
+        buf.push(*m);
+    }
 }
 
 fn parse_modes(off: usize, b: &[u8]) -> Option<Vec<u8>> {
@@ -170,7 +201,13 @@ impl Cipher {
         let nonce = Self::nonce(&self.prefix_tx, counter);
         let ct = self
             .aead
-            .encrypt(&nonce, Payload { msg: pt, aad: clear })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: pt,
+                    aad: clear,
+                },
+            )
             .expect("xchacha20poly1305 шифрование");
         let mut out = Vec::with_capacity(clear.len() + ct.len());
         out.extend_from_slice(clear);
@@ -225,7 +262,11 @@ impl Cipher {
                 pt.push(OP_ACK);
                 pt.extend_from_slice(&msg_id.to_be_bytes());
             }
-            Packet::Status { mute_mic, deaf, lvl } => {
+            Packet::Status {
+                mute_mic,
+                deaf,
+                lvl,
+            } => {
                 pt.push(OP_STATUS);
                 pt.push((*mute_mic as u8) | ((*deaf as u8) << 1) | ((lvl / 2) << 2));
             }
@@ -266,7 +307,14 @@ impl Packet {
                 b.push(OP_INCOMING);
                 modes_to_wire(modes, &mut b);
             }
-            Packet::Accept { mode, host_pub, prefixes, ssrc_joiner, ssrc_host, name } => {
+            Packet::Accept {
+                mode,
+                host_pub,
+                prefixes,
+                ssrc_joiner,
+                ssrc_host,
+                name,
+            } => {
                 b.push(OP_ACCEPT);
                 b.push(*mode);
                 b.extend_from_slice(host_pub);
@@ -289,28 +337,40 @@ impl Packet {
     }
 
     pub fn parse_open(b: &[u8]) -> Option<Packet> {
-        if b.is_empty() { return None; }
+        if b.is_empty() {
+            return None;
+        }
         match b[0] {
             OP_HELLO => {
-                if b.len() < 1 + NAME_BYTES + 32 + 1 { return None; }
+                if b.len() < 1 + NAME_BYTES + 32 + 1 {
+                    return None;
+                }
                 let name = name_from_bytes(&b[1..1 + NAME_BYTES]);
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&b[33..65]);
                 let modes = parse_modes(65, b)?;
-                Some(Packet::Hello(Hello { name, pub_key: key, modes }))
+                Some(Packet::Hello(Hello {
+                    name,
+                    pub_key: key,
+                    modes,
+                }))
             }
             OP_INCOMING => {
                 let modes = parse_modes(1, b)?;
                 Some(Packet::Incoming { modes })
             }
             OP_ACCEPT => {
-                if b.len() < 1 + 1 + 32 + 32 + 4 + 4 + NAME_BYTES { return None; }
+                if b.len() < 1 + 1 + 32 + 32 + 4 + 4 + NAME_BYTES {
+                    return None;
+                }
                 let mut host_pub = [0u8; 32];
                 host_pub.copy_from_slice(&b[2..34]);
                 let mut prefixes = [0u8; 32];
                 prefixes.copy_from_slice(&b[34..66]);
-                let mut a = [0u8; 4]; a.copy_from_slice(&b[66..70]);
-                let mut c = [0u8; 4]; c.copy_from_slice(&b[70..74]);
+                let mut a = [0u8; 4];
+                a.copy_from_slice(&b[66..70]);
+                let mut c = [0u8; 4];
+                c.copy_from_slice(&b[70..74]);
                 Some(Packet::Accept {
                     mode: b[1],
                     host_pub,
@@ -320,9 +380,13 @@ impl Packet {
                     name: name_from_bytes(&b[74..74 + NAME_BYTES]),
                 })
             }
-            OP_DECLINE => Some(Packet::Decline { reason: *b.get(1).unwrap_or(&0) }),
+            OP_DECLINE => Some(Packet::Decline {
+                reason: *b.get(1).unwrap_or(&0),
+            }),
             OP_RELAY_REG => {
-                if b.len() < 5 { return None; }
+                if b.len() < 5 {
+                    return None;
+                }
                 let mut room = [0u8; 4];
                 room.copy_from_slice(&b[1..5]);
                 Some(Packet::RelayReg { room })
@@ -341,24 +405,37 @@ impl Packet {
 
     /// Парсинг зашифрованного пакета. Управление: counter строго нарастающий
     /// (внутри себя), для AUDIO — seq без дублей.
-    pub fn decrypt_wire(c: &Cipher, wire: &[u8], last_ctl: &mut u64, last_aud_seq: &mut u32) -> Option<Packet> {
-        if wire.len() < 9 + 16 { return None; }
+    pub fn decrypt_wire(
+        c: &Cipher,
+        wire: &[u8],
+        last_ctl: &mut u64,
+        last_aud_seq: &mut u32,
+    ) -> Option<Packet> {
+        if wire.len() < 9 + 16 {
+            return None;
+        }
         let clear = &wire[..9];
         let ct = &wire[9..];
         match clear[0] {
             OP_AUDIO => {
-                let mut s = [0u8; 4]; s.copy_from_slice(&clear[5..9]);
+                let mut s = [0u8; 4];
+                s.copy_from_slice(&clear[5..9]);
                 let seq = u32::from_be_bytes(s);
                 // защита от дублей/replay (wrap-safe): новый seq должен «двигаться вперёд»
                 let forward = {
                     let diff = u32::wrapping_sub(seq, *last_aud_seq);
                     diff != 0 && diff < 0x4000_0000
                 };
-                if !forward { return None; }
+                if !forward {
+                    return None;
+                }
                 let pt = Cipher::decrypt_borrow(c, seq as u64, clear, ct)?;
-                if pt.len() < 2 || pt[0] != OP_AUDIO { return None; }
+                if pt.len() < 2 || pt[0] != OP_AUDIO {
+                    return None;
+                }
                 *last_aud_seq = seq;
-                let mut h = [0u8; 4]; h.copy_from_slice(&clear[1..5]);
+                let mut h = [0u8; 4];
+                h.copy_from_slice(&clear[1..5]);
                 Some(Packet::Audio {
                     ssrc: u32::from_be_bytes(h),
                     seq,
@@ -366,41 +443,60 @@ impl Packet {
                 })
             }
             OP_PING | OP_PONG | OP_TEXT | OP_ACK | OP_STATUS | OP_BYE => {
-                let mut b = [0u8; 8]; b.copy_from_slice(&clear[1..9]);
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&clear[1..9]);
                 let counter = u64::from_be_bytes(b);
-                if counter <= *last_ctl { return None; }
+                if counter <= *last_ctl {
+                    return None;
+                }
                 let pt = Cipher::decrypt_borrow(c, counter, clear, ct)?;
-                if pt.len() < 1 { return None; }
+                if pt.len() < 1 {
+                    return None;
+                }
                 let (op, body) = (pt[0], &pt[1..]);
-                if op != clear[0] { return None; }
+                if op != clear[0] {
+                    return None;
+                }
                 *last_ctl = counter;
                 match op {
                     OP_PING => {
-                        if body.len() < 16 { return None; }
+                        if body.len() < 16 {
+                            return None;
+                        }
                         Some(Packet::Ping {
                             msg_id: u64::from_be_bytes(body[0..8].try_into().unwrap()),
                             ts_ms: u64::from_be_bytes(body[8..16].try_into().unwrap()),
                         })
                     }
                     OP_PONG => {
-                        if body.len() < 16 { return None; }
+                        if body.len() < 16 {
+                            return None;
+                        }
                         Some(Packet::Pong {
                             msg_id: u64::from_be_bytes(body[0..8].try_into().unwrap()),
                             ts_ms: u64::from_be_bytes(body[8..16].try_into().unwrap()),
                         })
                     }
                     OP_TEXT => {
-                        if body.len() < 6 { return None; }
+                        if body.len() < 6 {
+                            return None;
+                        }
                         let n = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
-                        if body.len() < 6 + n { return None; }
+                        if body.len() < 6 + n {
+                            return None;
+                        }
                         Some(Packet::Text {
                             msg_id: u32::from_be_bytes(body[0..4].try_into().unwrap()),
                             text: String::from_utf8_lossy(&body[6..6 + n]).into_owned(),
                         })
                     }
                     OP_ACK => {
-                        if body.len() < 4 { return None; }
-                        Some(Packet::Ack { msg_id: u32::from_be_bytes(body[0..4].try_into().unwrap()) })
+                        if body.len() < 4 {
+                            return None;
+                        }
+                        Some(Packet::Ack {
+                            msg_id: u32::from_be_bytes(body[0..4].try_into().unwrap()),
+                        })
                     }
                     OP_STATUS => {
                         let f = body.first().copied().unwrap_or(0);
@@ -410,7 +506,9 @@ impl Packet {
                             lvl: (f >> 2).saturating_mul(2),
                         })
                     }
-                    OP_BYE => Some(Packet::Bye { reason: body.first().copied().unwrap_or(REASON_HANGUP) }),
+                    OP_BYE => Some(Packet::Bye {
+                        reason: body.first().copied().unwrap_or(REASON_HANGUP),
+                    }),
                     _ => None,
                 }
             }
@@ -424,7 +522,13 @@ impl Cipher {
     fn decrypt_borrow(&self, counter: u64, clear: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
         let nonce = Self::nonce(&self.prefix_rx, counter);
         self.aead
-            .decrypt(&nonce, Payload { msg: ct, aad: clear })
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ct,
+                    aad: clear,
+                },
+            )
             .ok()
     }
 }
@@ -434,27 +538,71 @@ mod tests {
     use super::*;
     use x25519_dalek::{PublicKey, StaticSecret};
 
+    #[test]
+    fn microphone_and_sound_status_survive_encryption_at_all_levels() {
+        let mut sender = Cipher::new(&[7; 32], &[9; 32], true);
+        let receiver = Cipher::new(&[7; 32], &[9; 32], false);
+        let (mut control, mut audio) = (0, 0);
+        for mute_mic in [false, true] {
+            for deaf in [false, true] {
+                for lvl in [0, 25, 50, 100] {
+                    let wire = Packet::encrypt_wire(
+                        &mut sender,
+                        &Packet::Status {
+                            mute_mic,
+                            deaf,
+                            lvl,
+                        },
+                    );
+                    match Packet::decrypt_wire(&receiver, &wire, &mut control, &mut audio) {
+                        Some(Packet::Status {
+                            mute_mic: m,
+                            deaf: d,
+                            lvl: l,
+                        }) => {
+                            assert_eq!((m, d, l), (mute_mic, deaf, lvl / 2 * 2));
+                        }
+                        other => panic!("status was not received: {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
     fn dh(a: &StaticSecret, b: &PublicKey) -> [u8; 32] {
         a.diffie_hellman(b).to_bytes()
     }
 
     #[test]
     fn cipher_roundtrip_files() {
-        let mut r = [0u8; 32]; rand_bytes(&mut r);
+        let mut r = [0u8; 32];
+        rand_bytes(&mut r);
         let sk = StaticSecret::from(r);
-        let mut r2 = [0u8; 32]; rand_bytes(&mut r2);
+        let mut r2 = [0u8; 32];
+        rand_bytes(&mut r2);
         let sk2 = StaticSecret::from(r2);
         let sh_a = dh(&sk, &PublicKey::from(&sk2));
         let sh_b = dh(&sk2, &PublicKey::from(&sk));
         assert_eq!(sh_a, sh_b, "DH shared должен совпадать");
 
-        let mut pf = [0u8; 32]; rand_bytes(&mut pf);
+        let mut pf = [0u8; 32];
+        rand_bytes(&mut pf);
         let mut a = Cipher::new(&sh_a, &pf, true);
         let mut b = Cipher::new(&sh_b, &pf, false);
 
-        let p1 = Packet::Text { msg_id: 7, text: "priv".into() };
-        let w = Packet::encrypt_wire(&mut a, &Packet::Text { msg_id: 7, text: "priv".into() });
-        let mut lc = 0u64; let mut la = 0u32;
+        let p1 = Packet::Text {
+            msg_id: 7,
+            text: "priv".into(),
+        };
+        let w = Packet::encrypt_wire(
+            &mut a,
+            &Packet::Text {
+                msg_id: 7,
+                text: "priv".into(),
+            },
+        );
+        let mut lc = 0u64;
+        let mut la = 0u32;
         let got = Packet::decrypt_wire(&b, &w, &mut lc, &mut la);
         match got {
             Some(Packet::Text { msg_id, text }) => assert_eq!((msg_id, text), (7, "priv".into())),
@@ -463,17 +611,30 @@ mod tests {
         let _ = p1;
 
         // Ping/pong round-trip
-        let w2 = Packet::encrypt_wire(&mut a, &Packet::Ping { msg_id: 3, ts_ms: 123456 });
+        let w2 = Packet::encrypt_wire(
+            &mut a,
+            &Packet::Ping {
+                msg_id: 3,
+                ts_ms: 123456,
+            },
+        );
         match Packet::decrypt_wire(&b, &w2, &mut lc, &mut la) {
             Some(Packet::Ping { msg_id, ts_ms }) => assert_eq!((msg_id, ts_ms), (3, 123456)),
             other => panic!("ping не расшифровался: {:?}", other),
         }
 
         // аудио-кадр
-        let w3 = Packet::encrypt_wire(&mut a, &Packet::Audio { ssrc: 99, seq: 4, payload: vec![1,2,3,4] });
+        let w3 = Packet::encrypt_wire(
+            &mut a,
+            &Packet::Audio {
+                ssrc: 99,
+                seq: 4,
+                payload: vec![1, 2, 3, 4],
+            },
+        );
         match Packet::decrypt_wire(&b, &w3, &mut lc, &mut la) {
             Some(Packet::Audio { ssrc, seq, payload }) => {
-                assert_eq!((ssrc, seq, payload), (99, 4, vec![1,2,3,4]));
+                assert_eq!((ssrc, seq, payload), (99, 4, vec![1, 2, 3, 4]));
             }
             other => panic!("audio не расшифровался: {:?}", other),
         }

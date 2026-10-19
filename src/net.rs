@@ -73,6 +73,7 @@ pub enum NetEvent {
     /// наше сообщение доставлено
     TextAck(u32),
     CallEnded(String),
+    Progress(String),
     Fatal(String),
 }
 
@@ -104,6 +105,8 @@ impl Session {
     pub fn stop(&mut self) {
         let _ = self.cmd_tx.send(NetCmd::Stop);
         self.killed.store(true, Ordering::Relaxed);
+        // Drop the membership guard even when cancelling a pending dial.
+        // Release the socket promptly so the same local port can be reused.
         self.handle.abort();
     }
 }
@@ -221,11 +224,11 @@ fn ssrc_rand() -> u32 {
 fn select_addr(target: &str) -> Option<SocketAddr> {
     use std::str::FromStr;
     if let Ok(a) = SocketAddr::from_str(target) {
-        return Some(a);
+        return a.is_ipv4().then_some(a);
     }
     if let Some((host, port)) = target.rsplit_once(':') {
         if let Ok(mut addrs) = (host, port.parse::<u16>().ok()?).to_socket_addrs() {
-            if let Some(a) = addrs.next() {
+            if let Some(a) = addrs.find(SocketAddr::is_ipv4) {
                 return Some(a);
             }
         }
@@ -260,18 +263,20 @@ async fn run_established(
     cmd_rx: &mut mpsc::UnboundedReceiver<NetCmd>,
     media_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     engine: Arc<AudioEngine>,
+    accepted_hello: Option<([u8; 32], Packet)>,
 ) -> Outcome {
     let mut peer = peer0;
     let mut last_ctl_rx: u64 = 0;
     let mut last_audio_seq_rx: u32 = 0;
     let mut last_rx = Instant::now();
-    let mut last_ping = Instant::now();
-    let mut last_status = Instant::now();
+    let mut last_ping = Instant::now() - KEEPALIVE_INTERVAL;
+    let mut last_status = Instant::now() - STATUS_SEND_INTERVAL;
     let mut ping_id: u64 = 0;
     let mut ping_sent: VecDeque<(u64, u64)> = VecDeque::new();
     let mut last_audio_seen = Instant::now();
     let mut peer_speaking = false;
     let mut audio_seq: u32 = 0;
+    let mut previous_audio_seq: Option<u32> = None;
     let mut msg_counter: u32 = 0;
     let mut pending_text: VecDeque<(u32, String, Instant, u32)> = VecDeque::new();
     let mut last_my_status = (engine.params.mute_mic(), engine.params.deaf());
@@ -291,8 +296,17 @@ async fn run_established(
                 };
                 // если мы заняты звонком, а нам дозвонился другой абонент — BUSY
                 if classify(&buf[..n]) == WireClass::Open {
-                    if let Some(Packet::Hello{..}) = Packet::parse_open(&buf[..n]) {
-                        send_open(&sock, from, &Packet::Decline { reason: REASON_BUSY }).await;
+                    if let Some(Packet::Hello(hello)) = Packet::parse_open(&buf[..n]) {
+                        // ACCEPT can be lost. A retry from this same dial campaign
+                        // must receive the same ACCEPT, rather than a BUSY response.
+                        if let Some((pub_key, accept)) = &accepted_hello
+                            && from == peer && hello.pub_key == *pub_key
+                        {
+                            dbg_net!("повтор HELLO: повторяем ACCEPT для {from}");
+                            send_open(&sock, from, accept).await;
+                        } else {
+                            send_open(&sock, from, &Packet::Decline { reason: REASON_BUSY }).await;
+                        }
                     }
                     continue;
                 }
@@ -317,10 +331,13 @@ async fn run_established(
                     eprintln!("[net] rx {} {} от {}", kind, classify(&buf[..n]) == WireClass::Secure, from);
                 }
                 match pkt {
-                    Some(Packet::Audio { payload, .. }) => {
+                    Some(Packet::Audio { payload, seq, .. }) => {
                         if payload.len() <= AUDIO_PAYLOAD_MAX {
                             last_audio_seen = Instant::now();
-                            if let Some(samples) = engine.decode_opus(&payload) {
+                            let missing = previous_audio_seq.map_or(0, |previous| seq.wrapping_sub(previous).saturating_sub(1));
+                            previous_audio_seq = Some(seq);
+                            if missing > 0 { dbg_net!("audio: восстанавливаем {} пропущенных кадров", missing.min(3)); }
+                            if let Some(samples) = engine.decode_opus(&payload, missing) {
                                 engine.push_out(&samples);
                             }
                             if !peer_speaking {
@@ -516,7 +533,7 @@ async fn run_host(
         tokio::net::lookup_host(&cfg.server_addr)
             .await
             .ok()
-            .and_then(|mut it| it.next())
+            .and_then(|mut it| it.find(SocketAddr::is_ipv4))
     };
     if let Some(s) = server {
         dbg_net!("host: комната через сервер {}", s);
@@ -535,6 +552,11 @@ async fn run_host(
         room = Some(code);
         dbg_net!("host: код комнаты {}", room_to_string(&code));
     }
+    let _membership = server
+        .zip(room)
+        .map(|(addr, code)| remember_me::server::Membership::new(sock.clone(), addr, code));
+    let mut registration_tick = tokio::time::interval(Duration::from_secs(4));
+    registration_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     #[allow(unused_assignments)] // incoming пере-/перезаписывается в select
     loop {
@@ -543,8 +565,7 @@ async fn run_host(
 
         // фаза 1: ждём HELLO
         let mut incoming: Option<(String, [u8; 32], Vec<u8>, SocketAddr)> = None;
-        let mut reg_tick: u32 = 0;
-        // регистрируем комнату (если сервер настроен) — каждые ~4.5 с держим TTL
+        // регистрируем комнату (если сервер настроен) — каждые 4 с держим TTL
         if let Some(s) = server {
             if let Some(code) = room {
                 let _ = sock
@@ -557,6 +578,7 @@ async fn run_host(
             tokio::select! {
                 res = sock.recv_from(&mut buf) => {
                     if let Ok((n, from)) = res {
+                        if server.is_some_and(|s| s != from) { continue; }
                         if let Some(Packet::Hello(h)) = Packet::parse_open(&buf[..n]) {
                             dbg_net!("host: HELLO от {} pub[:5]={:02x?}", from, &h.pub_key[..5]);
                             incoming = Some((h.name, h.pub_key, h.modes, from));
@@ -568,20 +590,11 @@ async fn run_host(
                     Some(NetCmd::Stop) | None => return,
                     _ => {}
                 },
-                _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                _ = registration_tick.tick() => {
                     while media_rx.try_recv().is_ok() {}
                     if killed.load(Ordering::Relaxed) { return; }
-                    reg_tick += 1;
-                    if reg_tick >= 30 {
-                        reg_tick = 0;
-                        if let Some(s) = server {
-                            if let Some(code) = room {
-                                let _ = sock
-                                    .send_to(&Packet::RelayReg { room: code }.encode_open(), s)
-                                    .await
-                                    .unwrap_or(0);
-                            }
-                        }
+                    if let Some(s) = server && let Some(code) = room {
+                        send_open(&sock, s, &Packet::RelayReg { room: code }).await;
                     }
                 }
             }
@@ -615,6 +628,15 @@ async fn run_host(
             addr: shown_addr,
         });
         let mut accepted: Option<bool> = None;
+        let decision_deadline = tokio::time::Instant::now() + ACCEPT_WAIT;
+        send_open(
+            &sock,
+            from,
+            &Packet::Incoming {
+                modes: vec![MODE_XCHACHA20POLY1305],
+            },
+        )
+        .await;
         while accepted.is_none() {
             tokio::select! {
                 maybe = cmd_rx.recv() => match maybe {
@@ -627,10 +649,22 @@ async fn run_host(
                     _ => {}
                 },
                 res = sock.recv_from(&mut buf) => {
-                    // повторные HELLO (абонент всё ещё ждёт) — просто игнор
-                    let _ = res;
+                    if let Ok((n, source)) = res
+                        && let Some(Packet::Hello(hello)) = Packet::parse_open(&buf[..n])
+                    {
+                        if source == from && hello.pub_key == pub_key {
+                            send_open(&sock, source, &Packet::Incoming { modes: vec![MODE_XCHACHA20POLY1305] }).await;
+                        } else {
+                            send_open(&sock, source, &Packet::Decline { reason: REASON_BUSY }).await;
+                        }
+                    }
                 }
-                _ = tokio::time::sleep_until((Instant::now() + ACCEPT_WAIT).into()) => {
+                _ = registration_tick.tick() => {
+                    if let Some(s) = server && let Some(code) = room {
+                        send_open(&sock, s, &Packet::RelayReg { room: code }).await;
+                    }
+                }
+                _ = tokio::time::sleep_until(decision_deadline) => {
                     while media_rx.try_recv().is_ok() {}
                     send_open(&sock, from, &Packet::Decline { reason: REASON_TIMEOUT }).await;
                     let _ = events.send(NetEvent::CallEnded("звонок сорвался".into()));
@@ -697,6 +731,7 @@ async fn run_host(
             &mut cmd_rx,
             &mut media_rx,
             engine.clone(),
+            Some((pub_key, acc)),
         )
         .await;
 
@@ -745,6 +780,14 @@ async fn run_joiner(
     }
 
     let mut buf = vec![0u8; MTU];
+    let relay_addr = if room.is_some() {
+        select_addr(&addr_str)
+    } else {
+        None
+    };
+    let _membership = relay_addr
+        .zip(room)
+        .map(|(addr, code)| remember_me::server::Membership::new(sock.clone(), addr, code));
 
     #[allow(unused_assignments)]
     'outer: loop {
@@ -809,20 +852,31 @@ async fn run_joiner(
             let _ = sock.send_to(&hello_wire, addr).await.unwrap_or(0);
 
             // ожидание ACCEPT / DECLINE
-            let reply = tokio::select! {
-                res = sock.recv_from(&mut buf) => {
-                    match res {
-                        Ok((n, from)) if from == addr => Some((n, from)),
-                        Ok(_) => None,
-                        Err(_) => None,
+            let reply_deadline = tokio::time::Instant::now() + HANDSHAKE_REPLY_WAIT;
+            let reply = loop {
+                tokio::select! {
+                    res = sock.recv_from(&mut buf) => {
+                        match res {
+                            Ok((n, from)) if from == addr => {
+                                match Packet::parse_open(&buf[..n]) {
+                                    Some(Packet::Incoming { .. }) => {
+                                        let _ = events.send(NetEvent::Progress(
+                                            "вызов доставлен хосту; ждём принятия клавишей Enter".into()));
+                                    }
+                                    Some(Packet::Accept { .. } | Packet::Decline { .. }) => break Some((n, from)),
+                                    _ => {}
+                                }
+                            }
+                            Ok(_) => {},
+                            Err(_) => break None,
+                        }
                     }
+                    maybe = cmd_rx.recv() => match maybe {
+                        Some(NetCmd::Stop | NetCmd::HangUp { .. }) | None => break 'outer,
+                        _ => {},
+                    },
+                    _ = tokio::time::sleep_until(reply_deadline) => break None,
                 }
-                maybe = cmd_rx.recv() => match maybe {
-                    Some(NetCmd::Stop) | None => break 'outer,
-                    Some(NetCmd::HangUp { .. }) => break 'outer,
-                    _ => None,
-                },
-                _ = tokio::time::sleep(HANDSHAKE_REPLY_WAIT) => None,
             };
 
             match reply {
@@ -913,6 +967,7 @@ async fn run_joiner(
             &mut cmd_rx,
             &mut media_rx,
             engine.clone(),
+            None,
         )
         .await;
 

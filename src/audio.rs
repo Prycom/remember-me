@@ -10,12 +10,14 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use crate::noise_suppress::NoiseSuppressor;
+use crate::voice_level::{PeakLimiter, SpeechFilter, SpeechLeveler, VoiceGate};
 use cpal::Sample as _;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use opusic_sys::{
     OPUS_APPLICATION_VOIP, OPUS_OK, OPUS_SET_BITRATE_REQUEST, OPUS_SET_DTX_REQUEST,
     OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST, OPUS_SET_VBR_REQUEST,
-    opus_decode, opus_decoder_create, opus_decoder_destroy, opus_encode, opus_encoder_create,
+    opus_decode_float, opus_decoder_create, opus_decoder_destroy, opus_encode, opus_encoder_create,
     opus_encoder_ctl, opus_encoder_destroy,
 };
 
@@ -31,7 +33,6 @@ macro_rules! dbg_audio {
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const FRAME_SAMPLES: usize = 960; // 20 мс моно @48k
 pub const BITRATE: i32 = 32_000;
-pub const HANGOVER_FRAMES: u32 = 10;
 pub const ECHO_DELAY_MS: u64 = 250;
 /// маркер «устройство ещё не подключено»
 const NEVER: &str = "\0";
@@ -109,24 +110,42 @@ impl Decoder {
     }
 
     pub fn decode(&mut self, pkt: &[u8]) -> Result<Vec<f32>, String> {
-        let mut pcm = [0i16; FRAME_SAMPLES];
+        self.decode_frame(Some(pkt), false)
+    }
+
+    fn decode_frame(&mut self, pkt: Option<&[u8]>, fec: bool) -> Result<Vec<f32>, String> {
+        // Keep codec overshoots in float until the playback limiter. Decoding
+        // into i16 would clip them before the limiter can preserve the wave.
+        let mut pcm = [0f32; FRAME_SAMPLES];
         let n = unsafe {
-            opus_decode(
+            opus_decode_float(
                 self.ptr.cast(),
-                pkt.as_ptr(),
-                pkt.len() as i32,
+                pkt.map_or(std::ptr::null(), |p| p.as_ptr()),
+                pkt.map_or(0, |p| p.len() as i32),
                 pcm.as_mut_ptr(),
                 FRAME_SAMPLES as i32,
-                0,
+                i32::from(fec),
             )
         };
         if n < 0 {
             return Err(format!("opus_decode: {n}"));
         }
-        Ok(pcm[..n as usize]
-            .iter()
-            .map(|&s| s as f32 / 32768.0)
-            .collect())
+        Ok(pcm[..n as usize].to_vec())
+    }
+
+    /// Preserve the codec timeline on packet loss. Recover the most recent
+    /// missing frame using in-band FEC (PLC if absent), earlier ones by PLC.
+    fn decode_with_loss(&mut self, pkt: &[u8], missing: u32) -> Result<Vec<f32>, String> {
+        let missing = missing.min(3);
+        let mut samples = Vec::with_capacity((missing as usize + 1) * FRAME_SAMPLES);
+        for i in 0..missing {
+            samples.extend(self.decode_frame(
+                if i + 1 == missing { Some(pkt) } else { None },
+                i + 1 == missing,
+            )?);
+        }
+        samples.extend(self.decode(pkt)?);
+        Ok(samples)
     }
 }
 
@@ -147,10 +166,10 @@ fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt()
 }
 
-/// 0..100 maps to -60..-20 dBFS (25 = -50 dBFS). Compare amplitudes,
+/// 0..100 maps to -70..-30 dBFS (25 = -60 dBFS). Compare amplitudes,
 /// not signal power; a normal microphone is often much quieter than -20 dBFS.
 fn vad_amplitude(threshold: u8) -> f32 {
-    10.0_f32.powf((-60.0 + threshold.min(100) as f32 * 0.4) / 20.0)
+    10.0_f32.powf((-70.0 + threshold.min(100) as f32 * 0.4) / 20.0)
 }
 
 fn level_percent(samples: &[f32]) -> u8 {
@@ -217,6 +236,10 @@ pub struct AudioParams {
     ptt_active: Arc<AtomicBool>,
     vox_mode: Arc<AtomicBool>,
     loopback: Arc<AtomicBool>,
+    auto_gain: Arc<AtomicBool>,
+    voice_filter: Arc<AtomicBool>,
+    noise_suppression: Arc<AtomicBool>,
+    input_clipping: Arc<AtomicBool>,
     /// уровень микрофона после gain, 0..100% (для индикатора на экране)
     in_level: Arc<AtomicU8>,
     out_level: Arc<AtomicU8>,
@@ -234,6 +257,10 @@ impl AudioParams {
             ptt_active: Arc::new(AtomicBool::new(false)),
             vox_mode: Arc::new(AtomicBool::new(true)),
             loopback: Arc::new(AtomicBool::new(false)),
+            auto_gain: Arc::new(AtomicBool::new(true)),
+            voice_filter: Arc::new(AtomicBool::new(false)),
+            noise_suppression: Arc::new(AtomicBool::new(false)),
+            input_clipping: Arc::new(AtomicBool::new(false)),
             in_level: Arc::new(AtomicU8::new(0)),
             out_level: Arc::new(AtomicU8::new(0)),
         }
@@ -259,17 +286,29 @@ impl AudioParams {
     pub fn gain_peer(&self) -> u8 {
         self.gain_peer.load(Ordering::Relaxed).min(200) as u8
     }
+    pub fn set_voice_filter(&self, enabled: bool) {
+        self.voice_filter.store(enabled, Ordering::Relaxed);
+    }
+    pub fn voice_filter(&self) -> bool {
+        self.voice_filter.load(Ordering::Relaxed)
+    }
+    pub fn set_noise_suppression(&self, enabled: bool) {
+        self.noise_suppression.store(enabled, Ordering::Relaxed);
+    }
+    pub fn noise_suppression(&self) -> bool {
+        self.noise_suppression.load(Ordering::Relaxed)
+    }
+    pub fn input_clipping(&self) -> bool {
+        self.input_clipping.load(Ordering::Relaxed)
+    }
     pub fn set_mute_mic(&self, v: bool) {
         self.mute_mic.store(v, Ordering::Relaxed);
     }
     pub fn mute_mic(&self) -> bool {
-        self.mute_mic.load(Ordering::Relaxed)
+        self.mute_mic.load(Ordering::Relaxed) || self.deaf()
     }
     pub fn set_deaf(&self, v: bool) {
         self.deaf.store(v, Ordering::Relaxed);
-        if v {
-            self.mute_mic.store(true, Ordering::Relaxed);
-        }
     }
     pub fn deaf(&self) -> bool {
         self.deaf.load(Ordering::Relaxed)
@@ -300,6 +339,12 @@ impl AudioParams {
     }
     pub fn loopback(&self) -> bool {
         self.loopback.load(Ordering::Relaxed)
+    }
+    pub fn auto_gain(&self) -> bool {
+        self.auto_gain.load(Ordering::Relaxed)
+    }
+    pub fn set_auto_gain(&self, value: bool) {
+        self.auto_gain.store(value, Ordering::Relaxed);
     }
 }
 
@@ -575,6 +620,10 @@ struct OutFeed {
     phase: f64,
     rate_out: f64,
     starved: u32,
+    limiter: PeakLimiter,
+    buffering: bool,
+    envelope: f32,
+    last_sample: f32,
 }
 
 impl OutFeed {
@@ -582,17 +631,34 @@ impl OutFeed {
     fn mono_fill(&mut self, out_mono: &mut [f32], gain: f32) {
         // сколько исходных (48k) сэмплов тратится на один выходной
         let step = SAMPLE_RATE as f64 / self.rate_out.max(1.0);
+        // Refill after each real gap, rather than only once before a call.
+        // 40 ms absorbs modest UDP jitter without a large voice latency.
+        if self.buffering && self.deq.len() >= 2 * FRAME_SAMPLES {
+            self.buffering = false;
+        }
+        let fade_step = 1.0 / (self.rate_out as f32 * 0.005).max(1.0);
+        let decay = (-1.0 / (self.rate_out as f32 * 0.001).max(1.0)).exp();
         for o in out_mono.iter_mut() {
             let i = self.phase.floor() as usize;
             let frac = (self.phase - i as f64) as f32;
-            if i < self.deq.len() && (frac < 1e-6 || i + 1 < self.deq.len()) {
+            if !self.buffering && i < self.deq.len() && (frac < 1e-6 || i + 1 < self.deq.len()) {
                 let next = self.deq.get(i + 1).copied().unwrap_or(self.deq[i]);
                 let s = self.deq[i] * (1.0 - frac) + next * frac;
-                *o = s * gain;
+                self.envelope = (self.envelope + fade_step).min(1.0);
+                self.last_sample = s * self.envelope;
+                *o = self.last_sample * gain;
                 self.starved = 0;
                 self.phase += step;
             } else {
-                *o = 0.0;
+                // Avoid a full-scale step into zero at an underrun. Resume
+                // with a short fade once enough new audio has accumulated.
+                self.last_sample *= decay;
+                if self.last_sample.abs() < 1e-20 {
+                    self.last_sample = 0.0;
+                }
+                *o = self.last_sample * gain;
+                self.envelope = 0.0;
+                self.buffering = true;
                 self.starved = self.starved.saturating_add(1);
             }
         }
@@ -607,6 +673,7 @@ impl OutFeed {
         if self.deq.is_empty() {
             self.phase = 0.0;
         }
+        self.limiter.process(out_mono);
     }
 }
 
@@ -638,6 +705,36 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
+    #[cfg(test)]
+    pub fn for_test() -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (encoded_tx, encoded_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (echo_tx, _) = mpsc::sync_channel(1);
+        (
+            Arc::new(Self {
+                params: AudioParams::new(100, 100, false, 25),
+                encoded_tx,
+                self_speaking: Arc::new(AtomicBool::new(false)),
+                out: Arc::new(Mutex::new(OutFeed {
+                    deq: VecDeque::new(),
+                    phase: 0.0,
+                    rate_out: SAMPLE_RATE as f64,
+                    starved: 0,
+                    buffering: true,
+                    envelope: 0.0,
+                    last_sample: 0.0,
+                    limiter: PeakLimiter::default(),
+                })),
+                echo_tx,
+                dec: Mutex::new(None),
+                in_stream: Mutex::new(None),
+                out_stream: Mutex::new(None),
+                cur_in: Mutex::new(String::new()),
+                cur_out: Mutex::new(String::new()),
+            }),
+            encoded_rx,
+        )
+    }
+
     /// Push декодированного кадра @48k (net-задача / эхо-поток).
     pub fn push_out(&self, samples: &[f32]) {
         let mut st = self.out.lock().unwrap();
@@ -648,21 +745,21 @@ impl AudioEngine {
         let mut st = self.out.lock().unwrap();
         st.deq.clear();
         st.phase = 0.0;
+        st.buffering = true;
+        st.envelope = 0.0;
+        st.last_sample = 0.0;
         *self.dec.lock().unwrap() = None;
-        let need = 3 * FRAME_SAMPLES;
-        while st.deq.len() < need {
-            st.deq.push_back(0.0);
-        }
+        // The jitter buffer starts on actual audio, not prefilled silence.
     }
 
     /// Декодирование входящего Opus-кадра (для net-задачи).
-    pub fn decode_opus(&self, pkt: &[u8]) -> Option<Vec<f32>> {
+    pub fn decode_opus(&self, pkt: &[u8], missing: u32) -> Option<Vec<f32>> {
         let mut g = self.dec.lock().unwrap();
         if g.is_none() {
             *g = Decoder::new().ok();
         }
         let d = g.as_mut()?;
-        d.decode(pkt).ok()
+        d.decode_with_loss(pkt, missing).ok()
     }
 
     /// Имена реально привязанных устройств; "" значит «по умолчанию».
@@ -876,67 +973,84 @@ impl AudioEngine {
                     }
                 };
                 let mut res = Resampler::anything(enc_rate);
-                let mut hangover = HANGOVER_FRAMES;
+                let mut gate = VoiceGate::default();
                 let mut was_speaking = false;
+                let mut leveler = SpeechLeveler::default();
+                let mut filter = SpeechFilter::default();
+                let mut denoiser = NoiseSuppressor::default();
+                let mut clipping_hold = 0_u32;
                 loop {
                     let chunk = match raw_rx.recv_timeout(Duration::from_millis(200)) {
                         Ok(v) => v,
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     };
-                    for frame in res.feed(&chunk) {
+                    for mut frame in res.feed(&chunk) {
                         if frame.len() != FRAME_SAMPLES {
                             continue;
                         }
-                        let gain = params.gain_in() as f32 / 100.0;
-                        let frame: Vec<f32> =
-                            frame.iter().map(|s| (*s * gain).clamp(-1.0, 1.0)).collect();
-                        let mut pcm_i16 = vec![0i16; FRAME_SAMPLES];
-                        for (o, s) in pcm_i16.iter_mut().zip(&frame) {
-                            *o = f32_to_i16(*s);
+                        if frame.iter().any(|s| s.abs() >= 0.99) {
+                            clipping_hold = 50;
+                        } else {
+                            clipping_hold = clipping_hold.saturating_sub(1);
                         }
+                        params
+                            .input_clipping
+                            .store(clipping_hold > 0, Ordering::Relaxed);
+                        filter.process(&mut frame, params.voice_filter());
+                        let unsuppressed_rms = rms(&frame);
+                        let speech_probability = denoiser
+                            .process(&mut frame, params.noise_suppression() && !params.mute_mic());
+                        // Keep suppressed residual noise out of VOX and AGC.
+                        // The existing hangover still preserves quiet endings.
+                        let likely_speech = speech_probability.is_none_or(|p| p >= 0.6);
+                        let continuing_speech = likely_speech
+                            || (was_speaking && speech_probability.is_some_and(|p| p >= 0.2));
+                        let gain = params.gain_in() as f32 / 100.0;
                         // уровень микрофона для индикатора (RMS проценты)
                         {
-                            params.store_in_level(level_percent(&frame));
+                            params.store_in_level((rms(&frame) * gain * 300.0).min(100.0) as u8);
                         }
                         // Режимы как в Discord: mute перекрывает всё;
                         // PTT — говорим только при зажатом спейсе; VOX — по порогу
-                        let speak = if params.mute_mic() {
-                            false
-                        } else if params.vox_mode() {
-                            rms(&frame) >= vad_amplitude(params.vad_threshold())
-                        } else {
-                            params.ptt_active.load(Ordering::Relaxed)
-                        };
-                        let speaking_now = if params.mute_mic()
-                            || (!params.vox_mode() && !params.ptt_active.load(Ordering::Relaxed))
-                        {
-                            hangover = 0;
-                            false
-                        } else if speak {
-                            hangover = HANGOVER_FRAMES;
-                            true
-                        } else if was_speaking && hangover > 0 {
-                            hangover -= 1;
-                            true
-                        } else {
-                            false
-                        };
+                        let vox = params.vox_mode();
+                        let ptt = params.ptt_active.load(Ordering::Relaxed);
+                        // Noise gating uses the same frame envelope, including
+                        // in PTT. Zeroing individual quiet samples distorts
+                        // zero crossings and makes fading words buzz.
+                        let (speaking_now, strong_speech) = gate.update(
+                            if continuing_speech {
+                                rms(&frame) * gain
+                            } else {
+                                0.0
+                            },
+                            vad_amplitude(params.vad_threshold()),
+                            vox || params.noise_gate(),
+                            ptt,
+                            params.mute_mic() || (!vox && !ptt),
+                        );
                         if was_speaking != speaking_now {
                             speak_flag.store(speaking_now, Ordering::Relaxed);
                             was_speaking = speaking_now;
                         }
                         if !speaking_now {
+                            leveler.idle();
                             continue;
                         }
-                        if params.noise_gate.load(Ordering::Relaxed) {
-                            let gate = vad_amplitude(params.vad_threshold()) * 32768.0;
-                            for s in pcm_i16.iter_mut() {
-                                if ((*s as f32).abs()) < gate {
-                                    *s = 0;
-                                }
-                            }
+                        if speech_probability.is_some() {
+                            leveler.process_with_reference(
+                                &mut frame,
+                                strong_speech && likely_speech,
+                                params.auto_gain(),
+                                gain,
+                                Some(unsuppressed_rms),
+                            );
+                        } else {
+                            leveler.process(&mut frame, strong_speech, params.auto_gain(), gain);
                         }
+                        gate.apply(&mut frame);
+                        params.store_in_level(level_percent(&frame));
+                        let pcm_i16: Vec<i16> = frame.iter().map(|s| f32_to_i16(*s)).collect();
                         match enc.encode(&pcm_i16) {
                             Ok(bytes) => {
                                 if params.loopback.load(Ordering::Relaxed) {
@@ -972,6 +1086,9 @@ pub fn start(
         cfg.vad_threshold,
     );
     params.set_vox_mode(matches!(cfg.mic_mode, crate::config::MicMode::Vox));
+    params.set_auto_gain(cfg.auto_gain);
+    params.set_voice_filter(cfg.voice_filter);
+    params.set_noise_suppression(cfg.noise_suppression);
 
     let self_speaking = Arc::new(AtomicBool::new(false));
     let out = Arc::new(Mutex::new(OutFeed {
@@ -979,6 +1096,10 @@ pub fn start(
         phase: 0.0,
         rate_out: SAMPLE_RATE as f64,
         starved: 0,
+        buffering: true,
+        envelope: 0.0,
+        last_sample: 0.0,
+        limiter: PeakLimiter::default(),
     }));
 
     // ── канал эхо-теста (живёт на весь срок движка) ────────────────────────
@@ -1098,16 +1219,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn very_quiet_speech_starts_at_default_volume_without_needing_200_percent() {
+        let (_, tx, mut rx) = encoder();
+        tx.send(speech(0.002)).unwrap();
+        receive_frames(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn denoising_keeps_quiet_actual_speech_audible_through_vox_agc_and_opus() {
+        let (params, tx, mut rx) = encoder();
+        params.set_noise_suppression(true);
+        params.set_voice_filter(true);
+        let mut speech = crate::noise_suppress::tests::reference_speech();
+        speech.truncate(4 * SAMPLE_RATE as usize + 1);
+        let input_rms = rms(&speech);
+        for s in &mut speech {
+            *s *= 0.002 / input_rms;
+        }
+        tx.send(speech).unwrap();
+        drop(tx);
+        let mut decoder = Decoder::new().unwrap();
+        let mut output = Vec::new();
+        while let Some(packet) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+        {
+            output.extend(decoder.decode(&packet).unwrap());
+        }
+        assert!(
+            output.len() > SAMPLE_RATE as usize * 2,
+            "quiet speech was cut off"
+        );
+        assert!(
+            rms(&output) > 0.03,
+            "quiet speech no longer audible: {}",
+            rms(&output)
+        );
+    }
+
+    #[tokio::test]
+    async fn agc_does_not_bring_suppressed_background_back_up() {
+        let (params, tx, mut rx) = encoder();
+        params.set_noise_suppression(true);
+        let mut seed = 17_u32;
+        let input: Vec<_> = (0..4 * SAMPLE_RATE + 1)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed as f64 / u32::MAX as f64 * 2.0 - 1.0) as f32 * 0.015
+            })
+            .collect();
+        tx.send(input).unwrap();
+        drop(tx);
+        let mut decoder = Decoder::new().unwrap();
+        let mut power = 0.0;
+        while let Some(packet) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+        {
+            power += decoder
+                .decode(&packet)
+                .unwrap()
+                .iter()
+                .map(|s| s * s)
+                .sum::<f32>();
+        }
+        let output_rms = (power / (4 * SAMPLE_RATE) as f32).sqrt();
+        assert!(
+            output_rms < 0.003,
+            "AGC amplified suppressed noise: {output_rms}"
+        );
+    }
+
+    #[tokio::test]
     async fn mic_gain_affects_vox_and_level_meter() {
         let (params, tx, mut rx) = encoder();
-        tx.send(speech(0.003)).unwrap();
+        tx.send(speech(0.001)).unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(100), rx.recv())
                 .await
                 .is_err()
         );
         params.set_gain_in(200);
-        tx.send(speech(0.003)).unwrap();
+        tx.send(speech(0.001)).unwrap();
         receive_frames(&mut rx).await;
         assert!(params.in_level() > 0);
     }
@@ -1138,12 +1331,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deafen_restores_the_previous_microphone_state() {
+        let params = AudioParams::new(100, 100, false, 25);
+        params.set_deaf(true);
+        assert!(params.mute_mic());
+        params.set_deaf(false);
+        assert!(!params.mute_mic());
+        params.set_mute_mic(true);
+        params.set_deaf(true);
+        params.set_deaf(false);
+        assert!(params.mute_mic());
+    }
+
+    #[test]
+    fn output_volume_is_limited_without_integer_sample_overflow() {
+        let mut feed = output(SAMPLE_RATE);
+        st_push(&mut feed, &vec![0.9; 2 * FRAME_SAMPLES]);
+        let mut block = vec![0.0; FRAME_SAMPLES];
+        feed.mono_fill(&mut block, 2.0);
+        assert!(block.iter().all(|&s| s >= 0.0 && s <= 0.95001));
+        assert!(block[FRAME_SAMPLES / 4..].iter().all(|&s| s > 0.8));
+    }
+
     fn output(rate: u32) -> OutFeed {
         OutFeed {
             deq: VecDeque::new(),
             phase: 0.0,
             rate_out: rate as f64,
             starved: 0,
+            buffering: true,
+            envelope: 0.0,
+            last_sample: 0.0,
+            limiter: PeakLimiter::default(),
         }
     }
 
@@ -1157,11 +1377,17 @@ mod tests {
                 for _ in 0..100 {
                     feed.mono_fill(&mut block, 1.0);
                 }
+                st_push(&mut feed, &vec![0.25; FRAME_SAMPLES]);
+                feed.mono_fill(&mut block, 1.0);
+                assert!(
+                    block.iter().all(|s| s.abs() < 0.0001),
+                    "one packet should wait for jitter headroom"
+                );
                 for _ in 0..10 {
                     st_push(&mut feed, &vec![0.25; FRAME_SAMPLES]);
                     feed.mono_fill(&mut block, 1.0);
                     assert!(
-                        block.iter().filter(|&&s| s > 0.2).count() > block.len() * 9 / 10,
+                        block[block.len() / 4..].iter().all(|s| *s > 0.2),
                         "playback stayed silent after idle at {rate} Hz"
                     );
                 }
@@ -1172,13 +1398,63 @@ mod tests {
     #[test]
     fn output_handles_callback_larger_than_available_audio() {
         let mut feed = output(SAMPLE_RATE);
-        st_push(&mut feed, &vec![0.5; FRAME_SAMPLES]);
+        st_push(&mut feed, &vec![0.5; 2 * FRAME_SAMPLES]);
         let mut block = vec![0.0; 4 * FRAME_SAMPLES];
         feed.mono_fill(&mut block, 1.0);
-        assert!(block[..FRAME_SAMPLES].iter().all(|&s| s == 0.5));
-        assert!(block[FRAME_SAMPLES..].iter().all(|&s| s == 0.0));
-        st_push(&mut feed, &vec![0.25; FRAME_SAMPLES]);
+        assert!(block[240..2 * FRAME_SAMPLES].iter().all(|&s| s == 0.5));
+        assert!(block[3 * FRAME_SAMPLES..].iter().all(|s| s.abs() < 0.0001));
+        assert!(
+            block.windows(2).all(|s| (s[1] - s[0]).abs() < 0.02),
+            "underrun abruptly cut the wave"
+        );
+        st_push(&mut feed, &vec![0.25; 2 * FRAME_SAMPLES]);
         feed.mono_fill(&mut block[..FRAME_SAMPLES], 1.0);
-        assert!(block[..FRAME_SAMPLES].iter().all(|&s| s == 0.25));
+        assert!(block[240..FRAME_SAMPLES].iter().all(|&s| s == 0.25));
+    }
+
+    #[test]
+    fn modest_packet_jitter_does_not_create_silence_holes() {
+        let mut feed = output(SAMPLE_RATE);
+        let mut block = vec![0.0; SAMPLE_RATE as usize / 100]; // 10 ms callback
+        // Packet intervals alternate between 30 and 10 ms, averaging 20 ms.
+        for tick in 0..100 {
+            if tick % 4 == 0 || tick % 4 == 3 {
+                st_push(&mut feed, &vec![0.25; FRAME_SAMPLES]);
+            }
+            feed.mono_fill(&mut block, 1.0);
+            if tick > 4 {
+                assert!(
+                    block.iter().all(|s| *s > 0.24),
+                    "jitter hole at tick {tick}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn opus_recovers_missing_frames_and_bounds_large_loss_bursts() {
+        let mut enc = Encoder::new().unwrap();
+        let mut dec = Decoder::new().unwrap();
+        let input: Vec<_> = speech(0.12)[..FRAME_SAMPLES]
+            .iter()
+            .map(|s| f32_to_i16(*s))
+            .collect();
+        for _ in 0..30 {
+            let packet = enc.encode(&input).unwrap();
+            dec.decode(&packet).unwrap();
+        }
+        enc.encode(&input).unwrap(); // lost packet
+        let packet = enc.encode(&input).unwrap();
+        let recovered = dec.decode_with_loss(&packet, 1).unwrap();
+        assert_eq!(recovered.len(), 2 * FRAME_SAMPLES);
+        assert!(
+            rms(&recovered[..FRAME_SAMPLES]) > 0.005,
+            "lost frame replaced with hard silence"
+        );
+        assert!(recovered.iter().all(|s| s.is_finite()));
+        assert_eq!(
+            dec.decode_with_loss(&packet, u32::MAX).unwrap().len(),
+            4 * FRAME_SAMPLES
+        );
     }
 }

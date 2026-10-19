@@ -13,13 +13,17 @@ mod app;
 mod audio;
 mod config;
 mod net;
+mod noise_suppress;
 mod proto;
 mod ui;
+mod voice_level;
 
 use std::time::Duration;
 
 use argh::FromArgs;
-use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use tokio::sync::mpsc;
 
 use app::App;
@@ -28,7 +32,7 @@ use config::Config;
 use remember_me::server;
 
 #[derive(FromArgs)]
-#[argh(description = "remember-me: P2P voice call + text chat")] 
+#[argh(description = "remember-me: P2P voice call + text chat")]
 struct Opts {
     /// сразу в режим прослушивания (host)
     #[argh(switch, short = 'H')]
@@ -49,10 +53,26 @@ struct Opts {
     /// своё имя (переопределяет конфиг)
     #[argh(option, short = 'n')]
     name: Option<String>,
+
+    /// проверить UDP в обе стороны до обновлённого сервера (ip:порт), без звука и UI
+    #[argh(option)]
+    check_server: Option<String>,
 }
 
 fn main() {
     let opts: Opts = argh::from_env();
+
+    if let Some(target) = opts.check_server {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        if let Err(error) = rt.block_on(server::check_relay(&target)) {
+            eprintln!("проверка сервера: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if opts.server {
         // ретранслятор — headless, TUI не нужен
@@ -89,8 +109,11 @@ fn main() {
         }
     };
 
-    let direct: Option<(bool, Option<String>)> =
-        if opts.host { Some((true, None)) } else { opts.connect.map(|t| (false, Some(t))) };
+    let direct: Option<(bool, Option<String>)> = if opts.host {
+        Some((true, None))
+    } else {
+        opts.connect.map(|t| (false, Some(t)))
+    };
 
     // --- рантайм для сетевой задачи
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -127,6 +150,7 @@ async fn run(
         std::io::stdout(),
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
                 | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         )

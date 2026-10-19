@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table};
 
 use crate::app::{App, Screen};
 use crate::config::MicMode;
@@ -66,17 +66,14 @@ pub fn render(app: &App, f: &mut Frame) {
 
 // ── HOME ───────────────────────────────────────────────────────────────────
 
-fn render_home(_app: &App, f: &mut Frame) {
+fn render_home(app: &App, f: &mut Frame) {
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "remember-me — прямой P2P-звонок: голос по UDP + переписка",
+            "remember-me — голосовой звонок и переписка",
             strong(),
         )),
-        Line::from(Span::styled(
-            "(как discord voice без лишнего: VPN или напрямую)",
-            dim(),
-        )),
+        Line::from(Span::styled("Напрямую или через ваш сервер", dim())),
         Line::from(""),
         Line::from(vec![
             Span::styled(" [H]", accent()),
@@ -100,10 +97,15 @@ fn render_home(_app: &App, f: &mut Frame) {
             dim(),
         )),
         Line::from(Span::styled(
-            " Работает и за NAT-сетью поверх VPN: обе стороны в одной VPN, либо проброс UDP.",
+            " Для звонка через сервер укажите его адрес в настройках.",
             dim(),
         )),
     ];
+    let mut lines = lines;
+    lines.insert(
+        3,
+        Line::from(Span::styled(format!("Вы: {}", app.cfg.name), accent())),
+    );
     let area = centered_rect(f, 66, lines.len() as u16 + 3);
     let block = Block::bordered()
         .title(" remember-me ".bold())
@@ -243,104 +245,97 @@ fn render_incoming(app: &App, f: &mut Frame) {
 // ── CALL ───────────────────────────────────────────────────────────────────
 
 fn render_call(app: &App, f: &mut Frame) {
-    let area = f.area();
+    let area = Rect {
+        height: f.area().height.saturating_sub(1),
+        ..f.area()
+    };
     let chunks = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(5),
         Constraint::Min(4),
         Constraint::Length(2),
         Constraint::Length(3),
     ])
     .split(area);
 
-    // ── верхняя плашка состояния
-    let p = app.engine.params.clone();
+    let p = &app.engine.params;
     let me_speaking = app
         .engine
         .self_speaking
         .load(std::sync::atomic::Ordering::Relaxed);
-    let mut top: Vec<Span> = Vec::new();
-    match &app.peer {
+    let compact = area.width < 64;
+    let mut rows = vec![participant_row(
+        format!("{} (вы)", app.cfg.name),
+        Some(p.mute_mic()),
+        Some(p.deaf()),
+        me_speaking,
+        if p.mute_mic() { 0 } else { p.in_level() },
+        compact,
+    )];
+    let ping = match &app.peer {
         Some(peer) => {
-            top.push(Span::styled(peer.name.clone(), green().bold()));
-            top.push(Span::styled(format!(" ({})", peer.addr), dim()));
-            top.push(Span::styled(
-                match peer.rtt {
-                    Some(rtt) => format!("  ping {rtt} ms"),
-                    None => "  ping —".into(),
-                },
-                dim(),
+            rows.push(participant_row(
+                peer.name.clone(),
+                peer.status_known.then_some(peer.mute_mic || peer.deaf),
+                peer.status_known.then_some(peer.deaf),
+                peer.speaking,
+                if peer.mute_mic { 0 } else { p.out_level() },
+                compact,
             ));
-            top.push(Span::styled("  ", dim()));
-            top.push(if peer.speaking {
-                Span::styled("пишет ●", green())
-            } else {
-                Span::styled("молчит ·", dim())
-            });
-            // статусы собеседника — как в Discord рядом с его ником
-            if peer.mute_mic {
-                top.push(Span::styled(" [МИКРО ВКЛ]", bad()));
+            match peer.rtt {
+                Some(ms) => format!("пинг соединения: {ms} мс"),
+                None => "пинг: измеряем…".into(),
             }
-            if peer.deaf {
-                top.push(Span::styled(" [ГЛУХОЙ]", bad()));
-            }
-            top.push(gap());
         }
         None => {
-            top.push(Span::styled("собеседник ещё не на связи ", dim()));
-            top.push(Span::styled(app.status.clone(), accent()));
+            rows.push(participant_row(
+                "Ожидаем собеседника".into(),
+                None,
+                None,
+                false,
+                0,
+                compact,
+            ));
+            "соединяемся…".into()
         }
-    }
-    top.push(gap());
-    if p.mute_mic() {
-        top.push(Span::styled("[МИКРО ВЫКЛ]", bad()));
+    };
+    let (headers, widths) = if compact {
+        (
+            vec!["Участник", "Микрофон", "Звук"],
+            vec![
+                Constraint::Min(12),
+                Constraint::Length(9),
+                Constraint::Length(7),
+            ],
+        )
     } else {
-        top.push(Span::styled("микро", dim()));
-    }
-    top.push(gap());
-    if p.deaf() {
-        top.push(Span::styled("[ГЛУХОЙ]", bad()));
-    } else {
-        top.push(Span::styled("звук", dim()));
-    }
-    top.push(Span::styled(format!("  звук: {}%", p.gain_peer()), dim()));
-    top.push(Span::styled(format!("  микро: {}%", p.gain_in()), dim()));
-    // индикаторы уровня: мой микрофон и вход собеседника — видно, где теряется звук
-    top.push(gap());
-    top.push(Span::styled(
-        format!("микрофон {}", level_bar(p.in_level())),
-        accent(),
-    ));
-    top.push(gap());
-    if app.peer.is_some() {
-        let level = p.out_level();
-        top.push(Span::styled(
-            format!("вход {}", level_bar(level)),
-            if level > 0 { green() } else { dim() },
-        ));
-    }
-    top.push(if me_speaking {
-        Span::styled("  говорю я ●", accent())
-    } else {
-        Span::styled("  говорю я ·", dim())
-    });
-    let title_seg = Line::from(top);
+        (
+            vec!["Участник", "Микрофон", "Звук", "Сейчас", "Уровень"],
+            vec![
+                Constraint::Min(14),
+                Constraint::Length(9),
+                Constraint::Length(7),
+                Constraint::Length(12),
+                Constraint::Length(8),
+            ],
+        )
+    };
     f.render_widget(
-        Paragraph::new(title_seg).block(
-            Block::bordered()
-                .title(" звонок ")
-                .title_alignment(Alignment::Left),
-        ),
+        Table::new(rows, widths)
+            .header(Row::new(headers).style(dim()))
+            .column_spacing(1)
+            .block(Block::bordered().title(format!(" Участники · {ping} "))),
         chunks[0],
     );
 
     // ── чат
     let mut lines: Vec<Line> = Vec::new();
     for l in &app.chat {
-        let (who, style) = if l.mine {
-            ("Я", accent())
+        let who = if l.mine {
+            format!("{} (вы)", l.name)
         } else {
-            (l.name.as_str(), green())
+            l.name.clone()
         };
+        let style = if l.mine { accent() } else { green() };
         let mut spans = vec![
             Span::styled(format!("{who}:"), style),
             Span::styled(" ", dim()),
@@ -388,7 +383,7 @@ fn render_call(app: &App, f: &mut Frame) {
         ))
     } else {
         Line::from(Span::styled(
-            "[M] микро  [D] глухой  [T] писать  [↑/↓] звук  [ [ ] ] микро громк.  [Пробел] говорить(Ptt)  [U] повесить",
+            "[F2] настройки  [T] чат  [M] микро  [D] звук  [U,Y] завершить",
             dim(),
         ))
     };
@@ -400,20 +395,83 @@ fn render_call(app: &App, f: &mut Frame) {
         Span::styled(cut(&ci), Style::new()),
         Span::styled("  [I] сменить", dim()),
     ]);
-    f.render_widget(Paragraph::new(vec![line, devline]), chunks[2]);
-
-    // ── блок denied?
-    let warn: Vec<Line> = Vec::new();
-    let warn = warn;
-    let _ = warn;
-    f.render_widget(
-        Paragraph::new(""), /*нижний блок — просто тосты*/
-        chunks[3],
-    );
+    let volume_keys = Line::from(Span::styled(
+        "[↑/↓] громкость собеседника  [ / ] микрофон  [A] автогромкость",
+        dim(),
+    ));
+    f.render_widget(Paragraph::new(vec![line, volume_keys]), chunks[2]);
+    let levels = Line::from(vec![
+        Span::styled(
+            if p.input_clipping() {
+                "ПЕРЕГРУЗ ВХОДА  "
+            } else {
+                ""
+            },
+            bad(),
+        ),
+        Span::styled(
+            format!(
+                "Микрофон: {}%  Собеседник: {}%  ",
+                p.gain_in(),
+                p.gain_peer()
+            ),
+            dim(),
+        ),
+        Span::styled(
+            format!(
+                "Авто: {}  Фильтр: {}  Шумодав: {}",
+                if p.auto_gain() { "ВКЛ" } else { "ВЫКЛ" },
+                if p.voice_filter() {
+                    "ВКЛ"
+                } else {
+                    "ВЫКЛ"
+                },
+                if p.noise_suppression() {
+                    "ВКЛ"
+                } else {
+                    "ВЫКЛ"
+                }
+            ),
+            accent(),
+        ),
+    ]);
+    let connection = Line::from(Span::styled(
+        app.peer
+            .as_ref()
+            .map(|peer| format!("Соединение: {}", peer.addr))
+            .unwrap_or_else(|| app.status.clone()),
+        dim(),
+    ));
+    f.render_widget(Paragraph::new(vec![levels, devline, connection]), chunks[3]);
 }
 
-fn gap() -> Span<'static> {
-    Span::raw("  ")
+fn participant_row(
+    name: String,
+    muted: Option<bool>,
+    deaf: Option<bool>,
+    speaking: bool,
+    level: u8,
+    compact: bool,
+) -> Row<'static> {
+    let state = |disabled: Option<bool>| match disabled {
+        Some(true) => Cell::from("ВЫКЛ").style(bad()),
+        Some(false) => Cell::from("ВКЛ").style(green()),
+        None => Cell::from("…").style(dim()),
+    };
+    let active = speaking && muted == Some(false);
+    let mut cells = vec![Cell::from(name).style(strong()), state(muted), state(deaf)];
+    if !compact {
+        cells.push(
+            Cell::from(if active {
+                "говорит ●"
+            } else {
+                "молчит"
+            })
+            .style(if active { green() } else { dim() }),
+        );
+        cells.push(Cell::from(level_bar(level)).style(accent()));
+    }
+    Row::new(cells)
 }
 
 /// Полоска уровня: 8 делений, заполнение по процентам.
@@ -447,7 +505,7 @@ fn render_settings(app: &App, f: &mut Frame) {
     };
 
     let rows: Vec<(String, String)> = vec![
-        ("имя".into(), String::new()),
+        ("имя".into(), cfg.name.clone()),
         ("порт".into(), cfg.port.to_string()),
         ("громкость микрофона".into(), format!("{}%", p.gain_in())),
         (
@@ -489,6 +547,31 @@ fn render_settings(app: &App, f: &mut Frame) {
             },
         ),
     ];
+    let mut rows = rows;
+    rows.push((
+        "автогромкость речи".into(),
+        if p.auto_gain() {
+            "ВКЛ — выравнивание тихой речи".into()
+        } else {
+            "ВЫКЛ".into()
+        },
+    ));
+    rows.push((
+        "фильтр голоса (лёгкий)".into(),
+        if p.voice_filter() {
+            "ВКЛ".into()
+        } else {
+            "ВЫКЛ".into()
+        },
+    ));
+    rows.push((
+        "шумоподавление".into(),
+        if p.noise_suppression() {
+            "ВКЛ".into()
+        } else {
+            "ВЫКЛ".into()
+        },
+    ));
     let mut lines = Vec::new();
     for (i, (label, val)) in rows.iter().enumerate() {
         let cursor = if i == app.settings_sel && app.edit.is_none() {
@@ -517,20 +600,80 @@ fn render_settings(app: &App, f: &mut Frame) {
             Span::styled(val, val_style),
         ]));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("[↑/↓]", accent()),
-        Span::styled(" поле   ", Style::new()),
-        Span::styled("[Enter/Enter/←/→/Space]", accent()),
-        Span::styled(" менять   ", Style::new()),
-        Span::styled("[L]", accent()),
-        Span::styled(" эхо   ", Style::new()),
-        Span::styled("[Esc]", accent()),
-        Span::styled(" назад", Style::new()),
-    ]));
-    let area = centered_rect(f, 74, lines.len() as u16 + 4);
-    let block = Block::bordered().title(" Настройки ".bold());
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    let mut area = centered_rect(f, 86, rows.len() as u16 + 8);
+    area.height = area.height.min(f.area().height.saturating_sub(1));
+    area.y = (f
+        .area()
+        .height
+        .saturating_sub(1)
+        .saturating_sub(area.height))
+        / 2;
+    let title = if app.peer.is_some() {
+        " Настройки · звонок продолжается "
+    } else {
+        " Настройки "
+    };
+    let block = Block::bordered().title(title.bold());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let parts = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(3),
+    ])
+    .split(inner);
+    let meter = Line::from(Span::styled(
+        format!(
+            "Микрофон: {}% · VOX: {}{}",
+            p.in_level(),
+            p.vad_threshold(),
+            if p.input_clipping() {
+                " · ПЕРЕГРУЗ ВХОДА: уменьшите усиление устройства"
+            } else {
+                ""
+            }
+        ),
+        if p.input_clipping() { bad() } else { dim() },
+    ));
+    f.render_widget(Paragraph::new(meter), parts[0]);
+    let scroll = (app.settings_sel + 1).saturating_sub(parts[1].height as usize);
+    f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), parts[1]);
+    let help = match app.settings_sel {
+        crate::app::ROW_VAD => "← выше чувствительность · → меньше фонового шума",
+        crate::app::ROW_DENOISE => "Enter: подавлять фон и клавиши · обработка на этом ПК",
+        crate::app::ROW_FILTER => "Enter: фильтр гула/шипения 80–8000 Гц, без нейросети",
+        crate::app::ROW_NAME | crate::app::ROW_PORT | crate::app::ROW_SERVER
+            if app.session.is_some() =>
+        {
+            "Имя, порт и сервер применяются при следующем соединении"
+        }
+        crate::app::ROW_ECHO if app.session.is_some() => {
+            "Эхо-тест доступен после завершения сессии"
+        }
+        _ => "←/→: значение · Enter/Пробел: переключить или редактировать",
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(help, accent()))),
+        parts[2],
+    );
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from("[↑/↓] поле   [←/→/Enter/Пробел] менять"),
+            Line::from(if app.session_screen() == Screen::Call {
+                "[Esc] вернуться к звонку"
+            } else {
+                "[Esc] назад"
+            }),
+            Line::from(if app.session.is_some() {
+                "Голос и чат работают, аудионастройки меняются сразу"
+            } else {
+                "[L] эхо-тест"
+            }),
+        ])
+        .style(dim()),
+        parts[3],
+    );
 }
 
 fn render_dev_pick(app: &App, f: &mut Frame, input: bool, idx: usize) {
@@ -580,4 +723,132 @@ fn cursor(sel: bool) -> Span<'static> {
 
 fn value_style(sel: bool) -> Style {
     if sel { strong() } else { Style::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{ChatLine, PeerInfo};
+    use crate::config::Config;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn draw(app: &App, width: u16) -> String {
+        draw_size(app, width, 24)
+    }
+
+    fn draw_size(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn app() -> App {
+        App::for_test(Config {
+            name: "Лексей".into(),
+            ..Config::default()
+        })
+    }
+
+    #[test]
+    fn saved_nickname_is_visible_without_editing_settings() {
+        let mut app = app();
+        app.screen = Screen::Settings;
+        let screen = draw(&app, 80);
+        assert!(screen.contains("имя  Лексей"));
+        assert!(screen.contains("автогромкость речи"));
+        assert!(app.edit.is_none());
+    }
+
+    #[test]
+    fn live_settings_keep_vox_and_optional_filter_accessible_in_short_terminals() {
+        let mut app = app();
+        app.screen = Screen::Call;
+        app.open_settings();
+        for height in [12, 24] {
+            app.settings_sel = crate::app::ROW_VAD;
+            let screen = draw_size(&app, 80, height);
+            assert!(screen.contains("▸ порог VOX  25"));
+            assert!(screen.contains("[Esc] вернуться к звонку"));
+            app.settings_sel = crate::app::ROW_FILTER;
+            let screen = draw_size(&app, 80, height);
+            assert!(screen.contains("▸ фильтр голоса (лёгкий)  ВЫКЛ"));
+            app.settings_sel = crate::app::ROW_DENOISE;
+            let screen = draw_size(&app, 80, height);
+            assert!(screen.contains("▸ шумоподавление  ВЫКЛ"));
+            app.engine.params.set_noise_suppression(true);
+            assert!(draw_size(&app, 80, height).contains("▸ шумоподавление  ВКЛ"));
+            app.engine.params.set_noise_suppression(false);
+        }
+    }
+
+    #[test]
+    fn call_shows_both_names_correct_mute_sound_ping_and_chat_author() {
+        let mut app = app();
+        app.screen = Screen::Call;
+        app.peer = Some(PeerInfo {
+            name: "Друг".into(),
+            addr: "комната AX3P".into(),
+            rtt: Some(83),
+            mute_mic: true,
+            deaf: false,
+            speaking: true,
+            level: 50,
+            status_known: true,
+        });
+        app.chat.push(ChatLine {
+            mine: true,
+            name: "Лексей".into(),
+            text: "Привет!".into(),
+            status: 1,
+        });
+        for width in [50, 80, 120] {
+            let screen = draw(&app, width);
+            assert!(screen.contains("Лексей (вы)"));
+            assert!(screen.contains("Лексей (вы): Привет!"));
+            assert!(screen.contains("83 мс"));
+            let peer = screen.lines().find(|line| line.contains("Друг")).unwrap();
+            let columns: Vec<_> = peer.split_whitespace().collect();
+            assert_eq!(&columns[1..3], &["ВЫКЛ", "ВКЛ"]);
+            assert!(!peer.contains("говорит"));
+        }
+        app.engine.params.set_mute_mic(true);
+        app.peer.as_mut().unwrap().mute_mic = false;
+        app.peer.as_mut().unwrap().deaf = true;
+        let screen = draw(&app, 80);
+        let me = screen
+            .lines()
+            .find(|line| line.contains("Лексей (вы)"))
+            .unwrap();
+        assert!(me.contains("ВЫКЛ"));
+        let peer = screen.lines().find(|line| line.contains("Друг")).unwrap();
+        assert_eq!(peer.matches("ВЫКЛ").count(), 2);
+    }
+
+    #[test]
+    fn peer_status_is_unknown_until_first_status_packet() {
+        let mut app = app();
+        app.screen = Screen::Call;
+        app.peer = Some(PeerInfo {
+            name: "Друг".into(),
+            addr: "127.0.0.1".into(),
+            rtt: None,
+            mute_mic: false,
+            deaf: false,
+            speaking: false,
+            level: 0,
+            status_known: false,
+        });
+        let screen = draw(&app, 80);
+        let peer = screen.lines().find(|line| line.contains("Друг")).unwrap();
+        assert!(!peer.contains("ВКЛ"));
+        assert!(peer.contains('…'));
+    }
 }

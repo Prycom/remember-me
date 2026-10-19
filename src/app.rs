@@ -45,6 +45,7 @@ pub struct PeerInfo {
     pub speaking: bool,
     /// уровень входа собеседника (из Status), 0..100%
     pub level: u8,
+    pub status_known: bool,
 }
 
 /// status для своих сообщений: 0 напоследок, 1 доставлено, 2 не доставлено
@@ -72,7 +73,10 @@ pub const ROW_IN_DEV: usize = 7;
 pub const ROW_OUT_DEV: usize = 8;
 pub const ROW_ECHO: usize = 9;
 pub const ROW_SERVER: usize = 10;
-pub const SETTINGS_ROWS: usize = 11;
+pub const ROW_AUTO_GAIN: usize = 11;
+pub const ROW_FILTER: usize = 12;
+pub const ROW_DENOISE: usize = 13;
+pub const SETTINGS_ROWS: usize = 14;
 
 const PENDING_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DIAL_MAX_TXT: &str = "60";
@@ -99,6 +103,7 @@ pub struct App {
     pub msg_id: u32,
     pending: HashMap<u32, (usize, Instant)>,
     pub settings_sel: usize,
+    settings_return: Screen,
     pub dev_pick: Option<DevPick>,
     pub edit: Option<(usize, String)>,
     pub conn_input: String,
@@ -113,10 +118,33 @@ impl App {
         engine: Arc<AudioEngine>,
         encoded_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     ) -> App {
+        Self::with_devices(cfg, engine, encoded_rx, crate::audio::list_devices())
+    }
+
+    #[cfg(test)]
+    pub fn for_test(cfg: Config) -> App {
+        let (engine, encoded_rx) = AudioEngine::for_test();
+        Self::with_devices(
+            cfg,
+            engine,
+            encoded_rx,
+            DeviceList {
+                inputs: vec![],
+                outputs: vec![],
+            },
+        )
+    }
+
+    fn with_devices(
+        cfg: Config,
+        engine: Arc<AudioEngine>,
+        encoded_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        devices: DeviceList,
+    ) -> App {
         App {
             cfg,
             engine,
-            devices: crate::audio::list_devices(),
+            devices,
             mode: None,
             screen: Screen::Home,
             session: None,
@@ -134,6 +162,7 @@ impl App {
             msg_id: 0,
             pending: HashMap::new(),
             settings_sel: 0,
+            settings_return: Screen::Home,
             dev_pick: None,
             edit: None,
             conn_input: String::new(),
@@ -165,8 +194,8 @@ impl App {
         if dead {
             self.session = None;
             self.mode = None;
-            if self.screen == Screen::Call {
-                self.screen = Screen::Home;
+            if self.session_screen() == Screen::Call {
+                self.set_session_screen(Screen::Home);
                 self.input_focus = false;
                 self.peer = None;
             }
@@ -220,19 +249,21 @@ impl App {
         });
         self.pending.insert(id, (idx, Instant::now()));
         if let Some(k) = self.peer_file.clone() {
-            append_chat_log(&k, true, &self.cfg.name, self.chat[idx].text.clone());
+            append_chat_log(&k, true, &self.cfg.name, &self.chat[idx].text);
         }
         self.chat_scroll = 0;
     }
 
     fn handle_net(&mut self, ev: NetEvent) {
         match ev {
+            NetEvent::Progress(message) => self.status = message,
             NetEvent::Waiting { local_addrs } => {
                 self.hint_addrs = local_addrs;
-                if matches!(self.mode, Some(Mode::Host)) && !matches!(self.screen, Screen::Incoming)
+                if matches!(self.mode, Some(Mode::Host))
+                    && !matches!(self.session_screen(), Screen::Incoming)
                 {
-                    if self.screen != Screen::Call {
-                        self.screen = Screen::HostWait;
+                    if self.session_screen() != Screen::Call {
+                        self.set_session_screen(Screen::HostWait);
                     }
                 }
                 self.status = "ожидаю звонок".into();
@@ -241,7 +272,7 @@ impl App {
                 self.room_code = Some(code);
             }
             NetEvent::Joining { attempt, addr } => {
-                self.screen = Screen::Call;
+                self.set_session_screen(Screen::Call);
                 self.status = if attempt == 0 {
                     format!("восстанавливаю связь с {addr}…")
                 } else {
@@ -249,8 +280,13 @@ impl App {
                 };
             }
             NetEvent::CallIncoming { name, addr } => {
+                if self.screen == Screen::Settings {
+                    self.set_toast(format!(
+                        "Входящий звонок от {name}: Esc, затем Enter — принять"
+                    ));
+                }
                 self.incoming = Some((name, addr));
-                self.screen = Screen::Incoming;
+                self.set_session_screen(Screen::Incoming);
             }
             NetEvent::InCall {
                 peer_name,
@@ -259,7 +295,7 @@ impl App {
                 // история этого собеседника (у каждого свой файл — тогда в
                 // переписке не мелькают чужие/прошлые разговоры)
                 self.peer_file = Some(chat_peer_key(&peer_name));
-                self.chat = load_chat_log(&self.peer_file.clone().unwrap());
+                self.chat = load_chat_log(&self.peer_file.clone().unwrap(), &self.cfg.name);
                 self.chat_scroll = 0;
                 self.peer = Some(PeerInfo {
                     name: peer_name,
@@ -269,8 +305,9 @@ impl App {
                     deaf: false,
                     speaking: false,
                     level: 0,
+                    status_known: false,
                 });
-                self.screen = Screen::Call;
+                self.set_session_screen(Screen::Call);
                 self.status = "в звонке".into();
             }
             NetEvent::Rtt(rtt) => {
@@ -287,6 +324,7 @@ impl App {
                     p.mute_mic = mute_mic;
                     p.deaf = deaf;
                     p.level = lvl.min(100);
+                    p.status_known = true;
                 }
             }
             NetEvent::PeerSpeaking(v) => {
@@ -308,7 +346,7 @@ impl App {
                 });
                 let line = self.chat.last().unwrap();
                 if let Some(k) = self.peer_file.clone() {
-                    append_chat_log(&k, false, &line.name, line.text.clone());
+                    append_chat_log(&k, false, &line.name, &line.text);
                 }
                 self.chat_scroll = 0;
             }
@@ -328,10 +366,10 @@ impl App {
                 self.chat_scroll = 0;
                 self.status = msg;
                 match self.mode {
-                    Some(Mode::Host) => self.screen = Screen::HostWait,
+                    Some(Mode::Host) => self.set_session_screen(Screen::HostWait),
                     Some(Mode::Joiner) => {
                         // сессия доделает сама; экран пусть дождётся
-                        self.screen = Screen::Home;
+                        self.set_session_screen(Screen::Home);
                     }
                     None => {}
                 }
@@ -340,7 +378,7 @@ impl App {
                 self.status = format!("ошибка: {msg}");
                 self.stop_session();
                 self.mode = None;
-                self.screen = Screen::Home;
+                self.set_session_screen(Screen::Home);
             }
         }
     }
@@ -401,6 +439,9 @@ impl App {
         p.set_vox_mode(matches!(self.cfg.mic_mode, MicMode::Vox));
         p.set_vad_threshold(self.cfg.vad_threshold);
         p.set_noise_gate(self.cfg.noise_gate);
+        p.set_auto_gain(self.cfg.auto_gain);
+        p.set_voice_filter(self.cfg.voice_filter);
+        p.set_noise_suppression(self.cfg.noise_suppression);
         self.cfg.save();
     }
 
@@ -492,7 +533,38 @@ impl App {
 
     // ── клавиатура ─────────────────────────────────────────────────────────
 
+    pub fn session_screen(&self) -> Screen {
+        if self.screen == Screen::Settings {
+            self.settings_return
+        } else {
+            self.screen
+        }
+    }
+
+    fn set_session_screen(&mut self, screen: Screen) {
+        if self.screen == Screen::Settings {
+            self.settings_return = screen;
+        } else {
+            self.screen = screen;
+        }
+    }
+
+    pub fn open_settings(&mut self) {
+        if self.screen != Screen::Settings {
+            self.settings_return = self.screen;
+            self.screen = Screen::Settings;
+            self.engine.params.set_ptt_active(false);
+            self.arm_hangup = false;
+        }
+    }
+
     pub fn on_event(&mut self, ev: Event) {
+        if let Event::Key(k) = &ev {
+            if k.code == KeyCode::F(2) && k.kind == KeyEventKind::Press {
+                self.open_settings();
+                return;
+            }
+        }
         match self.screen {
             Screen::Home => self.keys_home(ev),
             Screen::Connect => self.keys_connect(ev),
@@ -518,7 +590,7 @@ impl App {
                     self.screen = Screen::Connect;
                 }
                 (KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('ы'), _) => {
-                    self.screen = Screen::Settings;
+                    self.open_settings();
                 }
                 (KeyCode::Char('q') | KeyCode::Char('й'), _) => self.quit = true,
                 _ => {}
@@ -528,7 +600,10 @@ impl App {
 
     fn keys_connect(&mut self, ev: Event) {
         if let Event::Key(k) = ev {
-            if k.kind != KeyEventKind::Press {
+            if k.kind == KeyEventKind::Release
+                || (k.kind == KeyEventKind::Repeat
+                    && !matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace))
+            {
                 return;
             }
             match k.code {
@@ -555,11 +630,7 @@ impl App {
                         }
                         return;
                     }
-                    if k.modifiers.contains(KeyModifiers::SHIFT) {
-                        self.conn_input.push(c.to_ascii_uppercase());
-                    } else {
-                        self.conn_input.push(c);
-                    }
+                    push_text_key(&mut self.conn_input, c, k.modifiers);
                 }
                 _ => {}
             }
@@ -626,7 +697,11 @@ impl App {
                 }
                 return;
             }
-            if k.kind != KeyEventKind::Press {
+            if k.kind == KeyEventKind::Release
+                || (k.kind == KeyEventKind::Repeat
+                    && !(self.input_focus
+                        && matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace)))
+            {
                 return;
             }
 
@@ -649,7 +724,7 @@ impl App {
                             }
                             return;
                         }
-                        self.input.push(c);
+                        push_text_key(&mut self.input, c, k.modifiers);
                     }
                     _ => {}
                 }
@@ -668,7 +743,16 @@ impl App {
                     self.engine.params.set_deaf(v);
                     self.cfg_save_state();
                 }
-                (KeyCode::Char('t') | KeyCode::Char('е'), _) => self.input_focus = true,
+                (KeyCode::Char('s') | KeyCode::Char('ы'), _) => self.open_settings(),
+                (KeyCode::Char('t') | KeyCode::Char('е'), _) => {
+                    self.engine.params.set_ptt_active(false);
+                    self.input_focus = true;
+                }
+                (KeyCode::Char('a') | KeyCode::Char('ф'), _) => {
+                    let enabled = !self.engine.params.auto_gain();
+                    self.engine.params.set_auto_gain(enabled);
+                    self.cfg_save_state();
+                }
                 (KeyCode::Up, _) => {
                     let v = self.engine.params.gain_peer().saturating_add(5).min(200);
                     self.engine.params.set_gain_peer(v);
@@ -722,7 +806,18 @@ impl App {
 
     fn keys_settings(&mut self, ev: Event) {
         if let Event::Key(k) = ev {
-            if k.kind != KeyEventKind::Press {
+            if k.kind == KeyEventKind::Release
+                || (k.kind == KeyEventKind::Repeat
+                    && !matches!(
+                        k.code,
+                        KeyCode::Backspace
+                            | KeyCode::Up
+                            | KeyCode::Down
+                            | KeyCode::Left
+                            | KeyCode::Right
+                    )
+                    && !(self.edit.is_some() && matches!(k.code, KeyCode::Char(_))))
+            {
                 return;
             }
 
@@ -761,11 +856,7 @@ impl App {
                             }
                         }
                         if buf.len() < 64 {
-                            buf.push(if k.modifiers.contains(KeyModifiers::SHIFT) {
-                                c.to_ascii_uppercase()
-                            } else {
-                                c
-                            });
+                            push_text_key(buf, c, k.modifiers);
                         }
                     }
                     _ => {}
@@ -818,8 +909,7 @@ impl App {
                     self.settings_sel = (sel + 1).min(SETTINGS_ROWS.saturating_sub(1))
                 }
                 (KeyCode::Esc, _) => {
-                    self.save_all();
-                    self.screen = Screen::Home;
+                    self.screen = self.settings_return;
                 }
                 (KeyCode::Char('l') | KeyCode::Char('д'), _) => self.toggle_echo(),
                 (KeyCode::Char('c'), true) => self.quit = true,
@@ -920,12 +1010,40 @@ impl App {
                         self.toggle_echo();
                     }
                 }
+                ROW_FILTER => {
+                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                        self.engine
+                            .params
+                            .set_voice_filter(!self.engine.params.voice_filter());
+                        self.cfg_save_state();
+                    }
+                }
+                ROW_DENOISE => {
+                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                        self.engine
+                            .params
+                            .set_noise_suppression(!self.engine.params.noise_suppression());
+                        self.cfg_save_state();
+                    }
+                }
+                ROW_AUTO_GAIN => {
+                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                        self.engine
+                            .params
+                            .set_auto_gain(!self.engine.params.auto_gain());
+                        self.cfg_save_state();
+                    }
+                }
                 _ => {}
             }
         }
     }
 
     pub fn toggle_echo(&mut self) {
+        if self.session.is_some() {
+            self.set_toast("Эхо-тест доступен после завершения сессии".into());
+            return;
+        }
         let v = !self.engine.params.loopback();
         self.engine.params.set_loopback(v);
         self.set_toast(if v {
@@ -951,6 +1069,9 @@ impl App {
             MicMode::Ptt
         };
         self.cfg.noise_gate = self.noise_gate_on();
+        self.cfg.auto_gain = p.auto_gain();
+        self.cfg.voice_filter = p.voice_filter();
+        self.cfg.noise_suppression = p.noise_suppression();
         self.cfg.save();
     }
 
@@ -960,6 +1081,16 @@ impl App {
             if t.elapsed() > Duration::from_secs(4) {
                 self.toast = None;
             }
+        }
+    }
+}
+
+fn push_text_key(buffer: &mut String, c: char, modifiers: KeyModifiers) {
+    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) {
+        if modifiers.contains(KeyModifiers::SHIFT) && c.is_lowercase() {
+            buffer.extend(c.to_uppercase());
+        } else {
+            buffer.push(c);
         }
     }
 }
@@ -1002,44 +1133,229 @@ fn chat_path(key: &str) -> std::path::PathBuf {
         .join(format!("chat-{key}.log"))
 }
 
-fn append_chat_log(key: &str, mine: bool, name: &str, text: String) {
-    let path = chat_path(key);
-    let lang_name = if mine {
-        "Я".to_string()
-    } else {
-        name.to_string()
-    };
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "[{}] {}: {}", fmt_ts(), lang_name, text);
-    }
+// A versioned tab-separated record keeps ownership separate from the actual
+// nickname. Escape controls so messages and names cannot create extra records.
+fn escape_log(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
-fn load_chat_log(key: &str) -> Vec<ChatLine> {
-    let path = chat_path(key);
-    let mut out = Vec::new();
-    if let Ok(body) = std::fs::read_to_string(&path) {
-        for l in body.lines() {
-            let l = l.trim_end();
-            if l.is_empty() {
-                continue;
+fn unescape_log(value: &str) -> String {
+    let mut chars = value.chars();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some(c) => {
+                    out.push(c);
+                }
+                None => out.push('\\'),
             }
-            // формат: [hh:mm:ss] Я: текст | [hh:mm:ss] Имя: текст
-            let rest = l.split_once("] ").map(|(_, r)| r).unwrap_or(l);
-            let (who, text) = match rest.split_once(": ") {
-                Some((w, t)) => (w, t.to_string()),
-                None => ("собеседник", rest.to_string()),
-            };
-            out.push(ChatLine {
-                mine: who == "Я",
-                name: who.to_string(),
-                text,
-                status: 3,
-            });
+        } else {
+            out.push(c);
         }
     }
     out
+}
+
+fn chat_record(mine: bool, name: &str, text: &str) -> String {
+    format!(
+        "@rm2\t{}\t{}\t{}",
+        u8::from(mine),
+        escape_log(name),
+        escape_log(text)
+    )
+}
+
+fn append_chat_log(key: &str, mine: bool, name: &str, text: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(chat_path(key))
+    {
+        let _ = writeln!(f, "[{}] {}", fmt_ts(), chat_record(mine, name, text));
+    }
+}
+
+fn parse_chat_log(body: &str, my_name: &str) -> Vec<ChatLine> {
+    body.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let rest = line.split_once("] ").map(|(_, r)| r).unwrap_or(line);
+            if let Some(fields) = rest.strip_prefix("@rm2\t") {
+                let mut fields = fields.splitn(3, '\t');
+                let mine = fields.next() == Some("1");
+                let name = unescape_log(fields.next().unwrap_or(""));
+                let text = unescape_log(fields.next().unwrap_or(""));
+                ChatLine {
+                    mine,
+                    name,
+                    text,
+                    status: 3,
+                }
+            } else {
+                // Legacy logs stored only "Я" for own messages. The historical
+                // nickname is unrecoverable; display the current local nickname.
+                let (who, text) = rest.split_once(": ").unwrap_or(("собеседник", rest));
+                let mine = who == "Я";
+                ChatLine {
+                    mine,
+                    name: if mine {
+                        my_name.to_string()
+                    } else {
+                        who.to_string()
+                    },
+                    text: text.to_string(),
+                    status: 3,
+                }
+            }
+        })
+        .collect()
+}
+
+fn load_chat_log(key: &str, my_name: &str) -> Vec<ChatLine> {
+    std::fs::read_to_string(chat_path(key))
+        .map(|body| parse_chat_log(&body, my_name))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+
+    fn key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) {
+        app.on_event(Event::Key(KeyEvent::new_with_kind(code, modifiers, kind)));
+    }
+
+    #[test]
+    fn history_keeps_real_authors_and_reads_legacy_own_messages() {
+        let own_name = "Лексей: [ПК]";
+        let text = "Привет: A\\B\tстрока\nещё ] строка";
+        let log = format!(
+            "[12:00:00] Я: старое сообщение\n[12:00:01] Друг: ответ\n[12:00:02] {}\n[12:00:03] {}\n",
+            chat_record(true, own_name, text),
+            chat_record(false, "Я", "это ник собеседника")
+        );
+        let lines = parse_chat_log(&log, "ТекущийНик");
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].mine);
+        assert_eq!(lines[0].name, "ТекущийНик");
+        assert!(!lines[1].mine);
+        assert_eq!(lines[1].name, "Друг");
+        assert!(lines[2].mine);
+        assert_eq!(lines[2].name, own_name);
+        assert_eq!(lines[2].text, text);
+        assert!(!lines[3].mine);
+        assert_eq!(lines[3].name, "Я");
+    }
+
+    #[test]
+    fn chat_accepts_shift_unicode_and_repeat_but_ignores_release() {
+        let mut app = App::for_test(Config::default());
+        app.screen = Screen::Call;
+        app.input_focus = true;
+        for c in ['a', 'ж'] {
+            key(
+                &mut app,
+                KeyCode::Char(c),
+                KeyModifiers::SHIFT,
+                KeyEventKind::Press,
+            );
+        }
+        for c in [':', '!', '_'] {
+            key(
+                &mut app,
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            );
+        }
+        assert_eq!(app.input, "AЖ:!_");
+        for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+            key(&mut app, KeyCode::Backspace, KeyModifiers::NONE, kind);
+        }
+        key(
+            &mut app,
+            KeyCode::Char('я'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        );
+        key(
+            &mut app,
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert_eq!(app.input, "AЖ:я");
+    }
+
+    #[test]
+    fn repeating_backspace_works_in_address_and_settings_fields() {
+        let mut app = App::for_test(Config::default());
+        app.screen = Screen::Connect;
+        app.conn_input = "адрес123".into();
+        for _ in 0..3 {
+            key(
+                &mut app,
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            );
+        }
+        assert_eq!(app.conn_input, "адрес");
+        app.open_settings();
+        app.edit = Some((ROW_NAME, "Имя123".into()));
+        for _ in 0..3 {
+            key(
+                &mut app,
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            );
+        }
+        assert_eq!(app.edit.as_ref().unwrap().1, "Имя");
+    }
+
+    #[test]
+    fn settings_preserve_call_and_draft_and_follow_a_hangup() {
+        let mut app = App::for_test(Config::default());
+        app.screen = Screen::Call;
+        app.mode = Some(Mode::Joiner);
+        app.input = "Черновик: Привет!".into();
+        app.input_focus = true;
+        key(
+            &mut app,
+            KeyCode::F(2),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        );
+        assert_eq!(app.screen, Screen::Settings);
+        assert_eq!(app.session_screen(), Screen::Call);
+        key(
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        );
+        assert_eq!(app.screen, Screen::Call);
+        assert!(app.input_focus);
+        assert_eq!(app.input, "Черновик: Привет!");
+        app.open_settings();
+        app.handle_net(NetEvent::CallEnded("Друг вышел".into()));
+        assert_eq!(app.screen, Screen::Settings);
+        key(
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        );
+        assert_eq!(app.screen, Screen::Home);
+    }
 }

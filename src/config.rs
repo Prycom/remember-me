@@ -19,10 +19,16 @@ pub struct Config {
     pub gain_peer: u8,
     /// PTT (нажми-и-говори) или голосовая активность (VOX) — Discord имеет оба режима
     pub mic_mode: MicMode,
-    /// порог VOX 0..100: -60..-20 dBFS (25 = -50 dBFS)
+    /// порог VOX 0..100: -70..-30 dBFS (25 = -60 dBFS)
     pub vad_threshold: u8,
-    /// шумовой гейт (простая замена noiseSuppression у Discord)
+    /// Амплитудный гейт, в том числе при удержании PTT; отдельно от шумодава.
     pub noise_gate: bool,
+    /// Automatically bring speech to a conversational level before encoding.
+    pub auto_gain: bool,
+    /// Lightweight 80 Hz–8 kHz microphone filter; no model or worker threads.
+    pub voice_filter: bool,
+    /// Optional RNNoise suppression of background noise / keyboard sounds.
+    pub noise_suppression: bool,
     /// адрес ретранслятора для звонков по коду комнаты ("1.2.3.4:51900")
     pub server_addr: String,
 }
@@ -34,7 +40,9 @@ pub enum MicMode {
 }
 
 impl Default for MicMode {
-    fn default() -> Self { MicMode::Vox }
+    fn default() -> Self {
+        MicMode::Vox
+    }
 }
 
 impl Default for Config {
@@ -49,6 +57,9 @@ impl Default for Config {
             mic_mode: MicMode::Vox,
             vad_threshold: 25,
             noise_gate: false,
+            auto_gain: true,
+            voice_filter: false,
+            noise_suppression: false,
             server_addr: String::new(),
         }
     }
@@ -68,7 +79,11 @@ impl Config {
             .map(PathBuf::from)
             .ok()
             .filter(|p| !p.as_os_str().is_empty())
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".config"))
+            })
             .unwrap_or_else(|| PathBuf::from("."));
         dir.join("remember-me").join("config.toml")
     }
@@ -96,5 +111,4 @@ impl Config {
             let _ = std::fs::write(Self::path(), s);
         }
     }
-
 }
