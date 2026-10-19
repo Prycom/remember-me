@@ -1,0 +1,1184 @@
+// Звуковой конвейер: захват → Opus-кодирование → [сеть]; [сеть] → декодирование → воспроизведение.
+//
+// Референс — наблюдаемая поверхность discord_voice (setInputVolume, setLocalVolume,
+// setSelfMute/setSelfDeafen, setPTTActive, фича 'loopback'):
+// 48 кГц моно, Opus 20 мс кадры, VBR ~32 kbps, FEC 10%, PTT/VOX, шумовой гейт.
+// Смена входного/выходного устройства — на лету (как device update у Discord).
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+
+use cpal::Sample as _;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use opusic_sys::{
+    OPUS_APPLICATION_VOIP, OPUS_OK, OPUS_SET_BITRATE_REQUEST, OPUS_SET_DTX_REQUEST,
+    OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST, OPUS_SET_VBR_REQUEST,
+    opus_decode, opus_decoder_create, opus_decoder_destroy, opus_encode, opus_encoder_create,
+    opus_encoder_ctl, opus_encoder_destroy,
+};
+
+/// RM_DEBUG=1 — трассировка звука в stderr (ошибки стримов cpal и т.п.).
+macro_rules! dbg_audio {
+    ($($t:tt)*) => {
+        if std::env::var("RM_DEBUG").ok().as_deref() == Some("1") {
+            eprintln!("[audio] {}", format!($($t)*));
+        }
+    };
+}
+
+pub const SAMPLE_RATE: u32 = 48_000;
+pub const FRAME_SAMPLES: usize = 960; // 20 мс моно @48k
+pub const BITRATE: i32 = 32_000;
+pub const HANGOVER_FRAMES: u32 = 10;
+pub const ECHO_DELAY_MS: u64 = 250;
+/// маркер «устройство ещё не подключено»
+const NEVER: &str = "\0";
+
+enum OpusEnc {}
+enum OpusDec {}
+
+pub struct Encoder {
+    ptr: *mut OpusEnc,
+}
+unsafe impl Send for Encoder {}
+
+impl Encoder {
+    pub fn new() -> Result<Encoder, String> {
+        let mut err: i32 = 0;
+        let ptr =
+            unsafe { opus_encoder_create(SAMPLE_RATE as i32, 1, OPUS_APPLICATION_VOIP, &mut err) };
+        if err != OPUS_OK {
+            return Err(format!("opus_encoder_create: {err}"));
+        }
+        let e = Encoder { ptr: ptr.cast() };
+        e.ctl(OPUS_SET_BITRATE_REQUEST, BITRATE);
+        e.ctl(OPUS_SET_VBR_REQUEST, 1);
+        e.ctl(OPUS_SET_INBAND_FEC_REQUEST, 1);
+        e.ctl(OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10);
+        e.ctl(OPUS_SET_DTX_REQUEST, 0);
+        Ok(e)
+    }
+
+    fn ctl(&self, request: i32, value: i32) {
+        unsafe {
+            opus_encoder_ctl(self.ptr.cast(), request, value);
+        }
+    }
+
+    pub fn encode(&mut self, pcm_i16: &[i16]) -> Result<Vec<u8>, String> {
+        let mut out = [0u8; 400];
+        let n = unsafe {
+            opus_encode(
+                self.ptr.cast(),
+                pcm_i16.as_ptr(),
+                FRAME_SAMPLES as i32,
+                out.as_mut_ptr(),
+                out.len() as i32,
+            )
+        };
+        if n < 0 {
+            return Err(format!("opus_encode: {n}"));
+        }
+        Ok(out[..n as usize].to_vec())
+    }
+}
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        unsafe {
+            opus_encoder_destroy(self.ptr.cast());
+        }
+    }
+}
+
+pub struct Decoder {
+    ptr: *mut OpusDec,
+}
+unsafe impl Send for Decoder {}
+
+impl Decoder {
+    pub fn new() -> Result<Decoder, String> {
+        let mut err: i32 = 0;
+        let ptr = unsafe { opus_decoder_create(SAMPLE_RATE as i32, 1, &mut err) };
+        if err != OPUS_OK {
+            return Err(format!("opus_decoder_create: {err}"));
+        }
+        Ok(Decoder { ptr: ptr.cast() })
+    }
+
+    pub fn decode(&mut self, pkt: &[u8]) -> Result<Vec<f32>, String> {
+        let mut pcm = [0i16; FRAME_SAMPLES];
+        let n = unsafe {
+            opus_decode(
+                self.ptr.cast(),
+                pkt.as_ptr(),
+                pkt.len() as i32,
+                pcm.as_mut_ptr(),
+                FRAME_SAMPLES as i32,
+                0,
+            )
+        };
+        if n < 0 {
+            return Err(format!("opus_decode: {n}"));
+        }
+        Ok(pcm[..n as usize]
+            .iter()
+            .map(|&s| s as f32 / 32768.0)
+            .collect())
+    }
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        unsafe {
+            opus_decoder_destroy(self.ptr.cast());
+        }
+    }
+}
+
+#[inline]
+fn f32_to_i16(v: f32) -> i16 {
+    (v.clamp(-1.0, 1.0) * 32768.0) as i16
+}
+
+fn rms(samples: &[f32]) -> f32 {
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt()
+}
+
+/// 0..100 maps to -60..-20 dBFS (25 = -50 dBFS). Compare amplitudes,
+/// not signal power; a normal microphone is often much quieter than -20 dBFS.
+fn vad_amplitude(threshold: u8) -> f32 {
+    10.0_f32.powf((-60.0 + threshold.min(100) as f32 * 0.4) / 20.0)
+}
+
+fn level_percent(samples: &[f32]) -> u8 {
+    (rms(samples) * 300.0).min(100.0) as u8
+}
+
+// ── Ресемпллер входа (линейная интерполяция) ───────────────────────────────
+
+pub struct Resampler {
+    rate_in: u32,
+    phase: f64,
+    buf: Vec<f32>,
+    pending: Vec<f32>,
+}
+
+impl Resampler {
+    pub fn anything(rate_in: u32) -> Resampler {
+        Resampler {
+            rate_in: rate_in.max(1),
+            phase: 0.0,
+            buf: Vec::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Возвращает накопившиеся целые кадры по 960 сэмплов @48k.
+    pub fn feed(&mut self, chunk: &[f32]) -> Vec<Vec<f32>> {
+        let ratio = self.rate_in as f64 / SAMPLE_RATE as f64;
+        self.buf.extend(chunk.iter().copied());
+        let mut out = std::mem::take(&mut self.pending);
+        loop {
+            let i = self.phase.floor() as usize;
+            if i + 1 >= self.buf.len() {
+                break;
+            }
+            let frac = (self.phase - i as f64) as f32;
+            out.push(self.buf[i] * (1.0 - frac) + self.buf[i + 1] * frac);
+            self.phase += ratio;
+        }
+        let consumed = self.phase.floor() as usize;
+        let drop = consumed.min(self.buf.len().saturating_sub(1));
+        self.buf.drain(..drop);
+        self.phase -= drop as f64;
+        let frames = out.len() / FRAME_SAMPLES;
+        let mut res = Vec::with_capacity(frames);
+        for k in 0..frames {
+            res.push(out[k * FRAME_SAMPLES..(k + 1) * FRAME_SAMPLES].to_vec());
+        }
+        self.pending = out.split_off(frames * FRAME_SAMPLES);
+        res
+    }
+}
+
+// ── Общие параметры (громкости/режимы, меняются из UI на лету) ─────────────
+
+#[derive(Clone)]
+pub struct AudioParams {
+    gain_in: Arc<AtomicU32>,   // 0..200 (%)
+    gain_peer: Arc<AtomicU32>, // 0..200 (%)
+    mute_mic: Arc<AtomicBool>,
+    deaf: Arc<AtomicBool>,
+    noise_gate: Arc<AtomicBool>,
+    vad_threshold: Arc<AtomicU32>, // 0..100
+    ptt_active: Arc<AtomicBool>,
+    vox_mode: Arc<AtomicBool>,
+    loopback: Arc<AtomicBool>,
+    /// уровень микрофона после gain, 0..100% (для индикатора на экране)
+    in_level: Arc<AtomicU8>,
+    out_level: Arc<AtomicU8>,
+}
+
+impl AudioParams {
+    pub fn new(gain_in: u8, gain_peer: u8, noise_gate: bool, vad_threshold: u8) -> AudioParams {
+        AudioParams {
+            gain_in: Arc::new(AtomicU32::new(gain_in as u32)),
+            gain_peer: Arc::new(AtomicU32::new(gain_peer as u32)),
+            mute_mic: Arc::new(AtomicBool::new(false)),
+            deaf: Arc::new(AtomicBool::new(false)),
+            noise_gate: Arc::new(AtomicBool::new(noise_gate)),
+            vad_threshold: Arc::new(AtomicU32::new(vad_threshold as u32)),
+            ptt_active: Arc::new(AtomicBool::new(false)),
+            vox_mode: Arc::new(AtomicBool::new(true)),
+            loopback: Arc::new(AtomicBool::new(false)),
+            in_level: Arc::new(AtomicU8::new(0)),
+            out_level: Arc::new(AtomicU8::new(0)),
+        }
+    }
+    pub fn in_level(&self) -> u8 {
+        self.in_level.load(Ordering::Relaxed)
+    }
+    pub fn out_level(&self) -> u8 {
+        self.out_level.load(Ordering::Relaxed)
+    }
+    pub fn store_in_level(&self, pct: u8) {
+        self.in_level.store(pct, Ordering::Relaxed);
+    }
+    pub fn set_gain_in(&self, v: u8) {
+        self.gain_in.store(v as u32, Ordering::Relaxed);
+    }
+    pub fn gain_in(&self) -> u8 {
+        self.gain_in.load(Ordering::Relaxed).min(200) as u8
+    }
+    pub fn set_gain_peer(&self, v: u8) {
+        self.gain_peer.store(v as u32, Ordering::Relaxed);
+    }
+    pub fn gain_peer(&self) -> u8 {
+        self.gain_peer.load(Ordering::Relaxed).min(200) as u8
+    }
+    pub fn set_mute_mic(&self, v: bool) {
+        self.mute_mic.store(v, Ordering::Relaxed);
+    }
+    pub fn mute_mic(&self) -> bool {
+        self.mute_mic.load(Ordering::Relaxed)
+    }
+    pub fn set_deaf(&self, v: bool) {
+        self.deaf.store(v, Ordering::Relaxed);
+        if v {
+            self.mute_mic.store(true, Ordering::Relaxed);
+        }
+    }
+    pub fn deaf(&self) -> bool {
+        self.deaf.load(Ordering::Relaxed)
+    }
+    pub fn set_noise_gate(&self, v: bool) {
+        self.noise_gate.store(v, Ordering::Relaxed);
+    }
+    pub fn noise_gate(&self) -> bool {
+        self.noise_gate.load(Ordering::Relaxed)
+    }
+    pub fn set_vad_threshold(&self, v: u8) {
+        self.vad_threshold.store(v as u32, Ordering::Relaxed);
+    }
+    pub fn vad_threshold(&self) -> u8 {
+        self.vad_threshold.load(Ordering::Relaxed).min(100) as u8
+    }
+    pub fn set_vox_mode(&self, v: bool) {
+        self.vox_mode.store(v, Ordering::Relaxed);
+    }
+    pub fn vox_mode(&self) -> bool {
+        self.vox_mode.load(Ordering::Relaxed)
+    }
+    pub fn set_ptt_active(&self, v: bool) {
+        self.ptt_active.store(v, Ordering::Relaxed);
+    }
+    pub fn set_loopback(&self, v: bool) {
+        self.loopback.store(v, Ordering::Relaxed);
+    }
+    pub fn loopback(&self) -> bool {
+        self.loopback.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceList {
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+}
+
+/// Типы имён, которые человек в списке не желает видеть:
+/// null-«Discard…» (заглушка, звук с неё нулевой) и двусмысленный
+/// «Default Audio Device» (как вывод открывается, как вход ведёт в тишину
+/// системного дефолта — пользователь тогда всё равно не различает их со
+/// своим «(по умолчанию)»).
+const JUNK_DEVICES: [&str; 2] = [
+    "Discard all samples (playback) or generate zero samples (capture)",
+    "Default Audio Device",
+];
+
+/// Алиасы системного микшера — рабочие, но по смыслу равны «(по умолчанию)».
+/// Оставляем их в конце списка: реальные источники идут первыми.
+const ALIAS_DEVICES: [&str; 2] = [
+    "PipeWire Sound Server",
+    "Default ALSA Output (currently PipeWire Media Server)",
+];
+
+fn clean_names(raw: Vec<String>, input: bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    let mut aliases: Vec<String> = Vec::new();
+    for n in raw {
+        if JUNK_DEVICES.contains(&n.as_str()) {
+            continue;
+        }
+        if out.iter().any(|o| o == &n) || aliases.iter().any(|o| o == &n) {
+            continue; // дубли покидают список
+        }
+        if ALIAS_DEVICES.contains(&n.as_str()) {
+            aliases.push(n);
+        } else {
+            out.push(n);
+        }
+    }
+    out.extend(aliases);
+    // Порядок входов: живые USB-микрофоны — первыми (частый случай
+    // внешнего микрофона), затем прочие реальные входы (у встроенного
+    // 3.5-мм джека вход может оставить тишину, если в него не воткнут
+    // микрофон), мониторы («Monitor of …») — в конце: запись системного
+    // звука — полезный, но не основной сценарий.
+    if input && out.len() > 1 {
+        let mut usb: Vec<String> = Vec::new();
+        let mut other: Vec<String> = Vec::new();
+        let mut mons: Vec<String> = Vec::new();
+        for p in out {
+            if p.starts_with("Monitor of ") {
+                mons.push(p);
+            } else if p.contains("USB") {
+                usb.push(p);
+            } else {
+                other.push(p);
+            }
+        }
+        usb.extend(other);
+        usb.extend(mons);
+        return usb;
+    }
+    out
+}
+
+pub fn list_devices() -> DeviceList {
+    let host = audio_host();
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    if let Ok(it) = host.input_devices() {
+        for d in it {
+            inputs.push(d.to_string());
+        }
+    }
+    if let Ok(it) = host.output_devices() {
+        for d in it {
+            outputs.push(d.to_string());
+        }
+    }
+    DeviceList {
+        inputs: clean_names(inputs, true),
+        outputs: clean_names(outputs, false),
+    }
+}
+
+/// Один хост на весь процесс: имена из списка и привязка при смене
+/// устройств должны из одного источника.
+/// Предпочитаем PulseAudio-хост: он отдаёт человеческие имена устройств
+/// (как pavucontrol — «Ryzen HD Audio Controller Analog Stereo»,
+/// «USB PnP Audio Device») и умеет resample. Нет сервера (headless) —
+/// откат на системный (ALSA): там остаются технические имена, но звук
+/// открывается.
+static AUDIO_HOST: std::sync::OnceLock<cpal::Host> = std::sync::OnceLock::new();
+
+pub fn audio_host() -> &'static cpal::Host {
+    AUDIO_HOST.get_or_init(|| {
+        let pulse = cpal::host_from_id(cpal::HostId::PulseAudio);
+        if let Ok(h) = pulse {
+            let outputs = h.output_devices().map(|it| it.count()).unwrap_or(0);
+            let inputs = h.input_devices().map(|it| it.count()).unwrap_or(0);
+            if outputs > 0 || inputs > 0 {
+                return h;
+            }
+        }
+        cpal::default_host()
+    })
+}
+
+/// Проверка сохранённых имён устройств: если имя не числится в списке
+/// реальных (сохранился мусор прошлой сессии) — откат на дефолт.
+/// Вызывать ДО audio::start.
+pub fn sanitize_config_devices(cfg: &mut crate::config::Config) {
+    if cfg.input_device.is_empty() && cfg.output_device.is_empty() {
+        return;
+    }
+    let list = list_devices();
+    let mut dirty = false;
+    if !cfg.input_device.is_empty() && !list.inputs.iter().any(|i| i == &cfg.input_device) {
+        dbg_audio!(
+            "конфиг: устройство ввода «{}» не найдено — дефолт",
+            cfg.input_device
+        );
+        cfg.input_device.clear();
+        dirty = true;
+    }
+    if !cfg.output_device.is_empty() && !list.outputs.iter().any(|o| o == &cfg.output_device) {
+        dbg_audio!(
+            "конфиг: устройство вывода «{}» не найдено — дефолт",
+            cfg.output_device
+        );
+        cfg.output_device.clear();
+        dirty = true;
+    }
+    if dirty {
+        cfg.save();
+    }
+}
+
+/// Имена устройств в stderr (RM_DEBUG=1) — для отладки подмены устройств.
+pub fn dbg_devices() {
+    if std::env::var("RM_DEBUG").ok().as_deref() != Some("1") {
+        return;
+    }
+    let list = list_devices();
+    eprintln!("[audio] хост: {:?}", audio_host().id());
+    eprintln!("[audio] входы:");
+    for (i, d) in list.inputs.iter().enumerate() {
+        eprintln!("[audio]   {i}: {d}");
+    }
+    eprintln!("[audio] выходы:");
+    for (i, d) in list.outputs.iter().enumerate() {
+        eprintln!("[audio]   {i}: {d}");
+    }
+}
+
+fn find_device(input: bool, name: &str) -> Option<cpal::Device> {
+    let host = audio_host();
+    let by_default = if input {
+        host.default_input_device()
+    } else {
+        host.default_output_device()
+    };
+    if name.is_empty() {
+        return by_default;
+    }
+    let it = if input {
+        match host.input_devices() {
+            Ok(i) => i,
+            Err(_) => return by_default,
+        }
+    } else {
+        match host.output_devices() {
+            Ok(i) => i,
+            Err(_) => return by_default,
+        }
+    };
+    for d in it {
+        if d.to_string() == name {
+            return Some(d);
+        }
+    }
+    by_default
+}
+
+/// Буфер стрима: 960 кадров — 20 мс @48 кГц. У pulse-хоста Default
+/// означает серверные буферы (у PipeWire ~200 мс — слишком много для
+/// звонка), фикса даёт и низкую задержку, и ровные куски на разбор.
+const STREAM_BUF_FRAMES: u32 = 960;
+
+/// Конфигурация потока: предпочитаем 48 кГц и «нормальные» форматы;
+/// иначе любой формат из F32/I16/U16/U8 (ресемплинг у нас свой).
+fn plan_stream(
+    dev: &cpal::Device,
+    input: bool,
+) -> Option<(cpal::StreamConfig, cpal::SampleFormat, u32)> {
+    use cpal::SampleFormat as SF;
+    let ranges: Vec<cpal::SupportedStreamConfigRange> = if input {
+        dev.supported_input_configs().ok()?.collect()
+    } else {
+        dev.supported_output_configs().ok()?.collect()
+    };
+    let fmt_pref = [SF::F32, SF::I16, SF::U16, SF::U8];
+    let try_candidates = |rate: Option<u32>| -> Option<(cpal::StreamConfig, SF, u32)> {
+        for fmt in fmt_pref {
+            for want_ch in [1u16, 2, 0] {
+                // 0 = любые каналы
+                for r in &ranges {
+                    if r.sample_format() != fmt {
+                        continue;
+                    }
+                    if r.channels() < 1 || (want_ch != 0 && r.channels() != want_ch) {
+                        continue;
+                    }
+                    let (lo, hi) = (r.min_sample_rate(), r.max_sample_rate());
+                    let target = match rate {
+                        Some(x) if lo <= x && x <= hi => x,
+                        Some(_) => continue,
+                        None => lo.max(sound_lowest_rate(lo, hi)),
+                    };
+                    return Some((
+                        cpal::StreamConfig {
+                            channels: r.channels().min(2),
+                            sample_rate: target,
+                            buffer_size: cpal::BufferSize::Fixed(STREAM_BUF_FRAMES),
+                        },
+                        r.sample_format(),
+                        target,
+                    ));
+                }
+            }
+        }
+        None
+    };
+    // 1) 48 кГц
+    if let Some(f) = try_candidates(Some(SAMPLE_RATE)) {
+        return Some(f);
+    }
+    // 2) любая ставка, но нормальный формат
+    if let Some(f) = try_candidates(None) {
+        return Some(f);
+    }
+    // 3) совсем не убогое — дефолт конфиг какой есть
+    let d = if input {
+        dev.default_input_config().ok()?
+    } else {
+        dev.default_output_config().ok()?
+    };
+    let cfg = cpal::StreamConfig {
+        channels: d.channels(),
+        sample_rate: d.sample_rate(),
+        buffer_size: cpal::BufferSize::Fixed(STREAM_BUF_FRAMES),
+    };
+    Some((cfg, d.sample_format(), d.sample_rate()))
+}
+
+/// любит верхнюю часть диапазона (обычно 44100+)
+fn sound_lowest_rate(lo: u32, hi: u32) -> u32 {
+    for w in [48_000, 44_100, 32_000, 22_050, 16_000] {
+        if w >= lo && w <= hi {
+            return w;
+        }
+    }
+    lo
+}
+
+// ── Выход ──────────────────────────────────────────────────────────────────
+
+struct OutFeed {
+    deq: VecDeque<f32>, // сэмплы @48k (от декодера)
+    phase: f64,
+    rate_out: f64,
+    starved: u32,
+}
+
+impl OutFeed {
+    /// Заполняет out_mono сэмплами из очереди, растягивая/сжимая с 48k до rate_out.
+    fn mono_fill(&mut self, out_mono: &mut [f32], gain: f32) {
+        // сколько исходных (48k) сэмплов тратится на один выходной
+        let step = SAMPLE_RATE as f64 / self.rate_out.max(1.0);
+        for o in out_mono.iter_mut() {
+            let i = self.phase.floor() as usize;
+            let frac = (self.phase - i as f64) as f32;
+            if i < self.deq.len() && (frac < 1e-6 || i + 1 < self.deq.len()) {
+                let next = self.deq.get(i + 1).copied().unwrap_or(self.deq[i]);
+                let s = self.deq[i] * (1.0 - frac) + next * frac;
+                *o = s * gain;
+                self.starved = 0;
+                self.phase += step;
+            } else {
+                *o = 0.0;
+                self.starved = self.starved.saturating_add(1);
+            }
+        }
+        let consumed = self.phase.floor() as usize;
+        if consumed > 0 {
+            let cut = consumed.min(self.deq.len());
+            self.deq.drain(..cut);
+            self.phase -= cut as f64;
+        }
+        // Silence is not audio in the queue. Never accrue a read-position
+        // debt while waiting for the next packet (startup, VOX, packet loss).
+        if self.deq.is_empty() {
+            self.phase = 0.0;
+        }
+    }
+}
+
+fn st_push(st: &mut OutFeed, samples: &[f32]) {
+    st.deq.extend(samples.iter().copied());
+    let excess = st.deq.len().saturating_sub(10 * FRAME_SAMPLES);
+    if excess > 0 {
+        st.deq.drain(..excess);
+        st.phase = 0.0;
+    }
+}
+
+// ── Держатель всего звука ──────────────────────────────────────────────────
+
+pub struct AudioEngine {
+    pub params: AudioParams,
+    /// канал, куда кодер кладёт Opus-кадры (main pump шлёт их в net-сессию)
+    pub encoded_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// состояние «я говорю» (для UI/индикатора)
+    pub self_speaking: Arc<AtomicBool>,
+    out: Arc<Mutex<OutFeed>>,
+    echo_tx: mpsc::SyncSender<Vec<u8>>,
+    dec: Mutex<Option<Decoder>>,
+    in_stream: Mutex<Option<cpal::Stream>>,
+    out_stream: Mutex<Option<cpal::Stream>>,
+    /// текущие привязанные устройства (пусто = дефолт), NEVER — ещё не подключены
+    cur_in: Mutex<String>,
+    cur_out: Mutex<String>,
+}
+
+impl AudioEngine {
+    /// Push декодированного кадра @48k (net-задача / эхо-поток).
+    pub fn push_out(&self, samples: &[f32]) {
+        let mut st = self.out.lock().unwrap();
+        st_push(&mut st, samples);
+    }
+    /// Сброс декодера и очереди перед новым звонком.
+    pub fn prefill_out(&self) {
+        let mut st = self.out.lock().unwrap();
+        st.deq.clear();
+        st.phase = 0.0;
+        *self.dec.lock().unwrap() = None;
+        let need = 3 * FRAME_SAMPLES;
+        while st.deq.len() < need {
+            st.deq.push_back(0.0);
+        }
+    }
+
+    /// Декодирование входящего Opus-кадра (для net-задачи).
+    pub fn decode_opus(&self, pkt: &[u8]) -> Option<Vec<f32>> {
+        let mut g = self.dec.lock().unwrap();
+        if g.is_none() {
+            *g = Decoder::new().ok();
+        }
+        let d = g.as_mut()?;
+        d.decode(pkt).ok()
+    }
+
+    /// Имена реально привязанных устройств; "" значит «по умолчанию».
+    pub fn current_devices(&self) -> (String, String) {
+        let i = self.cur_in.lock().unwrap();
+        let o = self.cur_out.lock().unwrap();
+        (i.clone(), o.clone())
+    }
+
+    fn stop_input(&self) {
+        let mut slot = self.in_stream.lock().unwrap();
+        *slot = None; // старые колбэки отвязаны, кодер-поток умрёт сам (канал закрыт)
+        *self.cur_in.lock().unwrap() = NEVER.into();
+        self.self_speaking.store(false, Ordering::Relaxed);
+    }
+    fn stop_output(&self) {
+        let mut slot = self.out_stream.lock().unwrap();
+        *slot = None;
+        *self.cur_out.lock().unwrap() = NEVER.into();
+        self.params.out_level.store(0, Ordering::Relaxed);
+    }
+
+    /// Подменяет входное и выходное устройство по имени ("" = дефолт).
+    /// Меняется только та сторона, чьё имя реально изменилось.
+    pub fn rebuild_devices(&self, input_name: &str, output_name: &str) -> Result<(), String> {
+        let (ci, co) = self.current_devices();
+        let in_changed = ci != input_name;
+        let out_changed = co != output_name;
+        if !in_changed && !out_changed {
+            return Ok(());
+        }
+
+        // выход: там живёт общий OutFeed (к нему же пишет эхо-тест)
+        let mut err_out: Option<String> = None;
+        if out_changed {
+            self.stop_output();
+            let res = self.attach_output(output_name);
+            dbg_audio!(
+                "attach_output «{output_name}» → {}",
+                match &res {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => e.to_string(),
+                }
+            );
+            match res {
+                Ok(()) => *self.cur_out.lock().unwrap() = output_name.into(),
+                Err(e) => err_out = Some(format!("выход: {e}")),
+            }
+        }
+
+        // вход: при подмене выбрасываем поток ввода — кодер-поток умрёт от
+        // Disconnected, спавним новый
+        let mut err_in: Option<String> = None;
+        if in_changed {
+            self.stop_input();
+            let res = self.attach_input(input_name);
+            dbg_audio!(
+                "attach_input «{input_name}» → {}",
+                match &res {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => e.to_string(),
+                }
+            );
+            match res {
+                Ok(()) => *self.cur_in.lock().unwrap() = input_name.into(),
+                Err(e) => err_in = Some(format!("вход: {e}")),
+            }
+        }
+
+        match (err_in, err_out) {
+            (None, None) => Ok(()),
+            (i, o) => Err([i, o].into_iter().flatten().collect::<Vec<_>>().join("; ")),
+        }
+    }
+
+    fn attach_output(&self, out_name: &str) -> Result<(), String> {
+        let out_dev = find_device(false, out_name).ok_or("аудио-выход не найден")?;
+        let (out_cfg, out_fmt, out_rate) =
+            plan_stream(&out_dev, false).ok_or("выходные форматы недоступны")?;
+        let out_channels = out_cfg.channels as usize;
+        let st = self.out.clone();
+        let gain = self.params.gain_peer.clone();
+        let df = self.params.deaf.clone();
+        let level = self.params.out_level.clone();
+
+        macro_rules! build_out {
+            ($t:ty) => {{
+                out_dev
+                    .build_output_stream::<$t, _, _>(
+                        out_cfg.clone(),
+                        move |data: &mut [$t], _info| {
+                            let g_now = if df.load(Ordering::Relaxed) {
+                                0.0
+                            } else {
+                                gain.load(Ordering::Relaxed) as f32 / 100.0
+                            };
+                            let ch = out_channels.max(1);
+                            let frames = data.len() / ch;
+                            let mut mono = vec![0f32; frames];
+                            {
+                                let mut f = st.lock().unwrap();
+                                f.mono_fill(&mut mono, g_now);
+                            }
+                            level.store(level_percent(&mono), Ordering::Relaxed);
+                            if ch <= 1 {
+                                for (d, m) in data.iter_mut().zip(&mono) {
+                                    *d = m.to_sample::<$t>();
+                                }
+                            } else {
+                                for (i, m) in mono.iter().enumerate() {
+                                    for c in 0..ch {
+                                        if let Some(d) = data.get_mut(i * ch + c) {
+                                            *d = m.to_sample::<$t>();
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        |err| {
+                            dbg_audio!("ошибка выходного стрима: {err}");
+                        },
+                        None,
+                    )
+                    .map_err(|e| format!("открыть выход: {e}"))
+            }};
+        }
+        let out_stream = match out_fmt {
+            cpal::SampleFormat::F32 => build_out!(f32),
+            cpal::SampleFormat::I16 => build_out!(i16),
+            cpal::SampleFormat::U16 => build_out!(u16),
+            cpal::SampleFormat::U8 => build_out!(u8),
+            cpal::SampleFormat::I8 => build_out!(i8),
+            other => return Err(format!("неподдержанный выходной формат {other:?}")),
+        }?;
+        let mut o_rate = self.out.lock().unwrap();
+        o_rate.rate_out = out_rate as f64;
+        o_rate.phase = 0.0;
+        drop(o_rate);
+        out_stream
+            .play()
+            .map_err(|e| format!("запуск выхода: {e}"))?;
+        *self.out_stream.lock().unwrap() = Some(out_stream);
+        Ok(())
+    }
+
+    fn attach_input(&self, in_name: &str) -> Result<(), String> {
+        let in_dev = find_device(true, in_name).ok_or("микрофон не найден")?;
+        let (in_cfg, in_fmt, in_rate) =
+            plan_stream(&in_dev, true).ok_or("входные форматы недоступны")?;
+        let in_channels = in_cfg.channels as usize;
+        let (raw_tx, raw_rx) = mpsc::sync_channel::<Vec<f32>>(64);
+
+        macro_rules! build_in {
+            ($t:ty) => {{
+                let tx = raw_tx.clone();
+                in_dev
+                    .build_input_stream::<$t, _, _>(
+                        in_cfg.clone(),
+                        move |data: &[$t], _info| {
+                            if in_channels <= 1 {
+                                let mono: Vec<f32> =
+                                    data.iter().map(|s| s.to_sample::<f32>()).collect();
+                                let _ = tx.try_send(mono);
+                            } else {
+                                let mut mono = Vec::with_capacity(data.len() / in_channels);
+                                for ch_chunk in data.chunks(in_channels) {
+                                    let sum: f32 =
+                                        ch_chunk.iter().map(|s| s.to_sample::<f32>()).sum();
+                                    mono.push(sum / in_channels as f32);
+                                }
+                                let _ = tx.try_send(mono);
+                            }
+                        },
+                        |err| {
+                            dbg_audio!("ошибка входного стрима: {err}");
+                        },
+                        None,
+                    )
+                    .map_err(|e| format!("открыть вход: {e}"))
+            }};
+        }
+        let in_stream = match in_fmt {
+            cpal::SampleFormat::F32 => build_in!(f32),
+            cpal::SampleFormat::I16 => build_in!(i16),
+            cpal::SampleFormat::U16 => build_in!(u16),
+            cpal::SampleFormat::I8 => build_in!(i8),
+            cpal::SampleFormat::U8 => build_in!(u8),
+            other => return Err(format!("неподдержанный входной формат {other:?}")),
+        }?;
+        in_stream.play().map_err(|e| format!("запуск входа: {e}"))?;
+
+        self.spawn_encoder(raw_rx, in_rate);
+        *self.in_stream.lock().unwrap() = Some(in_stream);
+        Ok(())
+    }
+
+    /// Поток кодера: ресемпл → mute/PTT/VOX → шумовой гейт → Opus → канал.
+    fn spawn_encoder(&self, raw_rx: mpsc::Receiver<Vec<f32>>, enc_rate: u32) {
+        let params = self.params.clone();
+        let speak_flag = self.self_speaking.clone();
+        let encoded_tx = self.encoded_tx.clone();
+        let echo_tx = self.echo_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("rm-encoder".into())
+            .spawn(move || {
+                let mut enc = match Encoder::new() {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("opus encoder: {e}");
+                        return;
+                    }
+                };
+                let mut res = Resampler::anything(enc_rate);
+                let mut hangover = HANGOVER_FRAMES;
+                let mut was_speaking = false;
+                loop {
+                    let chunk = match raw_rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(v) => v,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    };
+                    for frame in res.feed(&chunk) {
+                        if frame.len() != FRAME_SAMPLES {
+                            continue;
+                        }
+                        let gain = params.gain_in() as f32 / 100.0;
+                        let frame: Vec<f32> =
+                            frame.iter().map(|s| (*s * gain).clamp(-1.0, 1.0)).collect();
+                        let mut pcm_i16 = vec![0i16; FRAME_SAMPLES];
+                        for (o, s) in pcm_i16.iter_mut().zip(&frame) {
+                            *o = f32_to_i16(*s);
+                        }
+                        // уровень микрофона для индикатора (RMS проценты)
+                        {
+                            params.store_in_level(level_percent(&frame));
+                        }
+                        // Режимы как в Discord: mute перекрывает всё;
+                        // PTT — говорим только при зажатом спейсе; VOX — по порогу
+                        let speak = if params.mute_mic() {
+                            false
+                        } else if params.vox_mode() {
+                            rms(&frame) >= vad_amplitude(params.vad_threshold())
+                        } else {
+                            params.ptt_active.load(Ordering::Relaxed)
+                        };
+                        let speaking_now = if params.mute_mic()
+                            || (!params.vox_mode() && !params.ptt_active.load(Ordering::Relaxed))
+                        {
+                            hangover = 0;
+                            false
+                        } else if speak {
+                            hangover = HANGOVER_FRAMES;
+                            true
+                        } else if was_speaking && hangover > 0 {
+                            hangover -= 1;
+                            true
+                        } else {
+                            false
+                        };
+                        if was_speaking != speaking_now {
+                            speak_flag.store(speaking_now, Ordering::Relaxed);
+                            was_speaking = speaking_now;
+                        }
+                        if !speaking_now {
+                            continue;
+                        }
+                        if params.noise_gate.load(Ordering::Relaxed) {
+                            let gate = vad_amplitude(params.vad_threshold()) * 32768.0;
+                            for s in pcm_i16.iter_mut() {
+                                if ((*s as f32).abs()) < gate {
+                                    *s = 0;
+                                }
+                            }
+                        }
+                        match enc.encode(&pcm_i16) {
+                            Ok(bytes) => {
+                                if params.loopback.load(Ordering::Relaxed) {
+                                    let _ = echo_tx.send(bytes);
+                                } else {
+                                    let _ = encoded_tx.send(bytes);
+                                }
+                            }
+                            Err(e) => eprintln!("opus encode: {e}"),
+                        }
+                    }
+                }
+            });
+    }
+}
+
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        self.stop_input();
+        self.stop_output();
+    }
+}
+
+/// Запуск захвата/кодера/воспроизведения.
+pub fn start(
+    cfg: &crate::config::Config,
+    encoded_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) -> Result<Arc<AudioEngine>, String> {
+    let params = AudioParams::new(
+        cfg.gain_in,
+        cfg.gain_peer,
+        cfg.noise_gate,
+        cfg.vad_threshold,
+    );
+    params.set_vox_mode(matches!(cfg.mic_mode, crate::config::MicMode::Vox));
+
+    let self_speaking = Arc::new(AtomicBool::new(false));
+    let out = Arc::new(Mutex::new(OutFeed {
+        deq: VecDeque::new(),
+        phase: 0.0,
+        rate_out: SAMPLE_RATE as f64,
+        starved: 0,
+    }));
+
+    // ── канал эхо-теста (живёт на весь срок движка) ────────────────────────
+    let (echo_tx, echo_rx) = mpsc::sync_channel::<Vec<u8>>(32);
+    {
+        let out_feed = out.clone();
+        let _ = std::thread::Builder::new()
+            .name("rm-echo".into())
+            .spawn(move || {
+                let mut dec = match Decoder::new() {
+                    Ok(d) => d,
+                    Err(_) => return,
+                };
+                // отставание: окно накопления ~ECHO_DELAY_MS
+                let mut window: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
+                let lag = Duration::from_millis(ECHO_DELAY_MS);
+                // сама задержка — «честность» эха: слышим себя как собеседник
+                loop {
+                    match echo_rx.recv_timeout(Duration::from_millis(10)) {
+                        Ok(frame) => window.push_back((Instant::now() + lag, frame)),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                    while let Some(front) = window.front() {
+                        if front.0 > Instant::now() {
+                            break;
+                        }
+                        let (_, frame) = window.pop_front().unwrap();
+                        if let Ok(samples) = dec.decode(&frame) {
+                            let mut st = out_feed.lock().unwrap();
+                            st_push(&mut st, &samples);
+                        }
+                    }
+                }
+            });
+    }
+
+    let engine = Arc::new(AudioEngine {
+        params,
+        encoded_tx,
+        self_speaking,
+        out,
+        echo_tx,
+        dec: Mutex::new(None),
+        in_stream: Mutex::new(None),
+        out_stream: Mutex::new(None),
+        cur_in: Mutex::new(NEVER.into()),
+        cur_out: Mutex::new(NEVER.into()),
+    });
+
+    dbg_devices();
+    // Подключаем устройства; при неудаче — на дефолтные, как Discord (device update).
+    if let Err(e) = engine.rebuild_devices(&cfg.input_device, &cfg.output_device) {
+        match engine.rebuild_devices("", "") {
+            Ok(()) => eprintln!("звук: использованы устройства по умолчанию ({e})"),
+            Err(e2) => return Err(format!("{e}; резерв тоже не удался: {e2}")),
+        }
+    }
+    Ok(engine)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encoder() -> (
+        AudioParams,
+        mpsc::SyncSender<Vec<f32>>,
+        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        let params = AudioParams::new(100, 100, false, 25);
+        let (encoded_tx, encoded_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (echo_tx, _) = mpsc::sync_channel(1);
+        let engine = AudioEngine {
+            params: params.clone(),
+            encoded_tx,
+            self_speaking: Arc::new(AtomicBool::new(false)),
+            out: Arc::new(Mutex::new(output(SAMPLE_RATE))),
+            echo_tx,
+            dec: Mutex::new(None),
+            in_stream: Mutex::new(None),
+            out_stream: Mutex::new(None),
+            cur_in: Mutex::new(NEVER.into()),
+            cur_out: Mutex::new(NEVER.into()),
+        };
+        let (tx, rx) = mpsc::sync_channel(4);
+        engine.spawn_encoder(rx, SAMPLE_RATE);
+        (params, tx, encoded_rx)
+    }
+
+    fn speech(amplitude: f32) -> Vec<f32> {
+        (0..2 * FRAME_SAMPLES + 1)
+            .map(|i| {
+                amplitude * (i as f32 * 440.0 * std::f32::consts::TAU / SAMPLE_RATE as f32).sin()
+            })
+            .collect()
+    }
+
+    async fn receive_frames(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        let mut dec = Decoder::new().unwrap();
+        for _ in 0..2 {
+            let packet = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("voice was suppressed")
+                .unwrap();
+            let pcm = dec.decode(&packet).unwrap();
+            assert_eq!(pcm.len(), FRAME_SAMPLES);
+            assert!(rms(&pcm) > 0.001, "encoded voice was silent");
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_speech_passes_default_vox_and_opus() {
+        let (_, tx, mut rx) = encoder();
+        tx.send(speech(0.02)).unwrap();
+        receive_frames(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn mic_gain_affects_vox_and_level_meter() {
+        let (params, tx, mut rx) = encoder();
+        tx.send(speech(0.003)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err()
+        );
+        params.set_gain_in(200);
+        tx.send(speech(0.003)).unwrap();
+        receive_frames(&mut rx).await;
+        assert!(params.in_level() > 0);
+    }
+
+    #[tokio::test]
+    async fn mute_and_ptt_release_suppress_voice_immediately() {
+        let (params, tx, mut rx) = encoder();
+        tx.send(speech(0.02)).unwrap();
+        receive_frames(&mut rx).await;
+        params.set_mute_mic(true);
+        tx.send(speech(0.02)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err()
+        );
+        params.set_mute_mic(false);
+        params.set_vox_mode(false);
+        params.set_ptt_active(true);
+        tx.send(speech(0.02)).unwrap();
+        receive_frames(&mut rx).await;
+        params.set_ptt_active(false);
+        tx.send(speech(0.02)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    fn output(rate: u32) -> OutFeed {
+        OutFeed {
+            deq: VecDeque::new(),
+            phase: 0.0,
+            rate_out: rate as f64,
+            starved: 0,
+        }
+    }
+
+    #[test]
+    fn playback_recovers_after_waiting_and_speech_pauses() {
+        for rate in [16_000, 44_100, 48_000, 96_000] {
+            let mut feed = output(rate);
+            let mut block = vec![0.0; rate as usize / 50];
+            for _ in 0..3 {
+                // The output device runs while waiting for a call / while VOX is closed.
+                for _ in 0..100 {
+                    feed.mono_fill(&mut block, 1.0);
+                }
+                for _ in 0..10 {
+                    st_push(&mut feed, &vec![0.25; FRAME_SAMPLES]);
+                    feed.mono_fill(&mut block, 1.0);
+                    assert!(
+                        block.iter().filter(|&&s| s > 0.2).count() > block.len() * 9 / 10,
+                        "playback stayed silent after idle at {rate} Hz"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn output_handles_callback_larger_than_available_audio() {
+        let mut feed = output(SAMPLE_RATE);
+        st_push(&mut feed, &vec![0.5; FRAME_SAMPLES]);
+        let mut block = vec![0.0; 4 * FRAME_SAMPLES];
+        feed.mono_fill(&mut block, 1.0);
+        assert!(block[..FRAME_SAMPLES].iter().all(|&s| s == 0.5));
+        assert!(block[FRAME_SAMPLES..].iter().all(|&s| s == 0.0));
+        st_push(&mut feed, &vec![0.25; FRAME_SAMPLES]);
+        feed.mono_fill(&mut block[..FRAME_SAMPLES], 1.0);
+        assert!(block[..FRAME_SAMPLES].iter().all(|&s| s == 0.25));
+    }
+}
