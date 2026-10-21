@@ -31,6 +31,9 @@ pub struct Participant {
 }
 struct Peer {
     identity: wire::Identity,
+    name_delivery: crate::avatar::Delivery,
+    name_received: u64,
+    avatar_custom: bool,
     avatar_delivery: crate::avatar::Delivery,
     avatar_received: u64,
     avatar_assembly: crate::avatar::Assembly,
@@ -159,6 +162,7 @@ async fn session(
     let mut pending: Vec<Pending> = Vec::new();
     let mut download_dir = cfg.download_directory();
     let mut profile = crate::avatar::Profile::new(cfg.avatar.as_ref());
+    let mut name = crate::profile::Name::new(&cfg.name);
     let mut roster_version = None;
     let mut entered = false;
     let started = Instant::now();
@@ -196,7 +200,7 @@ async fn session(
                         if peers.contains_key(&identity.id){continue}
                         let shared=secret.diffie_hellman(&PublicKey::from(identity.key)).to_bytes();if shared==[0;32]{continue}
                         let salt=prefixes(&own,&identity,epoch,code);let id=identity.id;
-                        peers.insert(id,Peer{status:Participant{id,name:identity.name.clone(),rtt:None,mute:false,deaf:false,speaking:false,level:0,known:false,avatar:crate::avatar::display(None,&identity.name)},avatar_delivery:Default::default(),avatar_received:0,avatar_assembly:Default::default(),cipher:Cipher::new(&shared,&salt,own_id<id),identity,control:0,sequence:0,decoder:Decoder::new()?,audio:VecDeque::new(),buffering:true,last_audio:Instant::now()-Duration::from_secs(10),last_authenticated:Instant::now()-Duration::from_secs(10),files:transfer::spawn_routed(download_dir.clone(),id,files_tx.clone()),seen_text:VecDeque::new(),pings:VecDeque::new()});
+                        peers.insert(id,Peer{status:Participant{id,name:identity.name.clone(),rtt:None,mute:false,deaf:false,speaking:false,level:0,known:false,avatar:crate::avatar::display(None,&identity.name)},name_delivery:Default::default(),name_received:0,avatar_custom:false,avatar_delivery:Default::default(),avatar_received:0,avatar_assembly:Default::default(),cipher:Cipher::new(&shared,&salt,own_id<id),identity,control:0,sequence:0,decoder:Decoder::new()?,audio:VecDeque::new(),buffering:true,last_audio:Instant::now()-Duration::from_secs(10),last_authenticated:Instant::now()-Duration::from_secs(10),files:transfer::spawn_routed(download_dir.clone(),id,files_tx.clone()),seen_text:VecDeque::new(),pings:VecDeque::new()});
                     }
                     roster_version=Some((epoch,revision,own.generation));
                     if !entered{entered=true;let _=events.send(NetEvent::GroupEntered{room:String::from_utf8_lossy(&code).into_owned(),server:target.clone()});trace("joined room");}
@@ -213,11 +217,21 @@ async fn session(
                             if let Ok(decoded)=peer.decoder.decode_with_loss(&payload,missing){peer.audio.extend(decoded);while peer.audio.len()>FRAME_SAMPLES*10{peer.audio.drain(..FRAME_SAMPLES);}}
                             peer.last_audio=Instant::now();peer.status.speaking=true;
                         }
-                        Packet::Avatar{revision,avatar}=>{send(&socket,server,own_id,peer,Packet::AvatarAck{revision}).await;if revision>peer.avatar_received{peer.avatar_received=revision;peer.status.avatar=avatar.unwrap_or_else(||crate::avatar::display(None,&peer.identity.name));trace(&format!("avatar received from {} revision={revision}",peer.identity.name));}}
+                        Packet::Name{revision,name}=>{
+                            send(&socket,server,own_id,peer,Packet::NameAck{revision}).await;
+                            if revision>peer.name_received {
+                                peer.name_received=revision;peer.identity.name=name.clone();peer.status.name=name.clone();
+                                if !peer.avatar_custom {peer.status.avatar=crate::avatar::display(None,&name);}
+                                trace(&format!("name received: {name} revision={revision}"));
+                                last_ui=Instant::now()-Duration::from_secs(1);
+                            }
+                        }
+                        Packet::NameAck{revision}=>peer.name_delivery.ack(revision),
+                        Packet::Avatar{revision,avatar}=>{send(&socket,server,own_id,peer,Packet::AvatarAck{revision}).await;if revision>peer.avatar_received{peer.avatar_received=revision;peer.avatar_custom=avatar.is_some();peer.status.avatar=avatar.unwrap_or_else(||crate::avatar::display(None,&peer.identity.name));trace(&format!("avatar received from {} revision={revision}",peer.identity.name));}}
                         Packet::AvatarChunk{revision,index,count,bytes}=>{
                             if revision<=peer.avatar_received {send(&socket,server,own_id,peer,Packet::AvatarAck{revision}).await;}
                             else if let Some(avatar)=peer.avatar_assembly.push(revision,index,count,bytes){
-                                peer.avatar_received=revision;peer.status.avatar=avatar;
+                                peer.avatar_received=revision;peer.avatar_custom=true;peer.status.avatar=avatar;
                                 send(&socket,server,own_id,peer,Packet::AvatarAck{revision}).await;
                                 trace(&format!("avatar received from {} revision={revision}",peer.identity.name));
                             }
@@ -239,6 +253,7 @@ async fn session(
             }
             cmd=commands.recv()=>match cmd {
                 Some(NetCmd::Stop|NetCmd::HangUp{..})|None=>{let _=events.send(NetEvent::CallEnded("вы вышли из комнаты".into()));return Ok(())}
+                Some(NetCmd::Name(value))=>{name.set(&value);own.name=name.value.clone();}
                 Some(NetCmd::Avatar(avatar))=>profile.set(avatar),
                 Some(NetCmd::DownloadDirectory(path))=>{download_dir=path;for p in peers.values(){p.files.set_directory(download_dir.clone());}}
                 Some(NetCmd::SendFile(path))=>{if peers.is_empty(){let _=events.send(NetEvent::Progress("в комнате пока нет получателей файла".into()));}for p in peers.values(){let _=p.files.commands.try_send(transfer::Command::Send(path.clone()));}}
@@ -261,7 +276,9 @@ async fn session(
                     if !p.buffering&&p.audio.len()>=FRAME_SAMPLES {for sample in &mut mixed{*sample+=p.audio.pop_front().unwrap();}}else{p.buffering=true;}
                 }
                 engine.push_out(&mixed);
-                for p in peers.values_mut(){if let Some(packet)=profile.next(&mut p.avatar_delivery,now){send(&socket,server,own_id,p,packet).await;}}
+                for p in peers.values_mut(){
+                    if let Some(packet)=name.next(&mut p.name_delivery,now){send(&socket,server,own_id,p,packet).await;}
+                    if let Some(packet)=profile.next(&mut p.avatar_delivery,now){send(&socket,server,own_id,p,packet).await;}}
                 if last_status.elapsed()>=Duration::from_secs(1){last_status=now;for p in peers.values_mut(){send(&socket,server,own_id,p,Packet::Status{mute_mic:engine.params.mute_mic(),deaf:engine.params.deaf(),lvl:engine.params.in_level()}).await;}}
                 if last_ping.elapsed()>=Duration::from_secs(2){last_ping=now;ping_id+=1;for p in peers.values_mut(){p.pings.push_back((ping_id,now));while p.pings.len()>8{p.pings.pop_front();}send(&socket,server,own_id,p,Packet::Ping{msg_id:ping_id,ts_ms:0}).await;}}
                 for message in &mut pending{if message.sent.elapsed()>Duration::from_millis(1500){message.tries+=1;message.sent=now;for id in &message.waiting{if let Some(p)=peers.get_mut(id){send(&socket,server,own_id,p,Packet::Text{msg_id:message.id,text:message.text.clone()}).await;}}}}

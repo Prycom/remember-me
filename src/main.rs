@@ -13,12 +13,14 @@ mod action;
 mod app;
 mod audio;
 mod avatar;
+mod avatar_graphics;
 mod chat_links;
 mod clipboard;
 mod config;
 mod group;
 mod net;
 mod noise_suppress;
+mod profile;
 mod proto;
 mod transfer;
 mod ui;
@@ -176,6 +178,8 @@ async fn run(
     }
 
     let mut term = ratatui::init();
+    let mut ui = crate::ui::Ui::default();
+    ui.thumbnails.detect();
     // kitty-style расширенные события клавиш: нужны для держания-space (PTT);
     // на терминалах без поддержки тихо игнорируется
     let _ = crossterm::execute!(
@@ -195,7 +199,6 @@ async fn run(
         )
     );
 
-    let mut ui = crate::ui::Ui::default();
     let mut res: std::io::Result<()> = Ok(());
     let frame_period = Duration::from_millis(33);
     let mut next_draw = Instant::now();

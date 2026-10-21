@@ -42,6 +42,8 @@ pub struct Config {
     pub avatar_resolution: u16,
     /// Cached full-detail source, so changing detail does not require the original file.
     pub avatar_original: Option<crate::avatar::Avatar>,
+    /// Old versions cropped photos. Reimport them once if the source still exists.
+    pub avatar_contained: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +81,7 @@ impl Default for Config {
             avatar_style: Default::default(),
             avatar_resolution: 32,
             avatar_original: None,
+            avatar_contained: false,
         }
     }
 }

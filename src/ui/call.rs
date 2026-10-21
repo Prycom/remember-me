@@ -17,11 +17,7 @@ const BAR_CELLS: usize = 6;
 pub fn render(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
     if area.width >= 86 {
         let [left, right] = Layout::horizontal([
-            Constraint::Length(
-                ((app.cfg.avatar_resolution / 4).clamp(6, 32) + 36)
-                    .max(44)
-                    .min(area.width / 2),
-            ),
+            Constraint::Length(44.min(area.width / 2)),
             Constraint::Min(20),
         ])
         .areas(area);
@@ -29,7 +25,7 @@ pub fn render(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
         chat(app, f, ui, right);
     } else {
         let count = app.participant_count() as u16;
-        let height = (count * 3 + 2)
+        let height = (count * 5 + 1)
             .max(6)
             .min(12)
             .min(area.height.saturating_sub(6));
@@ -41,7 +37,7 @@ pub fn render(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
 }
 struct MemberCard<'a> {
     name: String,
-    avatar: &'a crate::avatar::Avatar,
+    avatar: &'a std::sync::Arc<crate::avatar::Avatar>,
     mute: Option<bool>,
     deaf: Option<bool>,
     speaking: bool,
@@ -77,7 +73,9 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
         level: if p.mute_mic() { 0 } else { p.in_level() },
         ping: "вы".into(),
     }];
-    let waiting = crate::avatar::Avatar::identicon("waiting");
+    static WAITING: std::sync::OnceLock<std::sync::Arc<crate::avatar::Avatar>> =
+        std::sync::OnceLock::new();
+    let waiting = WAITING.get_or_init(|| crate::avatar::display(None, "waiting"));
     if app.group_room.is_some() {
         for peer in &app.group_peers {
             cards.push(MemberCard {
@@ -107,7 +105,7 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
     } else {
         cards.push(MemberCard {
             name: "Ожидаем собеседника".into(),
-            avatar: &waiting,
+            avatar: waiting,
             mute: None,
             deaf: None,
             speaking: false,
@@ -116,37 +114,18 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
         });
     }
     let selected = app.call_sel.min(cards.len() - 1);
-    let thumbnail = (if inner.height < 16 {
-        6
-    } else {
-        app.cfg.avatar_resolution / 4
-    })
-    .clamp(6, 32)
-    .min(inner.width.saturating_sub(22))
-        / 2
-        * 2;
+    // Resolution controls image detail, never the size of the participant card.
+    let thumbnail =
+        (if inner.height < 8 { 6u16 } else { 8 }).min(inner.width.saturating_sub(22)) / 2 * 2;
     let card_height = (thumbnail / 2).max(3);
-    let portrait_height = if inner.height >= (card_height * cards.len().min(3) as u16 + 18).max(28)
-        && inner.width >= 32
-    {
-        ((cards[selected].avatar.side() as u16 / 2 + 2)
-            .min(inner.width / 2 + 2)
-            .min(
-                inner
-                    .height
-                    .saturating_sub(cards.len().min(3) as u16 * card_height),
-            ))
-        .max(18)
-    } else {
-        0
-    };
-    let list_height = inner.height.saturating_sub(portrait_height);
-    let visible = (list_height as usize / card_height as usize).max(1);
+    let stride = card_height + 1; // A full blank row between participants.
+    let list_height = inner.height;
+    let visible = ((list_height as usize + 1) / stride as usize).max(1);
     let start = (selected + 1)
         .saturating_sub(visible)
         .min(cards.len().saturating_sub(visible));
     for (index, card) in cards.iter().enumerate().skip(start).take(visible) {
-        let y = inner.y + (index - start) as u16 * card_height;
+        let y = inner.y + (index - start) as u16 * stride;
         let height = card_height.min(inner.y + list_height - y);
         if height == 0 {
             continue;
@@ -164,11 +143,10 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
             Paragraph::new((0..height).map(|_| "▎").collect::<Vec<_>>().join("\n")).style(marker),
             Rect::new(row.x, row.y, 1, row.height),
         );
-        f.render_widget(
-            crate::avatar::Portrait {
-                avatar: card.avatar,
-                mode: app.cfg.avatar_style,
-            },
+        ui.thumbnails.render(
+            card.avatar,
+            app.cfg.avatar_style,
+            f,
             Rect::new(row.x + 1, row.y, thumbnail, row.height),
         );
         ui.push(
@@ -201,7 +179,7 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
         } else if card.mute == Some(true) {
             "микро выкл"
         } else if card.mute.is_some() {
-            "в комнате"
+            ""
         } else {
             "соединяемся"
         };
@@ -225,44 +203,8 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
             }
         }
     }
-    if portrait_height > 0 {
-        let card = &cards[selected];
-        let area = Rect::new(
-            inner.x,
-            inner.bottom() - portrait_height,
-            inner.width,
-            portrait_height,
-        );
-        let title = format!(
-            " {} ",
-            pad_name(&card.name, area.width.saturating_sub(4) as usize).trim_end()
-        );
-        let block = Block::bordered()
-            .title(title)
-            .title_bottom(if selected == 0 {
-                " клик: открыть профиль "
-            } else {
-                " профиль участника "
-            })
-            .border_style(if card.speaking {
-                green()
-            } else if focused {
-                accent()
-            } else {
-                dim()
-            });
-        let image = block.inner(area);
-        f.render_widget(block, area);
-        f.render_widget(
-            crate::avatar::Portrait {
-                avatar: card.avatar,
-                mode: app.cfg.avatar_style,
-            },
-            image,
-        );
-        ui.push(image, Action::ShowProfile(selected));
-    }
 }
+
 fn status(disabled: Option<bool>) -> &'static str {
     match disabled {
         Some(true) => "ВЫКЛ",
@@ -766,31 +708,34 @@ mod tests {
         );
     }
     #[test]
-    fn increasing_resolution_gives_thumbnails_more_pixels_without_hiding_names_in_small_windows() {
-        use ratatui::style::Color;
+    fn avatar_resolution_never_enlarges_cards_and_cards_have_a_blank_row_between_them() {
         let mut app = app();
         app.avatar = std::sync::Arc::new(crate::avatar::Avatar::identicon("large").resized(256));
-        let count = |app: &App| {
-            let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let capture = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
             let mut ui = Ui::default();
             terminal
                 .draw(|f| render(app, f, &mut ui, f.area()))
                 .unwrap();
-            terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .filter(|c| matches!(c.fg, Color::Rgb(..)))
-                .count()
+            (terminal.backend().buffer().clone(), ui)
         };
         app.cfg.avatar_resolution = 32;
-        let small = count(&app);
+        let (small, _) = capture(&app);
         app.cfg.avatar_resolution = 256;
-        let large = count(&app);
+        let (large, ui) = capture(&app);
+        assert_eq!(small, large, "resolution changed the thumbnail rectangle");
+        assert!(ui.hit(3, 2) == Some(Action::ShowProfile(0)));
+        assert!(ui.hit(3, 7) == Some(Action::ShowProfile(1)));
+        for x in 1..43 {
+            assert_eq!(large[(x, 5)].symbol(), " ", "cards have no gap at {x}");
+        }
         assert!(
-            large > small * 3,
-            "thumbnail did not gain detail: {small} -> {large}"
+            !large
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+                .contains("в комнате")
         );
         let (screen, _) = draw(&app, 80, 24);
         assert!(screen.contains("Лексей (вы)"));
@@ -807,6 +752,7 @@ mod tests {
             speaking: true,
             level: 50,
             status_known: true,
+            avatar_custom: false,
             avatar: crate::avatar::display(None, "Друг"),
         });
         app.chat.push(ChatLine {
@@ -844,6 +790,7 @@ mod tests {
             speaking: false,
             level: 0,
             status_known: false,
+            avatar_custom: false,
             avatar: crate::avatar::display(None, "Друг"),
         });
         let (screen, _) = draw(&app, 80, 24);
@@ -866,11 +813,11 @@ mod tests {
         let wheel = MouseEvent {
             kind: MouseEventKind::ScrollDown,
             column: 60,
-            row: 10,
+            row: 12,
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(ui.mouse(wheel), Some(Action::Scroll(Pane::Main, 3)));
-        assert_eq!(ui.hit(60, 10), Some(Action::Click(Pane::Main, 0)));
+        assert_eq!(ui.hit(60, 12), Some(Action::Click(Pane::Main, 0)));
         assert_eq!(ui.hit(60, 22), Some(Action::FocusInput));
     }
 }

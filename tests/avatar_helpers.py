@@ -77,3 +77,26 @@ def resolution(client, root, who, size):
         raise AssertionError(f'avatar detail did not change to {size}px')
     client.key('\x1b[A' * 24 + '\x1b')
     time.sleep(0.12)
+
+
+def rename(client, root, who, name):
+    config = root / who / 'remember-me/config.toml'
+    before = tomllib.loads(config.read_text())
+    client.key('\x1bOQ')
+    time.sleep(0.12)
+    client.key('\x1b[A' * 24 + '\r')
+    time.sleep(0.12)
+    client.key('\x7f' * len(before['name']))
+    client.key('\x1b[200~' + name + '\x1b[201~\r')
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            if tomllib.loads(config.read_text()).get('name') == name:
+                break
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
+        time.sleep(0.03)
+    else:
+        raise AssertionError('live nickname did not save')
+    client.key('\x1b')
+    time.sleep(0.12)

@@ -767,7 +767,7 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
     let help = match app.settings_sel {
         crate::app::ROW_AVATAR => "Enter: PNG/JPEG/WebP/GIF, путь или ~/ · пусто = узор по нику",
         crate::app::ROW_AVATAR_RESOLUTION => {
-            "←/→ или Enter: 8–256 px · видно в профиле по клику на аватарку"
+            "←/→: 8–256 px · размер карточки фиксирован · мелкие пиксели при поддержке графики"
         }
         crate::app::ROW_AVATAR_STYLE => {
             "Enter: цветные пиксели / ASCII · действует на все аватарки у вас"
@@ -781,10 +781,9 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
         crate::app::ROW_VAD => "← выше чувствительность · → меньше фонового шума",
         crate::app::ROW_DENOISE => "Enter: подавлять фон и клавиши · обработка на этом ПК",
         crate::app::ROW_FILTER => "Enter: фильтр гула/шипения 80–8000 Гц, без нейросети",
-        crate::app::ROW_NAME | crate::app::ROW_PORT | crate::app::ROW_SERVER
-            if app.session.is_some() =>
-        {
-            "Имя, порт и сервер применяются при следующем соединении"
+        crate::app::ROW_NAME => "Enter: изменить ник · участники звонка увидят новое имя сразу",
+        crate::app::ROW_PORT | crate::app::ROW_SERVER if app.session.is_some() => {
+            "Порт и сервер применяются при следующем соединении"
         }
         crate::app::ROW_ECHO if app.session.is_some() => {
             "Эхо-тест доступен после завершения сессии"
@@ -1104,6 +1103,7 @@ mod tests {
             speaking: true,
             level: 72,
             status_known: true,
+            avatar_custom: false,
             avatar: crate::avatar::display(image.as_ref(), "Друг"),
         });
         app.chat.push(ChatLine {
@@ -1242,7 +1242,7 @@ mod tests {
         assert_eq!(app.overlay, None);
         app.call_sel = 0;
         let (_, ui) = draw_ui(&app, 140, 42);
-        app.on_action(ui.hit(10, 30).unwrap());
+        app.on_action(ui.hit(4, 4).unwrap());
         assert_eq!(app.overlay, Some(Overlay::Profile));
         app.on_action(Action::EditAvatar);
         assert_eq!(app.screen, Screen::Settings);

@@ -40,14 +40,20 @@ def free_port():
 
 
 class Client:
-    def __init__(self, binary, root, name, args):
+    def __init__(self, binary, root, name, args, graphics=False):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 180, 0, 0))
         self.master = master
+        self.graphics_headers = []
+        self.graphics_placeholders = 0
         self.log_path = root / (name + ".log")
         self.log_file = self.log_path.open("wb")
         env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ.get("PATH", ""),
                    RM_OPEN_LOG=str(root / "opened.log"), XDG_CONFIG_HOME=str(root / name), RM_DEBUG="1", TERM="xterm-256color")
+        if graphics:
+            env.pop('TMUX', None)
+            env.pop('KONSOLE_VERSION', None)
+            env['TERM_PROGRAM'] = 'ghostty'
         self.proc = subprocess.Popen([str(binary), *args], stdin=slave, stdout=slave,
                                      stderr=self.log_file, env=env)
         os.close(slave)
@@ -56,7 +62,23 @@ class Client:
         # A real terminal continuously consumes the rendered TUI as well.
         def drain():
             try:
-                while os.read(master, 65536):
+                pending = b''
+                replied = False
+                while data := os.read(master, 65536):
+                    if graphics:
+                        pending += data
+                        if not replied and b'\x1b[5n' in pending:
+                            os.write(master, b'\x1b_Gi=31;OK\x1b\\\x1b[6;16;8t\x1b[0n')
+                            replied = True
+                        self.graphics_placeholders += data.count(chr(0x10EEEE).encode())
+                        for header in re.findall(rb'\x1b_Gq=2,i=(\d+),a=T,U=1,f=32,t=d,s=(\d+),v=(\d+),', pending):
+                            self.graphics_headers.append(tuple(map(int, header)))
+                        # Keep incomplete sequences across reads without counting old headers again.
+                        last = pending.rfind(b'\x1b_G')
+                        if last >= 0 and b';' not in pending[last:]:
+                            pending = pending[last:]
+                        else:
+                            pending = pending[-5:]
                     self.output_enabled.wait()
             except OSError:
                 pass
@@ -119,6 +141,9 @@ class LossyRelayProxy:
         self.impair_profiles = False
         self.avatar_lost = 0
         self.avatar_ack_lost = 0
+        self.impair_names = False
+        self.name_lost = 0
+        self.name_ack_lost = 0
         self.threads = []
         self.thread = threading.Thread(target=self.forward, daemon=True)
         self.thread.start()
@@ -138,6 +163,12 @@ class LossyRelayProxy:
                 thread.start()
                 self.threads.append(thread)
             payload = data[17:] if data[:1] == b"\x1b" else data
+            if self.impair_names and payload[:1] == b"\x10" and self.name_lost < 1:
+                self.name_lost += 1
+                continue
+            if self.impair_names and payload[:1] == b"\x11" and self.name_ack_lost < 1:
+                self.name_ack_lost += 1
+                continue
             if self.impair_profiles and payload[:1] == b"\x0f" and self.avatar_lost < 1:
                 self.avatar_lost += 1
                 continue
@@ -374,6 +405,15 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
             host.wait_log("повторяем ACCEPT")
             print("recovery after first ACCEPT is lost: PASS", flush=True)
         time.sleep(0.5)
+        avatar_helpers.rename(host, root, 'a', 'Солнышко')
+        joiner.wait_log('name received: Солнышко revision=2')
+        avatar_helpers.rename(joiner, root, 'b', 'Друг')
+        host.wait_log('name received: Друг revision=2')
+        avatar_helpers.rename(host, root, 'a', 'a')
+        avatar_helpers.rename(joiner, root, 'b', 'b')
+        joiner.wait_log('name received: a revision=3')
+        host.wait_log('name received: b revision=3')
+        print('  live nicknames in both directions without reconnecting: PASS', flush=True)
         avatar = root / 'avatar.png'
         avatar_helpers.picture(avatar)
         avatar_helpers.resolution(host, root, 'a', 256)

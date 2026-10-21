@@ -50,6 +50,7 @@ pub struct PeerInfo {
     /// уровень входа собеседника (из Status), 0..100%
     pub level: u8,
     pub status_known: bool,
+    pub avatar_custom: bool,
     pub avatar: Arc<crate::avatar::Avatar>,
 }
 
@@ -158,6 +159,13 @@ impl App {
     pub fn new(cfg: Config, engine: Arc<AudioEngine>) -> App {
         let automatic = cfg.auto_update;
         let mut app = Self::with_devices(cfg, engine, crate::audio::list_devices());
+        if !app.cfg.avatar_contained
+            && app.cfg.avatar.is_some()
+            && std::path::Path::new(&app.cfg.avatar_file).is_file()
+        {
+            let path = app.cfg.avatar_file.clone();
+            app.load_avatar(&path);
+        }
         if automatic {
             app.start_update(false);
         }
@@ -178,6 +186,10 @@ impl App {
     }
 
     fn with_devices(mut cfg: Config, engine: Arc<AudioEngine>, devices: DeviceList) -> App {
+        cfg.name = crate::profile::normalize_name(&cfg.name);
+        if cfg.name.is_empty() {
+            cfg.name = "user".into();
+        }
         if !crate::avatar::RESOLUTIONS.contains(&cfg.avatar_resolution) {
             cfg.avatar_resolution = 32;
         }
@@ -242,6 +254,7 @@ impl App {
                 Ok((avatar, original, path)) => {
                     self.cfg.avatar_resolution = avatar.side() as u16;
                     self.cfg.avatar_original = Some(original);
+                    self.cfg.avatar_contained = true;
                     self.cfg.avatar = Some(avatar);
                     self.cfg.avatar_file = path;
                     self.apply_avatar();
@@ -541,6 +554,7 @@ impl App {
                     speaking: false,
                     level: 0,
                     status_known: false,
+                    avatar_custom: false,
                 });
                 self.set_session_screen(Screen::Call);
                 self.status = "в звонке".into();
@@ -614,8 +628,17 @@ impl App {
                     p.status_known = true;
                 }
             }
+            NetEvent::PeerName(name) => {
+                if let Some(peer) = &mut self.peer {
+                    peer.name = name;
+                    if !peer.avatar_custom {
+                        peer.avatar = crate::avatar::display(None, &peer.name);
+                    }
+                }
+            }
             NetEvent::PeerAvatar(avatar) => {
                 if let Some(peer) = &mut self.peer {
+                    peer.avatar_custom = avatar.is_some();
                     peer.avatar =
                         avatar.unwrap_or_else(|| crate::avatar::display(None, &peer.name));
                 }
@@ -1560,8 +1583,12 @@ impl App {
         let buf = buf.trim().to_string();
         match row {
             ROW_NAME => {
-                if !buf.is_empty() {
-                    self.cfg.name = buf;
+                let name = crate::profile::normalize_name(&buf);
+                if !name.is_empty() {
+                    self.cfg.name = name;
+                    if let Some(session) = &self.session {
+                        session.send(NetCmd::Name(self.cfg.name.clone()));
+                    }
                     self.avatar = crate::avatar::display(self.cfg.avatar.as_ref(), &self.cfg.name);
                 }
             }
@@ -1973,6 +2000,30 @@ fn load_chat_log(key: &str, my_name: &str) -> Vec<ChatLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_peer_name_updates_authors_and_identicons_without_replacing_a_photo() {
+        let mut app = App::for_test(Config::default());
+        app.handle_net(NetEvent::InCall {
+            peer_name: "Старое".into(),
+            peer_addr: "127.0.0.1:1".into(),
+        });
+        app.handle_net(NetEvent::PeerName("Новое".into()));
+        let peer = app.peer.as_ref().unwrap();
+        assert_eq!(peer.name, "Новое");
+        assert_eq!(*peer.avatar, crate::avatar::Avatar::identicon("Новое"));
+        let photo = crate::avatar::display(None, "a custom image");
+        app.handle_net(NetEvent::PeerAvatar(Some(photo.clone())));
+        app.handle_net(NetEvent::PeerName("Третье".into()));
+        assert!(Arc::ptr_eq(&app.peer.as_ref().unwrap().avatar, &photo));
+        app.handle_net(NetEvent::Text("После переименования".into()));
+        assert_eq!(app.chat.last().unwrap().name, "Третье");
+        app.handle_net(NetEvent::PeerAvatar(None));
+        assert_eq!(
+            *app.peer.as_ref().unwrap().avatar,
+            crate::avatar::Avatar::identicon("Третье")
+        );
+    }
 
     #[test]
     fn attachments_keep_real_names_and_local_paths_in_history() {

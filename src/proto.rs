@@ -34,6 +34,8 @@ pub const OP_FILE: u8 = 12;
 pub const OP_AVATAR: u8 = 13;
 pub const OP_AVATAR_ACK: u8 = 14;
 pub const OP_AVATAR_CHUNK: u8 = 15;
+pub const OP_NAME: u8 = 16;
+pub const OP_NAME_ACK: u8 = 17;
 pub const OP_BYE: u8 = 11;
 pub use remember_me::server::OP_RELAY_REG;
 
@@ -107,6 +109,13 @@ pub enum Packet {
     AvatarAck {
         revision: u64,
     },
+    Name {
+        revision: u64,
+        name: String,
+    },
+    NameAck {
+        revision: u64,
+    },
     Text {
         msg_id: u32,
         text: String,
@@ -150,6 +159,8 @@ pub fn classify(b: &[u8]) -> WireClass {
         | Some(OP_FILE)
         | Some(OP_AVATAR)
         | Some(OP_AVATAR_ACK)
+        | Some(OP_NAME)
+        | Some(OP_NAME_ACK)
         | Some(OP_AVATAR_CHUNK) => WireClass::Secure,
         Some(_) => WireClass::Unknown,
         None => WireClass::Unknown,
@@ -270,6 +281,15 @@ impl Cipher {
         clear.extend_from_slice(&counter.to_be_bytes());
         let mut pt = Vec::with_capacity(64);
         match pkt {
+            Packet::Name { revision, name } => {
+                pt.push(OP_NAME);
+                pt.extend(revision.to_be_bytes());
+                pt.extend(name_to_bytes(name));
+            }
+            Packet::NameAck { revision } => {
+                pt.push(OP_NAME_ACK);
+                pt.extend(revision.to_be_bytes());
+            }
             Packet::Ping { msg_id, ts_ms } => {
                 pt.push(OP_PING);
                 pt.extend_from_slice(&msg_id.to_be_bytes());
@@ -345,6 +365,8 @@ fn op_of(p: &Packet) -> u8 {
         Packet::Avatar { .. } => OP_AVATAR,
         Packet::AvatarAck { .. } => OP_AVATAR_ACK,
         Packet::AvatarChunk { .. } => OP_AVATAR_CHUNK,
+        Packet::Name { .. } => OP_NAME,
+        Packet::NameAck { .. } => OP_NAME_ACK,
         Packet::Text { .. } => OP_TEXT,
         Packet::Ack { .. } => OP_ACK,
         Packet::Status { .. } => OP_STATUS,
@@ -504,7 +526,7 @@ impl Packet {
                 })
             }
             OP_PING | OP_PONG | OP_TEXT | OP_ACK | OP_STATUS | OP_BYE | OP_FILE | OP_AVATAR
-            | OP_AVATAR_ACK | OP_AVATAR_CHUNK => {
+            | OP_AVATAR_ACK | OP_AVATAR_CHUNK | OP_NAME | OP_NAME_ACK => {
                 let mut b = [0u8; 8];
                 b.copy_from_slice(&clear[1..9]);
                 let counter = u64::from_be_bytes(b);
@@ -521,6 +543,17 @@ impl Packet {
                 }
                 *last_ctl = counter;
                 match op {
+                    OP_NAME if body.len() == 8 + NAME_BYTES => {
+                        let name = crate::profile::normalize_name(&name_from_bytes(&body[8..]));
+                        let revision = u64::from_be_bytes(body[..8].try_into().ok()?);
+                        if revision == 0 || name.is_empty() {
+                            return None;
+                        }
+                        Some(Packet::Name { revision, name })
+                    }
+                    OP_NAME_ACK if body.len() == 8 => Some(Packet::NameAck {
+                        revision: u64::from_be_bytes(body.try_into().ok()?),
+                    }),
                     OP_AVATAR => {
                         if body.len() < 9 {
                             return None;
@@ -630,6 +663,39 @@ impl Cipher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_names_are_authenticated_bounded_and_replay_protected() {
+        let mut tx = Cipher::new(&[5; 32], &[7; 32], true);
+        let rx = Cipher::new(&[5; 32], &[7; 32], false);
+        let (mut control, mut audio) = (0, 0);
+        let wire = Packet::encrypt_wire(
+            &mut tx,
+            &Packet::Name {
+                revision: 2,
+                name: "Новое имя".into(),
+            },
+        );
+        assert_eq!(classify(&wire), WireClass::Secure);
+        assert!(
+            !wire
+                .windows("Новое имя".len())
+                .any(|w| w == "Новое имя".as_bytes())
+        );
+        let mut tampered = wire.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(Packet::decrypt_wire(&rx, &tampered, &mut control, &mut audio).is_none());
+        assert!(
+            matches!(Packet::decrypt_wire(&rx, &wire, &mut control, &mut audio),
+            Some(Packet::Name {revision:2, name}) if name == "Новое имя")
+        );
+        assert!(Packet::decrypt_wire(&rx, &wire, &mut control, &mut audio).is_none());
+        let ack = Packet::encrypt_wire(&mut tx, &Packet::NameAck { revision: 2 });
+        assert!(matches!(
+            Packet::decrypt_wire(&rx, &ack, &mut control, &mut audio),
+            Some(Packet::NameAck { revision: 2 })
+        ));
+    }
 
     #[test]
     fn avatars_are_encrypted_bounded_and_can_be_reset_without_changing_audio_mode() {

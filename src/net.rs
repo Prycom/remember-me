@@ -79,6 +79,7 @@ pub enum NetEvent {
     },
     PeerSpeaking(bool),
     PeerAvatar(Option<Arc<crate::avatar::Avatar>>),
+    PeerName(String),
     Text(String),
     Transfer(crate::transfer::TransferUpdate),
     /// наше сообщение доставлено
@@ -92,6 +93,7 @@ pub enum NetEvent {
 #[derive(Debug, Clone)]
 pub enum NetCmd {
     AcceptCall,
+    Name(String),
     Avatar(Option<Arc<crate::avatar::Avatar>>),
     DeclineCall,
     Text(String),
@@ -314,8 +316,11 @@ async fn run_established(
     accepted_hello: Option<([u8; 32], Packet)>,
     download_directory: &mut std::path::PathBuf,
     profile: &mut crate::avatar::Profile,
+    own_name: &mut crate::profile::Name,
 ) -> Outcome {
     let mut files = crate::transfer::spawn(download_directory.clone());
+    let mut name_delivery = crate::avatar::Delivery::default();
+    let mut name_received = 0;
     let mut avatar_delivery = crate::avatar::Delivery::default();
     let mut avatar_received = 0u64;
     let mut avatar_assembly = crate::avatar::Assembly::default();
@@ -387,6 +392,14 @@ async fn run_established(
                     eprintln!("[net] rx {} {} от {}", kind, classify(&buf[..n]) == WireClass::Secure, from);
                 }
                 match pkt {
+                    Some(Packet::Name{revision,name}) => {
+                        send_secure(&sock,&mut cipher,peer,&Packet::NameAck{revision}).await;
+                        if revision > name_received {
+                            name_received=revision;dbg_net!("name received: {name} revision={revision}");
+                            let _=events.send(NetEvent::PeerName(name));
+                        }
+                    }
+                    Some(Packet::NameAck{revision}) => name_delivery.ack(revision),
                     Some(Packet::Avatar{revision,avatar}) => {
                         send_secure(&sock,&mut cipher,peer,&Packet::AvatarAck{revision}).await;
                         if revision>avatar_received {avatar_received=revision;let _=events.send(NetEvent::PeerAvatar(avatar));dbg_net!("avatar received revision={revision}");}
@@ -474,6 +487,7 @@ async fn run_established(
             Some(cmd) = cmd_rx.recv() => {
                 dbg_net!("← cmd {:?}", cmd);
                 match cmd {
+                    NetCmd::Name(value) => own_name.set(&value),
                     NetCmd::Avatar(avatar) => profile.set(avatar),
                     NetCmd::SendFile(path) => {
                         if files.commands.try_send(crate::transfer::Command::Send(path)).is_err() { let _ = events.send(NetEvent::Progress("очередь передачи занята, повторите отправку".into())); }
@@ -509,6 +523,7 @@ async fn run_established(
             // ── мелкие периодические дела ───────────────────────────────────
             _ = maintenance.tick() => {
                 let now = Instant::now();
+                if let Some(packet)=own_name.next(&mut name_delivery,now) {send_secure(&sock,&mut cipher,peer,&packet).await;}
                 if let Some(packet)=profile.next(&mut avatar_delivery,now) {send_secure(&sock,&mut cipher,peer,&packet).await;}
                 if now.duration_since(last_ping) >= KEEPALIVE_INTERVAL {
                     last_ping = now;
@@ -615,6 +630,7 @@ async fn run_host(
 
     let mut download_directory = cfg.download_directory();
     let mut profile = crate::avatar::Profile::new(cfg.avatar.as_ref());
+    let mut own_name = crate::profile::Name::new(&cfg.name);
     let mut buf = vec![0u8; MTU];
 
     // серверная комната (если настроена): код + периодическая регистрация
@@ -679,6 +695,7 @@ async fn run_host(
                 }
                 maybe = cmd_rx.recv() => match maybe {
                     Some(NetCmd::DownloadDirectory(path))=>download_directory=path,
+                    Some(NetCmd::Name(value))=>own_name.set(&value),
                     Some(NetCmd::Avatar(avatar))=>profile.set(avatar),
                     Some(NetCmd::Stop) | None => return,
                     _ => {}
@@ -737,6 +754,7 @@ async fn run_host(
             tokio::select! {
                 maybe = cmd_rx.recv() => match maybe {
                     Some(NetCmd::DownloadDirectory(path))=>download_directory=path,
+                    Some(NetCmd::Name(value))=>own_name.set(&value),
                     Some(NetCmd::Avatar(avatar))=>profile.set(avatar),
                     Some(NetCmd::AcceptCall) => accepted = Some(true),
                     Some(NetCmd::DeclineCall) => accepted = Some(false),
@@ -801,7 +819,7 @@ async fn run_host(
             prefixes,
             ssrc_joiner: ssrc_peer,
             ssrc_host: ssrc_self,
-            name: cfg.name.clone(),
+            name: own_name.value.clone(),
         };
         let _ = sock.send_to(&acc.encode_open(), from).await.unwrap_or(0);
 
@@ -832,6 +850,7 @@ async fn run_host(
             Some((pub_key, acc)),
             &mut download_directory,
             &mut profile,
+            &mut own_name,
         )
         .await;
 
@@ -881,6 +900,7 @@ async fn run_joiner(
 
     let mut download_directory = cfg.download_directory();
     let mut profile = crate::avatar::Profile::new(cfg.avatar.as_ref());
+    let mut own_name = crate::profile::Name::new(&cfg.name);
     let mut buf = vec![0u8; MTU];
     let relay_addr = if room.is_some() {
         select_addr(&addr_str)
@@ -934,7 +954,7 @@ async fn run_joiner(
             });
 
             let hb = Packet::Hello(Hello {
-                name: cfg.name.clone(),
+                name: own_name.value.clone(),
                 pub_key: campaign_pub,
                 modes: vec![MODE_XCHACHA20POLY1305],
             });
@@ -975,6 +995,7 @@ async fn run_joiner(
                     }
                     maybe = cmd_rx.recv() => match maybe {
                     Some(NetCmd::DownloadDirectory(path))=>download_directory=path,
+                    Some(NetCmd::Name(value))=>own_name.set(&value),
                     Some(NetCmd::Avatar(avatar))=>profile.set(avatar),
                         Some(NetCmd::Stop | NetCmd::HangUp { .. }) | None => break 'outer,
                         _ => {},
@@ -1076,6 +1097,7 @@ async fn run_joiner(
             None,
             &mut download_directory,
             &mut profile,
+            &mut own_name,
         )
         .await;
 

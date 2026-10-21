@@ -113,7 +113,7 @@ def main():
                                   f'output_device = "{names[who, "out"]}"\n'
                                   f'download_dir = "{root / ("downloads_" + who)}"\n'
                                   f'server_addr = "{server if who == "a" else ""}"\n')
-            a = Client(binary, root, "a", ["--host"])
+            a = Client(binary, root, "a", ["--host"], graphics=True)
             clients.append(a)
             a.wait_log("код комнаты")
             code = re.search(r"код комнаты ([A-Z2-9]{4})", a.log()).group(1)
@@ -130,11 +130,19 @@ def main():
             avatar_helpers.choose(a, root, 'a', avatar)
             b.wait_log('avatar received from a revision=2')
             avatar.unlink()
+            proxy.impair_names = True
+            avatar_helpers.rename(a, root, 'a', 'Солнышко')
+            b.wait_log('name received: Солнышко revision=2')
             c = Client(binary, root, "c", ["--connect", f"{code}@{server}"])
             clients.append(c)
             for client in clients:
                 client.wait_log("roster: 2 remote members")
-            c.wait_log('avatar received from a revision=2')
+            c.wait_log('name received: Солнышко revision=2')
+            c.wait_log('avatar received from Солнышко revision=2')
+            avatar_helpers.rename(a, root, 'a', 'a')
+            for client in (b,c): client.wait_log('name received: a revision=3')
+            assert proxy.name_lost == 1 and proxy.name_ack_lost == 1
+            print('  live names: packet/ACK loss, stale relay roster and late join: PASS', flush=True)
             assert proxy.avatar_lost == 1 and proxy.avatar_ack_lost == 1
             avatar_helpers.resolution(a, root, 'a', 224)
             for client in (b, c):
@@ -144,6 +152,11 @@ def main():
                 client.wait_log('avatar received from a revision=4')
             print('  group 256px avatar: chunk/ACK loss, late join, cached resize, live reset: PASS', flush=True)
             time.sleep(0.5)
+            assert a.graphics_placeholders > 0 and len(a.graphics_headers) >= 3, 'native thumbnails were not rendered'
+            assert all(w == 64 and h == 64 for _,w,h in a.graphics_headers), a.graphics_headers
+            ids = [image for image,_,_ in a.graphics_headers]
+            assert len(ids) == len(set(ids)), 'cached thumbnail was transmitted more than once'
+            print('  native graphics: fixed 64px canvas, Unicode placements, one transmission per cached image: PASS', flush=True)
             ui_stalls(root, names, a)
             if options.ui_stall_only:
                 return

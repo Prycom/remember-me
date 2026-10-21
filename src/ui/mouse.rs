@@ -7,12 +7,14 @@ use crate::action::{Action, Pane};
 
 #[derive(Default)]
 pub struct Ui {
+    pub thumbnails: crate::avatar_graphics::Thumbnails,
     hits: Vec<(Rect, Action)>,
     panes: Vec<(Rect, Pane)>,
 }
 
 impl Ui {
     pub fn clear(&mut self) {
+        self.thumbnails.begin_frame();
         self.hits.clear();
         self.panes.clear();
     }

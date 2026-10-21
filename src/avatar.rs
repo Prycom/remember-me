@@ -121,20 +121,21 @@ impl Avatar {
         if side == 0 {
             return Err("пустая картинка".into());
         }
-        // Crop first: an extremely wide image must not create a huge resize intermediate.
-        let square = image
-            .crop_imm(
-                (image.width() - side) / 2,
-                (image.height() - side) / 2,
-                side,
-                side,
-            )
-            .resize_exact(
+        // Contain the whole photo, including its right edge. Padding is
+        // transparent; both intermediates are bounded by the chosen resolution.
+        let fitted = image
+            .resize(
                 resolution as u32,
                 resolution as u32,
                 image::imageops::FilterType::Lanczos3,
             )
             .into_rgba8();
+        let mut square = image::RgbaImage::new(resolution as u32, resolution as u32);
+        let (x, y) = (
+            (resolution as u32 - fitted.width()) / 2,
+            (resolution as u32 - fitted.height()) / 2,
+        );
+        image::imageops::overlay(&mut square, &fitted, x as i64, y as i64);
         Ok(Self::quantize(square.as_raw()))
     }
     /// Rebuild from the cached source; never repeatedly resize the thumbnail.
@@ -245,18 +246,17 @@ impl Avatar {
         self.color_at(x, y, self.side())
     }
     fn color_at(&self, x: usize, y: usize, side: usize) -> Option<[u8; 3]> {
-        let radius = (side * 6 / 32) as i32;
-        let dx = (radius - x as i32)
-            .max(x as i32 - (side as i32 - radius - 1))
-            .max(0);
-        let dy = (radius - y as i32)
-            .max(y as i32 - (side as i32 - radius - 1))
-            .max(0);
-        if dx * dx + dy * dy > radius * radius {
-            return None;
-        }
         let index = self.pixels[y * side + x];
         (index != 0).then(|| self.palette[index as usize])
+    }
+    pub fn rgba(&self) -> image::RgbaImage {
+        let side = self.side();
+        image::RgbaImage::from_fn(side as u32, side as u32, |x, y| {
+            image::Rgba(
+                self.color_at(x as usize, y as usize, side)
+                    .map_or([0, 0, 0, 0], |[r, g, b]| [r, g, b, 255]),
+            )
+        })
     }
 }
 fn dist(a: [u8; 3], b: [u8; 3]) -> u32 {
@@ -516,7 +516,7 @@ mod tests {
         assert!(transparent.pixels.iter().all(|&p| p == 0));
     }
     #[test]
-    fn imports_center_crop_and_keeps_owned_pixels_after_source_is_removed() {
+    fn contains_the_whole_photo_and_keeps_pixels_after_source_is_removed() {
         let path =
             std::env::temp_dir().join(format!("remember-me-avatar-{}.png", std::process::id()));
         let mut image = image::RgbaImage::from_pixel(96, 32, image::Rgba([255, 0, 0, 255]));
@@ -529,12 +529,12 @@ mod tests {
         let avatar = Avatar::load(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert!(avatar.valid());
-        assert!(
-            avatar
-                .pixels
-                .iter()
-                .all(|&i| avatar.palette[i as usize] == [20, 100, 220])
-        );
+        // Neither side is cropped; transparent padding preserves aspect ratio.
+        assert_eq!(avatar.color(1, 16), Some([255, 0, 0]));
+        assert_eq!(avatar.color(30, 16), Some([255, 0, 0]));
+        let middle = avatar.color(16, 16).unwrap();
+        assert!(middle[2] > 190 && middle[0] < 50);
+        assert_eq!(avatar.color(16, 1), None);
         let config = crate::config::Config {
             avatar: Some(avatar.clone()),
             ..Default::default()
