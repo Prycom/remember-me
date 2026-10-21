@@ -8,6 +8,7 @@ use crate::action::{Action, Pane};
 #[derive(Default)]
 pub struct Ui {
     pub thumbnails: crate::avatar_graphics::Thumbnails,
+    pub native_avoid: Option<Rect>,
     hits: Vec<(Rect, Action)>,
     panes: Vec<(Rect, Pane)>,
 }

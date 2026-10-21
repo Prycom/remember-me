@@ -20,7 +20,7 @@ pub const RESOLUTIONS: [u16; 17] = [
     8, 12, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256,
 ];
 pub const MAX_SIDE: usize = 256;
-pub const MAX_BYTES: usize = COLORS * 3 + MAX_SIDE * MAX_SIDE;
+pub const MAX_BYTES: usize = 6 + MAX_SIDE * MAX_SIDE * 3 + MAX_SIDE * MAX_SIDE / 8;
 pub const CHUNK_BYTES: usize = 1024;
 pub const MAX_CHUNKS: usize = MAX_BYTES.div_ceil(CHUNK_BYTES);
 
@@ -28,6 +28,31 @@ pub const MAX_CHUNKS: usize = MAX_BYTES.div_ceil(CHUNK_BYTES);
 pub struct Avatar {
     palette: Vec<[u8; 3]>,
     pixels: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "rgba_config")]
+    rgba: Option<Vec<u8>>,
+}
+// Keep full-colour sources compact in TOML rather than writing 262144 integers.
+mod rgba_config {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(
+        value: &Option<Vec<u8>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_some(&base64_simd::STANDARD.encode_to_string(value.as_ref().unwrap()))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let value = Option::<String>::deserialize(d)?;
+        value
+            .map(|s| {
+                if s.len() > 350_000 {
+                    return Err(serde::de::Error::custom("avatar exceeds 256px"));
+                }
+                base64_simd::STANDARD
+                    .decode_to_vec(s)
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()
+    }
 }
 impl std::fmt::Debug for Avatar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -42,19 +67,45 @@ pub enum AvatarStyle {
 }
 
 impl Avatar {
+    pub fn is_full(&self) -> bool {
+        self.rgba.is_some()
+    }
     pub fn side(&self) -> usize {
+        let pixels = self
+            .rgba
+            .as_ref()
+            .map_or(self.pixels.len(), |p| p.len() / 4);
         RESOLUTIONS
             .into_iter()
             .map(usize::from)
-            .find(|n| n * n == self.pixels.len())
+            .find(|n| n * n == pixels)
             .unwrap_or(0)
     }
     pub fn valid(&self) -> bool {
+        if let Some(rgba) = &self.rgba {
+            return self.side() != 0
+                && rgba.len() == self.side() * self.side() * 4
+                && self.pixels.is_empty()
+                && self.palette.is_empty();
+        }
         self.palette.len() == COLORS
             && self.side() != 0
             && self.pixels.iter().all(|p| (*p as usize) < COLORS)
     }
     pub fn encode(&self) -> Vec<u8> {
+        if let Some(rgba) = &self.rgba {
+            let mut bytes = b"RMA2".to_vec();
+            bytes.extend((self.side() as u16).to_be_bytes());
+            bytes.extend(rgba.chunks_exact(4).flat_map(|p| p[..3].iter().copied()));
+            for chunk in rgba.chunks(32) {
+                let mask = chunk
+                    .chunks_exact(4)
+                    .enumerate()
+                    .fold(0u8, |mask, (i, p)| mask | (u8::from(p[3] != 0) << i));
+                bytes.push(mask);
+            }
+            return bytes;
+        }
         self.palette
             .iter()
             .flatten()
@@ -63,6 +114,37 @@ impl Avatar {
             .collect()
     }
     pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(b"RMA2") {
+            let side = u16::from_be_bytes(bytes.get(4..6)?.try_into().ok()?) as usize;
+            if !RESOLUTIONS.contains(&(side as u16))
+                || bytes.len() != 6 + side * side * 3 + (side * side).div_ceil(8)
+            {
+                return None;
+            }
+            let rgb = &bytes[6..6 + side * side * 3];
+            let mask = &bytes[6 + side * side * 3..];
+            let rgba = rgb
+                .chunks_exact(3)
+                .enumerate()
+                .flat_map(|(i, p)| {
+                    [
+                        p[0],
+                        p[1],
+                        p[2],
+                        if mask[i / 8] & (1 << (i % 8)) != 0 {
+                            255
+                        } else {
+                            0
+                        },
+                    ]
+                })
+                .collect();
+            return Some(Self {
+                palette: Vec::new(),
+                pixels: Vec::new(),
+                rgba: Some(rgba),
+            });
+        }
         if !RESOLUTIONS
             .iter()
             .any(|&n| bytes.len() == COLORS * 3 + n as usize * n as usize)
@@ -70,6 +152,7 @@ impl Avatar {
             return None;
         }
         let value = Self {
+            rgba: None,
             palette: bytes[..COLORS * 3]
                 .chunks_exact(3)
                 .map(|p| [p[0], p[1], p[2]])
@@ -82,7 +165,28 @@ impl Avatar {
     pub fn load(path: &Path) -> Result<Self, String> {
         Self::load_at(path, SIDE as u16)
     }
+    #[cfg(test)]
     pub fn load_at(path: &Path, resolution: u16) -> Result<Self, String> {
+        Self::read_square(path, resolution).map(|square| Self::quantize(square.as_raw()))
+    }
+    pub fn load_original(path: &Path) -> Result<Self, String> {
+        Self::read_square(path, MAX_SIDE as u16).map(Self::full_color)
+    }
+    pub fn full_color(mut square: image::RgbaImage) -> Self {
+        for p in square.pixels_mut() {
+            if p[3] < 128 {
+                p.0 = [0; 4];
+            } else {
+                p[3] = 255;
+            }
+        }
+        Self {
+            palette: Vec::new(),
+            pixels: Vec::new(),
+            rgba: Some(square.into_raw()),
+        }
+    }
+    fn read_square(path: &Path, resolution: u16) -> Result<image::RgbaImage, String> {
         if !RESOLUTIONS.contains(&resolution) {
             return Err("выберите размер аватарки от 8 до 256 в настройках".into());
         }
@@ -136,24 +240,15 @@ impl Avatar {
             (resolution as u32 - fitted.height()) / 2,
         );
         image::imageops::overlay(&mut square, &fitted, x as i64, y as i64);
-        Ok(Self::quantize(square.as_raw()))
+        Ok(square)
     }
     /// Rebuild from the cached source; never repeatedly resize the thumbnail.
     pub fn resized(&self, resolution: u16) -> Self {
         assert!(self.valid() && RESOLUTIONS.contains(&resolution));
-        if self.side() == resolution as usize {
+        if self.side() == resolution as usize && self.rgba.is_none() {
             return self.clone();
         }
-        let rgba = self
-            .pixels
-            .iter()
-            .flat_map(|&i| {
-                let [r, g, b] = self.palette[i as usize];
-                [r, g, b, if i == 0 { 0 } else { 255 }]
-            })
-            .collect();
-        let image =
-            image::RgbaImage::from_raw(self.side() as u32, self.side() as u32, rgba).unwrap();
+        let image = self.rgba();
         let scaled = image::imageops::resize(
             &image,
             resolution as u32,
@@ -215,6 +310,7 @@ impl Avatar {
             .map(|p| p.map_or(0, |p| nearest(p, &centers) as u8))
             .collect();
         Self {
+            rgba: None,
             palette: centers,
             pixels,
         }
@@ -239,13 +335,21 @@ impl Avatar {
                 }
             }
         }
-        Self { palette, pixels }
+        Self {
+            palette,
+            pixels,
+            rgba: None,
+        }
     }
     #[cfg(test)]
     fn color(&self, x: usize, y: usize) -> Option<[u8; 3]> {
         self.color_at(x, y, self.side())
     }
     fn color_at(&self, x: usize, y: usize, side: usize) -> Option<[u8; 3]> {
+        if let Some(rgba) = &self.rgba {
+            let p = &rgba[(y * side + x) * 4..][..4];
+            return (p[3] != 0).then_some([p[0], p[1], p[2]]);
+        }
         let index = self.pixels[y * side + x];
         (index != 0).then(|| self.palette[index as usize])
     }
@@ -286,8 +390,28 @@ pub struct Portrait<'a> {
     pub avatar: &'a Avatar,
     pub mode: AvatarStyle,
 }
+pub struct RoundedPortrait<'a> {
+    portrait: Portrait<'a>,
+    round: bool,
+}
 impl Widget for Portrait<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
+        self.draw(area, buffer, false);
+    }
+}
+impl Widget for RoundedPortrait<'_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        self.portrait.draw(area, buffer, self.round);
+    }
+}
+impl<'a> Portrait<'a> {
+    pub fn rounded(self, round: bool) -> RoundedPortrait<'a> {
+        RoundedPortrait {
+            portrait: self,
+            round,
+        }
+    }
+    fn draw(self, area: Rect, buffer: &mut Buffer, round: bool) {
         let width = area
             .width
             .min(area.height.saturating_mul(2))
@@ -303,16 +427,29 @@ impl Widget for Portrait<'_> {
         let top = area.y + (area.height - height) / 2;
         for y in 0..height {
             for x in 0..width {
-                let upper = self.avatar.color_at(
+                let mut upper = self.avatar.color_at(
                     x as usize * side / width as usize,
                     y as usize * 2 * side / (height as usize * 2),
                     side,
                 );
-                let lower = self.avatar.color_at(
+                let mut lower = self.avatar.color_at(
                     x as usize * side / width as usize,
                     (y as usize * 2 + 1) * side / (height as usize * 2),
                     side,
                 );
+                if round {
+                    let circle = |py: u16| {
+                        ((x as f32 + 0.5) / width as f32 * 2.0 - 1.0).powi(2)
+                            + ((py as f32 + 0.5) / (height as f32 * 2.0) * 2.0 - 1.0).powi(2)
+                            <= 1.0
+                    };
+                    if !circle(y * 2) {
+                        upper = None;
+                    }
+                    if !circle(y * 2 + 1) {
+                        lower = None;
+                    }
+                }
                 let cell = &mut buffer[(left + x, top + y)];
                 if self.mode == AvatarStyle::Ascii {
                     let rgb = match (upper, lower) {
@@ -501,6 +638,67 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn maximum_quality_preserves_full_colour_through_config_and_encrypted_chunks() {
+        let source = image::RgbaImage::from_fn(256, 256, |x, y| {
+            image::Rgba([
+                x as u8,
+                y as u8,
+                (x ^ y) as u8,
+                if x == 0 { 0 } else { 255 },
+            ])
+        });
+        let avatar = Avatar::full_color(source);
+        assert!(avatar.valid() && avatar.is_full());
+        assert_eq!(avatar.encode().len(), MAX_BYTES);
+        assert_eq!(Avatar::decode(&avatar.encode()), Some(avatar.clone()));
+        let config = crate::config::Config {
+            avatar: Some(avatar.clone()),
+            avatar_smooth: true,
+            ..Default::default()
+        };
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.len() < 400_000);
+        let restored: crate::config::Config = toml::from_str(&text).unwrap();
+        assert_eq!(restored.avatar, Some(avatar.clone()));
+        let profile = Profile::new(Some(&avatar));
+        let mut delivery = Delivery::default();
+        let mut assembly = Assembly::default();
+        let mut cipher = crate::proto::Cipher::new(&[5; 32], &[7; 32], true);
+        let receiver = crate::proto::Cipher::new(&[5; 32], &[7; 32], false);
+        let (mut control, mut sequence) = (0, 0);
+        let start = Instant::now();
+        let mut result = None;
+        for tick in 0..MAX_CHUNKS * 3 {
+            if let Some(packet) = profile.next(
+                &mut delivery,
+                start + Duration::from_millis(tick as u64 * 25),
+            ) {
+                let bytes = crate::proto::Packet::encrypt_wire(&mut cipher, &packet);
+                assert!(bytes.len() + 17 + 28 <= 1280);
+                if tick == 0 {
+                    continue;
+                }
+                if let Some(crate::proto::Packet::AvatarChunk {
+                    revision,
+                    index,
+                    count,
+                    bytes,
+                }) = crate::proto::Packet::decrypt_wire(
+                    &receiver,
+                    &bytes,
+                    &mut control,
+                    &mut sequence,
+                ) {
+                    result = assembly.push(revision, index, count, bytes);
+                    if result.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(*result.unwrap(), avatar);
+    }
     #[test]
     fn wire_roundtrip_transparency_and_bounds() {
         let avatar = Avatar::identicon("Лексей");

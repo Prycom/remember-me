@@ -1,6 +1,7 @@
 """Avatar fixtures/import through the real settings UI, using only Python stdlib."""
 from pathlib import Path
 import struct
+import base64
 import time
 import tomllib
 import zlib
@@ -32,8 +33,11 @@ def choose(client, root, who, path):
         try:
             cfg = tomllib.loads(config.read_text())
             if cfg.get('avatar_file') == str(path):
-                assert len(cfg['avatar']['pixels']) == cfg.get('avatar_resolution', 32)**2
-                assert len(cfg['avatar_original']['pixels']) == 256**2
+                if cfg.get('avatar_smooth'):
+                    assert len(base64.b64decode(cfg['avatar']['rgba'])) == 256**2*4
+                else:
+                    assert len(cfg['avatar']['pixels']) == cfg.get('avatar_resolution', 32)**2
+                assert len(base64.b64decode(cfg['avatar_original']['rgba'])) == 256**2*4
                 assert len(cfg['avatar']['palette']) == 32
                 break
         except (OSError, tomllib.TOMLDecodeError):
@@ -55,8 +59,9 @@ def clear(client):
 def resolution(client, root, who, size):
     config = root / who / 'remember-me/config.toml'
     before = tomllib.loads(config.read_text())
-    sizes = [8, 12, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256]
-    delta = (sizes.index(size) - sizes.index(before.get('avatar_resolution', 32))) % len(sizes)
+    sizes = [8, 12, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 0]
+    current = 0 if before.get('avatar_smooth') else before.get('avatar_resolution', 32)
+    delta = (sizes.index(size) - sizes.index(current)) % len(sizes)
     direction = '\x1b[C' if delta <= len(sizes)//2 else '\x1b[D'
     steps = min(delta, len(sizes)-delta)
     client.key('\x1bOQ')
@@ -68,9 +73,12 @@ def resolution(client, root, who, size):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         cfg = tomllib.loads(config.read_text())
-        if cfg.get('avatar_resolution') == size:
+        if cfg.get('avatar_resolution') == (size or 256) and bool(cfg.get('avatar_smooth')) == (size == 0):
             if 'avatar' in cfg:
-                assert len(cfg['avatar']['pixels']) == size**2
+                if size:
+                    assert len(cfg['avatar']['pixels']) == size**2
+                else:
+                    assert len(base64.b64decode(cfg['avatar']['rgba'])) == 256**2*4
             break
         time.sleep(0.03)
     else:

@@ -44,6 +44,11 @@ pub struct Config {
     pub avatar_original: Option<crate::avatar::Avatar>,
     /// Old versions cropped photos. Reimport them once if the source still exists.
     pub avatar_contained: bool,
+    /// Smooth full-colour source instead of an intentionally pixelated portrait.
+    pub avatar_smooth: bool,
+    pub avatar_round: bool,
+    /// Prefer the built-in viewer; unsupported types still open externally.
+    pub media_in_terminal: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +87,9 @@ impl Default for Config {
             avatar_resolution: 32,
             avatar_original: None,
             avatar_contained: false,
+            avatar_smooth: false,
+            avatar_round: false,
+            media_in_terminal: true,
         }
     }
 }

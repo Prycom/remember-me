@@ -21,6 +21,40 @@ pub fn action_for(k: &KeyEvent, app: &App) -> Option<Action> {
     {
         return Some(Action::Quit);
     }
+    if app.overlay == Some(crate::action::Overlay::Media) {
+        return match k.code {
+            KeyCode::Char(' ') if !vox => Some(Action::Ptt(true)),
+            KeyCode::Char('p' | 'P' | 'з' | 'З') if k.kind == KeyEventKind::Press => {
+                Some(Action::MediaPause)
+            }
+            KeyCode::Esc => Some(Action::Cancel),
+            KeyCode::Char('o' | 'O' | 'щ' | 'Щ') if k.kind == KeyEventKind::Press => {
+                Some(Action::OpenExternal)
+            }
+            KeyCode::Char(' ') | KeyCode::Enter if k.kind == KeyEventKind::Press => {
+                Some(Action::MediaPause)
+            }
+            KeyCode::Up => Some(Action::Up),
+            KeyCode::Down => Some(Action::Down),
+            KeyCode::Left => Some(Action::Left),
+            KeyCode::Right => Some(Action::Right),
+            KeyCode::PageUp => Some(Action::PageUp),
+            KeyCode::PageDown => Some(Action::PageDown),
+            KeyCode::Home => Some(Action::Home),
+            KeyCode::End => Some(Action::End),
+            _ => None,
+        };
+    }
+    if app.overlay.is_none()
+        && k.kind == KeyEventKind::Press
+        && (matches!(k.code, KeyCode::Char('v' | 'V'))
+            && k.modifiers.contains(KeyModifiers::CONTROL)
+            || k.code == KeyCode::Insert
+                && k.modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL))
+    {
+        return Some(Action::ClipboardPaste);
+    }
     if app.overlay == Some(crate::action::Overlay::Profile) && k.kind == KeyEventKind::Press {
         match k.code {
             KeyCode::Left => return Some(Action::Left),
@@ -63,6 +97,7 @@ pub fn action_for(k: &KeyEvent, app: &App) -> Option<Action> {
             KeyCode::F(3) if app.screen == Screen::Call => return Some(Action::SendFile),
             KeyCode::F(4) if app.screen == Screen::Call => return Some(Action::CancelFile),
             KeyCode::F(5) => return Some(Action::Update),
+            KeyCode::F(6) => return Some(Action::ClipboardPaste),
             _ => {}
         }
     }
@@ -302,6 +337,37 @@ mod tests {
     use crate::app::{ROW_ECHO, ROW_NAME};
     use crate::config::Config;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    #[test]
+    fn clipboard_keys_and_media_controls_do_not_become_ptt_or_chat_input() {
+        let mut app = App::for_test(Config::default());
+        app.screen = Screen::Call;
+        app.focus = Focus::Input;
+        for key in [
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+        ] {
+            assert_eq!(action_for(&key, &app), Some(Action::ClipboardPaste));
+        }
+        app.overlay = Some(crate::action::Overlay::Media);
+        assert_eq!(
+            action_for(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &app),
+            Some(Action::MediaPause)
+        );
+        assert_eq!(
+            action_for(&KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &app),
+            Some(Action::OpenExternal)
+        );
+        assert_eq!(
+            action_for(&KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &app),
+            Some(Action::PageDown)
+        );
+        app.engine.params.set_vox_mode(false);
+        assert_eq!(
+            action_for(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &app),
+            Some(Action::Ptt(true))
+        );
+    }
 
     fn app() -> App {
         App::for_test(Config::default())

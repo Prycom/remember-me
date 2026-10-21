@@ -144,20 +144,7 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
             Rect::new(row.x, row.y, 1, row.height),
         );
         let image = Rect::new(row.x + 1, row.y, thumbnail, row.height);
-        if app.overlay.is_none() && app.file_input.is_none() {
-            ui.thumbnails
-                .render(card.avatar, app.cfg.avatar_style, f, image);
-        } else {
-            // A modal may overwrite the transmit cell before the frame reaches
-            // the terminal. Keep native images unrendered until they are visible.
-            f.render_widget(
-                crate::avatar::Portrait {
-                    avatar: card.avatar,
-                    mode: app.cfg.avatar_style,
-                },
-                image,
-            );
-        }
+        super::draw_avatar(app, f, ui, card.avatar, image, false);
         ui.push(
             Rect::new(row.x + 1, row.y, thumbnail, row.height),
             Action::ShowProfile(index),
@@ -222,6 +209,23 @@ fn status(disabled: Option<bool>) -> &'static str {
     }
 }
 
+pub(super) fn profile_rect(app: &App, body: Rect) -> Rect {
+    let avatar = if app.call_sel == 0 {
+        &app.avatar
+    } else if app.group_room.is_some() {
+        app.group_peers
+            .get(app.call_sel - 1)
+            .map(|p| &p.avatar)
+            .unwrap_or(&app.avatar)
+    } else {
+        app.peer.as_ref().map(|p| &p.avatar).unwrap_or(&app.avatar)
+    };
+    let side = (avatar.side() as u16)
+        .min(body.width.saturating_sub(4))
+        .min(body.height.saturating_sub(7).saturating_mul(2));
+    super::centered_rect(body, (side + 4).max(48), (side / 2 + 7).max(24))
+}
+
 pub(super) fn render_profile(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
     let p = &app.engine.params;
     let (name, avatar, mute, deaf, ping, speaking) = if app.call_sel == 0 {
@@ -268,11 +272,7 @@ pub(super) fn render_profile(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) 
             false,
         )
     };
-    // Use available terminal cells for actual detail, instead of stretching a 32px thumbnail.
-    let side = (avatar.side() as u16)
-        .min(body.width.saturating_sub(4))
-        .min(body.height.saturating_sub(7).saturating_mul(2));
-    let area = super::centered_rect(body, (side + 4).max(48), (side / 2 + 7).max(24));
+    let area = profile_rect(app, body);
     f.render_widget(ratatui::widgets::Clear, area);
     let block = Block::bordered()
         .title(format!(
@@ -297,13 +297,7 @@ pub(super) fn render_profile(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) 
         Span::styled(format!(" · {ping}"), dim()),
     ]);
     f.render_widget(Paragraph::new(states).centered(), info);
-    f.render_widget(
-        crate::avatar::Portrait {
-            avatar,
-            mode: app.cfg.avatar_style,
-        },
-        image,
-    );
+    super::draw_avatar(app, f, ui, avatar, image, true);
     let choices = if app.call_sel == 0 {
         vec![
             ("[ A картинка ]", Action::EditAvatar),

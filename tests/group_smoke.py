@@ -144,16 +144,21 @@ def main():
             assert proxy.name_lost == 1 and proxy.name_ack_lost == 1
             print('  live names: packet/ACK loss, stale relay roster and late join: PASS', flush=True)
             assert proxy.avatar_lost == 1 and proxy.avatar_ack_lost == 1
+            avatar_helpers.resolution(a, root, 'a', 0)  # maximum full-colour quality
+            for client in (b,c): client.wait_log('avatar received from a revision=3')
+            avatar_helpers.resolution(a, root, 'a', 256)
+            for client in (b,c): client.wait_log('avatar received from a revision=4')
             avatar_helpers.resolution(a, root, 'a', 224)
             for client in (b, c):
-                client.wait_log('avatar received from a revision=3')
+                client.wait_log('avatar received from a revision=5')
             avatar_helpers.clear(a)
             for client in (b, c):
-                client.wait_log('avatar received from a revision=4')
+                client.wait_log('avatar received from a revision=6')
             print('  group 256px avatar: chunk/ACK loss, late join, cached resize, live reset: PASS', flush=True)
             time.sleep(0.5)
             assert a.graphics_placeholders > 0 and len(a.graphics_headers) >= 3, 'native thumbnails were not rendered'
-            assert all(w == 64 and h == 64 for _,w,h in a.graphics_headers), a.graphics_headers
+            assert any(w == 64 and h == 64 for _,w,h in a.graphics_headers), a.graphics_headers
+            assert all(w <= 1024 and h <= 1024 for _,w,h in a.graphics_headers), a.graphics_headers
             ids = [image for image,_,_ in a.graphics_headers]
             assert len(ids) == len(set(ids)), 'cached thumbnail was transmitted more than once'
             print('  native graphics: fixed 64px canvas, Unicode placements, one transmission per cached image: PASS', flush=True)

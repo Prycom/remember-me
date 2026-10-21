@@ -16,6 +16,7 @@ pub enum Focus {
 pub enum Overlay {
     Help,
     Profile,
+    Media,
     HangUp,
 }
 
@@ -36,6 +37,9 @@ pub enum Action {
     NextPane,
     NextLink(bool),
     OpenLink(usize),
+    OpenExternal,
+    MediaPause,
+    ClipboardPaste,
     SendFile,
     CancelFile,
     Update,

@@ -40,16 +40,20 @@ def free_port():
 
 
 class Client:
-    def __init__(self, binary, root, name, args, graphics=False):
+    def __init__(self, binary, root, name, args, graphics=False, extra_env=None):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 180, 0, 0))
         self.master = master
         self.graphics_headers = []
         self.graphics_placeholders = 0
+        self.graphics_deletions = []
         self.log_path = root / (name + ".log")
         self.log_file = self.log_path.open("wb")
         env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ.get("PATH", ""),
                    RM_OPEN_LOG=str(root / "opened.log"), XDG_CONFIG_HOME=str(root / name), RM_DEBUG="1", TERM="xterm-256color")
+        for key,value in (extra_env or {}).items():
+            if value is None: env.pop(key,None)
+            else: env[key]=value
         if graphics:
             env.pop('TMUX', None)
             env.pop('KONSOLE_VERSION', None)
@@ -73,6 +77,7 @@ class Client:
                         self.graphics_placeholders += data.count(chr(0x10EEEE).encode())
                         for header in re.findall(rb'\x1b_Gq=2,i=(\d+),a=T,U=1,f=32,t=d,s=(\d+),v=(\d+),', pending):
                             self.graphics_headers.append(tuple(map(int, header)))
+                        self.graphics_deletions.extend(map(int,re.findall(rb'\x1b_Ga=d,d=I,i=(\d+),q=2;',pending)))
                         # Keep incomplete sequences across reads without counting old headers again.
                         last = pending.rfind(b'\x1b_G')
                         if last >= 0 and b';' not in pending[last:]:

@@ -3,6 +3,7 @@
 
 mod call;
 pub(crate) mod keymap;
+mod media;
 mod mouse;
 pub use mouse::Ui;
 
@@ -54,8 +55,40 @@ fn cut(s: &str, n: usize) -> String {
     }
 }
 
+pub(super) fn draw_avatar(
+    app: &App,
+    f: &mut Frame,
+    ui: &mut Ui,
+    avatar: &std::sync::Arc<crate::avatar::Avatar>,
+    area: Rect,
+    foreground: bool,
+) {
+    if foreground || ui.native_avoid.is_none_or(|cover| !cover.intersects(area)) {
+        ui.thumbnails.render_avatar(
+            avatar,
+            app.cfg.avatar_style,
+            avatar.is_full(),
+            app.cfg.avatar_round,
+            f,
+            area,
+        );
+    } else {
+        f.render_widget(
+            crate::avatar::Portrait {
+                avatar,
+                mode: app.cfg.avatar_style,
+            }
+            .rounded(app.cfg.avatar_round),
+            area,
+        );
+    }
+}
+
 pub fn render(app: &App, f: &mut Frame, ui: &mut Ui) {
     ui.clear();
+    if app.media.is_none() {
+        ui.thumbnails.clear_images();
+    }
     app.chat_hits.borrow_mut().clear();
     if app.screen != Screen::Call {
         app.chat_targets.borrow_mut().clear();
@@ -66,6 +99,17 @@ pub fn render(app: &App, f: &mut Frame, ui: &mut Ui) {
         Constraint::Length(1),
     ])
     .areas(f.area());
+    ui.native_avoid = if app.file_input.is_some() {
+        Some(centered_rect(body, 84, 7))
+    } else {
+        match app.overlay {
+            Some(Overlay::Profile) => Some(call::profile_rect(app, body)),
+            Some(Overlay::Help) => Some(centered_rect(body, 72, 20)),
+            Some(Overlay::HangUp) => Some(centered_rect(body, 36, 7)),
+            Some(Overlay::Media) => Some(media::area(body)),
+            None => None,
+        }
+    };
     header(app, f, head);
     if app.screen == Screen::Call
         && let Some(room) = &app.group_room
@@ -180,6 +224,9 @@ fn call_buttons(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) -> bool {
     if area.width >= 110 {
         segs.insert(4, ("[ F3 файл ]", Action::SendFile));
         segs.insert(5, ("[ F5 обновить ]", Action::Update));
+    }
+    if area.width >= 132 {
+        segs.insert(5, ("[ F6 буфер ]", Action::ClipboardPaste));
     }
     let total: usize = segs.iter().map(|(t, _)| t.chars().count()).sum::<usize>() + segs.len() - 1;
     if total > area.width as usize {
@@ -350,13 +397,7 @@ fn render_home(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
             .border_style(dim());
         let image = block.inner(area);
         f.render_widget(block, area);
-        f.render_widget(
-            crate::avatar::Portrait {
-                avatar: &app.avatar,
-                mode: app.cfg.avatar_style,
-            },
-            image,
-        );
+        draw_avatar(app, f, ui, &app.avatar, image, false);
         ui.push(area, Action::EditAvatar);
     }
     ui.push_pane(body, Pane::Side);
@@ -566,13 +607,7 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
             .border_style(accent());
         let image = block.inner(area);
         f.render_widget(block, area);
-        f.render_widget(
-            crate::avatar::Portrait {
-                avatar: &app.avatar,
-                mode: app.cfg.avatar_style,
-            },
-            image,
-        );
+        draw_avatar(app, f, ui, &app.avatar, image, false);
         ui.push(area, Action::EditAvatar);
         fields
     } else {
@@ -691,7 +726,29 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
     ));
     rows.push((
         "чёткость аватарки".into(),
-        format!("{0}×{0} пикселей · ←/→ или Enter", cfg.avatar_resolution),
+        if cfg.avatar_smooth {
+            "Максимум · полный цвет · сглаживание".into()
+        } else {
+            format!("{0}×{0} пикселей · ←/→ или Enter", cfg.avatar_resolution)
+        },
+    ));
+    rows.push((
+        "форма аватарок".into(),
+        if cfg.avatar_round {
+            "круглая"
+        } else {
+            "как есть"
+        }
+        .into(),
+    ));
+    rows.push((
+        "просмотр вложений".into(),
+        if cfg.media_in_terminal {
+            "в терминале · O открыть внешне"
+        } else {
+            "внешнее приложение"
+        }
+        .into(),
     ));
     let mut lines = Vec::new();
     for (i, (label, val)) in rows.iter().enumerate() {
@@ -767,10 +824,16 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
     let help = match app.settings_sel {
         crate::app::ROW_AVATAR => "Enter: PNG/JPEG/WebP/GIF, путь или ~/ · пусто = узор по нику",
         crate::app::ROW_AVATAR_RESOLUTION => {
-            "←/→: 8–256 px · размер карточки фиксирован · мелкие пиксели при поддержке графики"
+            "←/→: 8–256 пикселей или Максимум · одинаковая отрисовка в карточке и профиле"
         }
         crate::app::ROW_AVATAR_STYLE => {
             "Enter: цветные пиксели / ASCII · действует на все аватарки у вас"
+        }
+        crate::app::ROW_AVATAR_ROUND => {
+            "Enter/←/→: круглая аватарка или исходная форма · действует на вашем экране"
+        }
+        crate::app::ROW_MEDIA_VIEW => {
+            "Enter/←/→: картинки, GIF и текст в терминале или внешнем приложении"
         }
         crate::app::ROW_AVATAR_CLEAR => "Enter: удалить свою картинку и вернуть узор по нику",
         crate::app::ROW_AUTO_UPDATE => {
@@ -906,6 +969,7 @@ fn overlays(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
                     "tab  участники / чат",
                     "i / t  писать · esc  назад",
                     "F2 настройки · F3 файл · F4 отмена · F5 обновить",
+                    "Ctrl+V / Shift+Insert / F6 — картинка или текст из буфера",
                     "l / shift+tab ссылки · enter открыть",
                     "space  говорить (PTT)",
                     "m  микрофон · d  звук",
@@ -935,6 +999,7 @@ fn overlays(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
             ui.push(area, Action::Cancel);
         }
         Some(Overlay::Profile) => call::render_profile(app, f, ui, body),
+        Some(Overlay::Media) => media::render(app, f, ui, body),
         Some(Overlay::HangUp) => {
             let area = centered_rect(body, 36, 7);
             f.render_widget(Clear, area);
@@ -1019,7 +1084,7 @@ fn file_prompt(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
     f.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
-                "Путь к файлу · вставка · ~/ поддерживается",
+                "Путь к файлу или PNG из буфера · ~/ поддерживается",
                 dim(),
             )),
             Line::from(format!("> {visible}▏")),

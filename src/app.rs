@@ -91,7 +91,9 @@ pub const ROW_AVATAR: usize = 16;
 pub const ROW_AVATAR_STYLE: usize = 17;
 pub const ROW_AVATAR_CLEAR: usize = 18;
 pub const ROW_AVATAR_RESOLUTION: usize = 19;
-pub const SETTINGS_ROWS: usize = 20;
+pub const ROW_AVATAR_ROUND: usize = 20;
+pub const ROW_MEDIA_VIEW: usize = 21;
+pub const SETTINGS_ROWS: usize = 22;
 
 const PENDING_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DIAL_MAX_TXT: &str = "60";
@@ -127,6 +129,8 @@ pub struct App {
     pub call_sel: usize,
     pub host_sel: usize,
     pub overlay: Option<Overlay>,
+    pub media: Option<crate::media::Viewer>,
+    clipboard_result: Option<std::sync::mpsc::Receiver<Result<crate::clipboard::Input, String>>>,
     pub log: Vec<String>,
     pub chat_scroll: usize,
     pub chat_view_height: std::cell::Cell<usize>,
@@ -159,7 +163,12 @@ impl App {
     pub fn new(cfg: Config, engine: Arc<AudioEngine>) -> App {
         let automatic = cfg.auto_update;
         let mut app = Self::with_devices(cfg, engine, crate::audio::list_devices());
-        if !app.cfg.avatar_contained
+        if (!app.cfg.avatar_contained
+            || app
+                .cfg
+                .avatar_original
+                .as_ref()
+                .is_some_and(|a| !a.is_full()))
             && app.cfg.avatar.is_some()
             && std::path::Path::new(&app.cfg.avatar_file).is_file()
         {
@@ -220,6 +229,8 @@ impl App {
             call_sel: 0,
             host_sel: 0,
             overlay: None,
+            media: None,
+            clipboard_result: None,
             log: Vec::new(),
             chat_scroll: 0,
             chat_view_height: std::cell::Cell::new(0),
@@ -246,12 +257,43 @@ impl App {
     // ── главный тик: события сети + перекачка аудио ─────────────────────────
 
     pub fn poll(&mut self) {
+        if self.overlay != Some(Overlay::Media) {
+            self.media = None;
+        }
+        if let Some(media) = &mut self.media {
+            media.poll();
+        }
+        if let Some(rx) = &self.clipboard_result
+            && let Ok(result) = rx.try_recv()
+        {
+            self.clipboard_result = None;
+            match result {
+                Ok(crate::clipboard::Input::Text(text)) => self.on_action(Action::Paste(text)),
+                Ok(crate::clipboard::Input::Image(path)) if self.screen == Screen::Call => {
+                    if std::env::var("RM_DEBUG").ok().as_deref() == Some("1") {
+                        eprintln!("[clipboard] image {}", path.display());
+                    }
+                    self.engine.params.set_ptt_active(false);
+                    self.overlay = None;
+                    self.media = None;
+                    self.file_input = Some(path.display().to_string());
+                    self.set_toast(
+                        "картинка из буфера · Enter предложить файл · Esc отменить".into(),
+                    );
+                }
+                Ok(crate::clipboard::Input::Image(_)) => {
+                    self.set_toast("картинка сохранена; вернитесь в звонок для отправки".into())
+                }
+                Err(error) => self.set_toast(error),
+            }
+        }
         if let Some(rx) = &self.avatar_load
             && let Ok(result) = rx.try_recv()
         {
             self.avatar_load = None;
             match result {
                 Ok((avatar, original, path)) => {
+                    self.cfg.avatar_smooth = avatar.is_full();
                     self.cfg.avatar_resolution = avatar.side() as u16;
                     self.cfg.avatar_original = Some(original);
                     self.cfg.avatar_contained = true;
@@ -389,6 +431,21 @@ impl App {
         }
     }
     fn open_target(&mut self, target: OpenTarget) {
+        if self.cfg.media_in_terminal
+            && let OpenTarget::File(path) = &target
+            && crate::media::supported(path)
+        {
+            if std::env::var("RM_DEBUG").ok().as_deref() == Some("1") {
+                eprintln!("[media] open {}", path.display());
+            }
+            self.engine.params.set_ptt_active(false);
+            self.media = Some(crate::media::Viewer::new(path.clone()));
+            self.overlay = Some(Overlay::Media);
+            return;
+        }
+        self.open_external(target);
+    }
+    fn open_external(&mut self, target: OpenTarget) {
         let tx = self.open_results.0.clone();
         std::thread::spawn(move || {
             let _ = tx.send(crate::chat_links::open(target));
@@ -1027,6 +1084,76 @@ impl App {
             self.quit = true;
             return;
         }
+        if a == Action::ClipboardPaste {
+            if self.clipboard_result.is_none() {
+                let allow_image = self.screen == Screen::Call && self.overlay.is_none();
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.clipboard_result = Some(rx);
+                std::thread::spawn(move || {
+                    let _ = tx.send(crate::clipboard::read(allow_image));
+                });
+            }
+            return;
+        }
+        if self.overlay == Some(Overlay::Media) {
+            match a {
+                Action::Ptt(value) => self.engine.params.set_ptt_active(value),
+                Action::Cancel => {
+                    self.engine.params.set_ptt_active(false);
+                    self.overlay = None;
+                    self.media = None;
+                }
+                Action::OpenExternal => {
+                    if let Some(media) = &self.media {
+                        self.open_external(OpenTarget::File(media.path.clone()));
+                    }
+                }
+                Action::MediaPause | Action::Confirm => {
+                    if let Some(media) = &mut self.media {
+                        media.paused = !media.paused;
+                        if std::env::var("RM_DEBUG").ok().as_deref() == Some("1") {
+                            eprintln!("[media] paused={}", media.paused);
+                        }
+                    }
+                }
+                Action::Left => {
+                    if let Some(media) = &mut self.media {
+                        media.step(-1);
+                    }
+                }
+                Action::Right => {
+                    if let Some(media) = &mut self.media {
+                        media.step(1);
+                    }
+                }
+                Action::Up
+                | Action::Down
+                | Action::PageUp
+                | Action::PageDown
+                | Action::Home
+                | Action::End => {
+                    let delta = match a {
+                        Action::Up => -1,
+                        Action::Down => 1,
+                        Action::PageUp => -20,
+                        Action::PageDown => 20,
+                        Action::Home => i32::MIN,
+                        _ => i32::MAX,
+                    };
+                    if let Some(media) = &mut self.media {
+                        media.scroll_by(delta);
+                    }
+                }
+                Action::Scroll(_, delta) => {
+                    if let Some(media) = &mut self.media {
+                        media.scroll_by(delta as i32);
+                    }
+                }
+                Action::Quit => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
         if self.file_input.is_some() {
             match a {
                 Action::Confirm => {
@@ -1636,6 +1763,10 @@ impl App {
     }
 
     fn settings_adjust(&mut self, d: i16) {
+        if matches!(self.settings_sel, ROW_AVATAR_ROUND | ROW_MEDIA_VIEW) {
+            self.settings_toggle();
+            return;
+        }
         if self.settings_sel == ROW_AVATAR_RESOLUTION {
             self.adjust_avatar_resolution(d.signum());
             return;
@@ -1699,6 +1830,14 @@ impl App {
                 self.cfg_save_state();
             }
             ROW_AVATAR_STYLE => self.cycle_avatars(),
+            ROW_AVATAR_ROUND => {
+                self.cfg.avatar_round = !self.cfg.avatar_round;
+                self.cfg.save();
+            }
+            ROW_MEDIA_VIEW => {
+                self.cfg.media_in_terminal = !self.cfg.media_in_terminal;
+                self.cfg.save();
+            }
             ROW_AVATAR_RESOLUTION => self.adjust_avatar_resolution(1),
             ROW_AVATAR_CLEAR => {
                 self.load_avatar("");
@@ -1742,11 +1881,21 @@ impl App {
         let path = crate::config::expand_path(path);
         let source = path.display().to_string();
         let resolution = self.cfg.avatar_resolution;
+        let smooth = self.cfg.avatar_smooth;
         let (tx, rx) = std::sync::mpsc::channel();
         self.avatar_load = Some(rx);
         std::thread::spawn(move || {
-            let result = crate::avatar::Avatar::load_at(&path, crate::avatar::MAX_SIDE as u16)
-                .map(|original| (original.resized(resolution), original, source));
+            let result = crate::avatar::Avatar::load_original(&path).map(|original| {
+                (
+                    if smooth {
+                        original.clone()
+                    } else {
+                        original.resized(resolution)
+                    },
+                    original,
+                    source,
+                )
+            });
             let _ = tx.send(result);
         });
         self.set_toast("готовим аватарку… голос продолжает работать".into());
@@ -1757,13 +1906,20 @@ impl App {
             return;
         }
         let sizes = crate::avatar::RESOLUTIONS;
-        let index = sizes
-            .iter()
-            .position(|&n| n == self.cfg.avatar_resolution)
-            .unwrap_or(4);
-        let resolution = sizes[(index as i16 + direction).rem_euclid(sizes.len() as i16) as usize];
+        let index = if self.cfg.avatar_smooth {
+            sizes.len()
+        } else {
+            sizes
+                .iter()
+                .position(|&n| n == self.cfg.avatar_resolution)
+                .unwrap_or(4)
+        };
+        let index = (index as i16 + direction).rem_euclid(sizes.len() as i16 + 1) as usize;
+        let smooth = index == sizes.len();
+        let resolution = if smooth { 256 } else { sizes[index] };
         if self.cfg.avatar.is_none() {
             self.cfg.avatar_resolution = resolution;
+            self.cfg.avatar_smooth = smooth;
             self.cfg.save();
             return;
         }
@@ -1778,17 +1934,24 @@ impl App {
         self.avatar_load = Some(rx);
         std::thread::spawn(move || {
             let original = cached.map(Ok).unwrap_or_else(|| {
-                crate::avatar::Avatar::load_at(
-                    &crate::config::expand_path(&source),
-                    crate::avatar::MAX_SIDE as u16,
+                crate::avatar::Avatar::load_original(&crate::config::expand_path(&source)).map_err(
+                    |_| {
+                        "для старой аватарки выберите картинку заново: исходный файл не найден"
+                            .to_string()
+                    },
                 )
-                .map_err(|_| {
-                    "для старой аватарки выберите картинку заново: исходный файл не найден"
-                        .to_string()
-                })
             });
-            let _ =
-                tx.send(original.map(|original| (original.resized(resolution), original, source)));
+            let _ = tx.send(original.map(|original| {
+                (
+                    if smooth {
+                        crate::avatar::Avatar::full_color(original.rgba())
+                    } else {
+                        original.resized(resolution)
+                    },
+                    original,
+                    source,
+                )
+            }));
         });
         self.set_toast(format!("готовим аватарку {resolution}×{resolution}…"));
     }
@@ -2000,6 +2163,73 @@ fn load_chat_log(key: &str, my_name: &str) -> Vec<ChatLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attachment_preview_and_clipboard_prompt_preserve_the_call_and_chat_draft() {
+        let path = std::env::temp_dir().join(format!("rm-preview-{}.png", std::process::id()));
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]))
+            .save(&path)
+            .unwrap();
+        let mut app = App::for_test(Config::default());
+        app.screen = Screen::Call;
+        app.input = "черновик".into();
+        app.engine.params.set_ptt_active(true);
+        app.open_target(OpenTarget::File(path.clone()));
+        assert_eq!(app.overlay, Some(Overlay::Media));
+        app.on_action(Action::Cancel);
+        assert!(app.media.is_none());
+        assert_eq!(app.screen, Screen::Call);
+        assert_eq!(app.input, "черновик");
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.clipboard_result = Some(rx);
+        tx.send(Ok(crate::clipboard::Input::Image(path.clone())))
+            .unwrap();
+        app.poll();
+        assert_eq!(app.file_input.as_deref(), path.to_str());
+        assert!(
+            app.chat.is_empty(),
+            "pasting must wait for Enter before offering a file"
+        );
+        app.on_action(Action::Cancel);
+        assert!(app.file_input.is_none());
+        assert_eq!(app.input, "черновик");
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn maximum_avatar_quality_rounding_and_viewer_preferences_are_live_settings() {
+        let original =
+            crate::avatar::Avatar::full_color(image::RgbaImage::from_fn(256, 256, |x, y| {
+                image::Rgba([x as u8, y as u8, 80, 255])
+            }));
+        let mut app = App::for_test(Config {
+            avatar: Some(original.resized(256)),
+            avatar_original: Some(original),
+            avatar_resolution: 256,
+            ..Default::default()
+        });
+        app.settings_sel = ROW_AVATAR_RESOLUTION;
+        app.settings_adjust(5);
+        let end = Instant::now() + Duration::from_secs(5);
+        while app.avatar_load.is_some() && Instant::now() < end {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.cfg.avatar_smooth && app.avatar.is_full());
+        app.settings_sel = ROW_AVATAR_ROUND;
+        app.settings_toggle();
+        assert!(app.cfg.avatar_round);
+        app.settings_sel = ROW_MEDIA_VIEW;
+        app.settings_toggle();
+        assert!(!app.cfg.media_in_terminal);
+        app.settings_sel = ROW_AVATAR_RESOLUTION;
+        app.settings_adjust(5);
+        let end = Instant::now() + Duration::from_secs(5);
+        while app.avatar_load.is_some() && Instant::now() < end {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!app.cfg.avatar_smooth);
+        assert_eq!(app.avatar.side(), 8);
+    }
 
     #[test]
     fn live_peer_name_updates_authors_and_identicons_without_replacing_a_photo() {

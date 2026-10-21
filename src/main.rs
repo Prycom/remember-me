@@ -18,6 +18,7 @@ mod chat_links;
 mod clipboard;
 mod config;
 mod group;
+mod media;
 mod net;
 mod noise_suppress;
 mod profile;
@@ -245,6 +246,7 @@ async fn run(
 
         if Instant::now() >= next_draw {
             let draw_started = Instant::now();
+            ui.thumbnails.flush_cleanup();
             res = term.draw(|f| ui::render(&app, f, &mut ui)).map(|_| ());
             if draw_started.elapsed() > Duration::from_millis(100)
                 && std::env::var("RM_DEBUG").ok().as_deref() == Some("1")
@@ -261,6 +263,7 @@ async fn run(
         }
     }
 
+    ui.thumbnails.shutdown();
     #[cfg(not(windows))]
     let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     let _ = crossterm::execute!(

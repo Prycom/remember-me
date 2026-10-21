@@ -1,5 +1,10 @@
 Rolling test builds for Linux x86_64 and Windows 10/11 x64.
 
+- Downloaded pictures, animated GIFs and text files open inside the terminal, with an external-app preference and O shortcut. Downloads and per-recipient consent are unchanged.
+- Paste clipboard images with Ctrl+V, Shift+Insert or F6 on Linux/Windows; Enter offers the captured PNG, Escape cancels while preserving the draft.
+- Avatars use the same renderer in thumbnails and profiles. Choose an explicit pixel grid or Maximum (full colour and smoothing), plus optional circular decoration. Update all clients for full-colour avatar delivery; the relay is unchanged.
+- GIF decoding, native image encoding and playback are bounded and run outside the voice loop; closing previews releases image resources.
+
 - File offers require each recipient’s consent within two minutes; Y/Enter accepts, N declines. Update all clients; the relay is unchanged.
 - Chat message selection/scrolling with arrows, highlighted rows, contextual file actions and Unicode cursor editing.
 - Portable `remember-me.exe` for Windows x64: bundled Opus and C runtime, WASAPI audio, verified self-updates with F5.
