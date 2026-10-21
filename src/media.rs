@@ -26,6 +26,7 @@ pub struct Viewer {
     pub scroll: usize,
     pub frame: usize,
     pub paused: bool,
+    pub prepared: std::cell::Cell<bool>,
     pub text_rows: std::cell::Cell<usize>,
     pub wrapped: std::cell::RefCell<Option<(u16, Vec<String>)>>,
     elapsed: Duration,
@@ -54,6 +55,7 @@ impl Viewer {
             scroll: 0,
             frame: 0,
             paused: false,
+            prepared: std::cell::Cell::new(false),
             elapsed: Duration::ZERO,
             last: Instant::now(),
             cancelled,
@@ -86,7 +88,12 @@ impl Viewer {
             self.last = Instant::now();
         }
         let now = Instant::now();
-        if !self.paused
+        if !self.prepared.get() {
+            self.elapsed = Duration::ZERO;
+            self.frame = 0;
+        }
+        if self.prepared.get()
+            && !self.paused
             && let Some(Content::Image(frames)) = &self.content
             && frames.len() > 1
         {
@@ -365,6 +372,13 @@ mod tests {
         let mut viewer = Viewer::new(path.clone());
         viewer.result = None;
         viewer.content = Some(content);
+        viewer.last = Instant::now() - Duration::from_millis(800);
+        viewer.poll();
+        assert_eq!(
+            viewer.frame, 0,
+            "the loading screen must not advance playback"
+        );
+        viewer.prepared.set(true);
         viewer.last = Instant::now() - Duration::from_millis(800);
         viewer.poll();
         assert!(viewer.frame > 0);

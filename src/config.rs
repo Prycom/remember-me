@@ -33,6 +33,8 @@ pub struct Config {
     pub server_addr: String,
     /// Empty uses the platform Downloads directory.
     pub download_dir: String,
+    /// Empty uses the OS temporary directory; files live until application exit.
+    pub clipboard_dir: String,
     /// Check the fixed GitHub test channel once at startup; replace atomically.
     pub auto_update: bool,
     pub avatar: Option<crate::avatar::Avatar>,
@@ -80,6 +82,7 @@ impl Default for Config {
             noise_suppression: false,
             server_addr: String::new(),
             download_dir: String::new(),
+            clipboard_dir: String::new(),
             auto_update: true,
             avatar: None,
             avatar_file: String::new(),
@@ -128,6 +131,13 @@ pub fn expand_path(value: &str) -> PathBuf {
 }
 
 impl Config {
+    pub fn clipboard_directory(&self) -> PathBuf {
+        if self.clipboard_dir.trim().is_empty() {
+            std::env::temp_dir()
+        } else {
+            expand_path(&self.clipboard_dir)
+        }
+    }
     pub fn download_directory(&self) -> PathBuf {
         if !self.download_dir.trim().is_empty() {
             let path = expand_path(&self.download_dir);

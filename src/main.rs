@@ -23,6 +23,7 @@ mod net;
 mod noise_suppress;
 mod profile;
 mod proto;
+mod storage;
 mod transfer;
 mod ui;
 mod update;

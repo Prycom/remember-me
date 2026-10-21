@@ -61,6 +61,7 @@ def main():
             a.wait_log('[clipboard] image ')
             pasted=Path(re.search(r'\[clipboard\] image (.+)',a.log()).group(1))
             assert pasted.exists()
+            assert root/'a/remember-me' not in pasted.parents, 'clipboard image leaked into config directory'
             assert not list((root/'downloads_b').glob('*')), 'paste sent data without Enter'
             a.key('\r');b.wait_log('[file] offer '+pasted.name)
             assert not (root/'downloads_b'/pasted.name).exists()
@@ -81,6 +82,7 @@ def main():
             file_consent(b,gif.name);downloaded=root/'downloads_b'/gif.name
             wait(downloaded.exists,'GIF download missing')
             b.key('\x1b[F\r');b.wait_log('[media] loaded animation.gif image frames=12')
+            b.wait_log('[media] ready animation.gif frames=12')
             time.sleep(1.4);b.key(' ');b.wait_log('[media] paused=true');b.key('\x1b[C')
             measure(root,names['a','mic'],names['b','out'],sound,True,'voice while GIF preview is open')
             b.key(' ');b.wait_log('[media] paused=false')
@@ -113,8 +115,12 @@ def main():
             wait(lambda:str(root/'downloads_b'/text.name) in (root/'opened.log').read_text(),'external preference was ignored')
             assert b.log().count('[media] open ')==before
             a.key('\r');time.sleep(.2)
-            assert any('Черновик' in p.read_text() for p in (root/'a/remember-me').glob('chat-*.log')),'image paste lost the chat draft'
+            assert any('Черновик' in p.read_text() for p in (root/'a/state/remember-me/logs').glob('chat-*.log')),'image paste lost the chat draft'
             print('  text viewer + scrolling + live external preference + preserved draft: PASS',flush=True)
+            a.key('\x03')
+            wait(lambda:a.proc.poll() is not None,'normal application exit failed')
+            wait(lambda:not pasted.exists(),'clipboard image survived normal application exit')
+            print('  temporary clipboard snapshots removed on application exit: PASS',flush=True)
             print('MEDIA: PASS',flush=True)
         except Exception:
             for client in clients: print(client.log()[-4000:])
@@ -123,6 +129,7 @@ def main():
             if owner:
                 owner.communicate('\n',timeout=3)
             for client in reversed(clients):client.close()
+            if 'pasted' in locals():pasted.unlink(missing_ok=True)
             if xserver:xserver.terminate();xserver.wait(timeout=3)
             for module in reversed(modules):pulse('unload-module',module)
 

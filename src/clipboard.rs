@@ -6,22 +6,27 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 
 pub enum Input {
     Text(String),
-    Image(std::path::PathBuf),
+    Image(tempfile::TempPath),
 }
 
 /// Called only for an explicit paste, on a short-lived background thread.
-pub fn read(allow_image: bool) -> Result<Input, String> {
+pub fn read(allow_image: bool, directory: &std::path::Path) -> Result<Input, String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("буфер обмена: {e}"))?;
     if allow_image && let Ok(image) = clipboard.get_image() {
-        return save_image(image.width, image.height, image.bytes.as_ref()).map(Input::Image);
+        return save_image(directory, image.width, image.height, image.bytes.as_ref())
+            .map(Input::Image);
     }
     clipboard
         .get_text()
         .map(Input::Text)
         .map_err(|e| format!("в буфере нет доступной картинки или текста: {e}"))
 }
-fn save_image(width: usize, height: usize, bytes: &[u8]) -> Result<std::path::PathBuf, String> {
-    use std::io::Write;
+fn save_image(
+    directory: &std::path::Path,
+    width: usize,
+    height: usize,
+    bytes: &[u8],
+) -> Result<tempfile::TempPath, String> {
     if width == 0
         || height == 0
         || width > 4096
@@ -30,26 +35,14 @@ fn save_image(width: usize, height: usize, bytes: &[u8]) -> Result<std::path::Pa
     {
         return Err("картинка из буфера должна быть не больше 4096×4096".into());
     }
-    let dir = crate::config::Config::path()
-        .parent()
-        .ok_or("нет папки настроек")?
-        .join("clipboard");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let random = u32::from_be_bytes(crate::net::rnd32()[..4].try_into().unwrap());
-    let path = dir.join(format!("clipboard-{stamp}-{random:08x}.png"));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&path).map_err(|e| e.to_string())?;
-    let result = image::codecs::png::PngEncoder::new(&mut file);
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix("remember-me-clipboard-")
+        .suffix(".png")
+        .tempfile_in(directory)
+        .map_err(|e| e.to_string())?;
+    let file = temporary.as_file_mut();
+    let result = image::codecs::png::PngEncoder::new(&mut *file);
     use image::ImageEncoder;
     if let Err(error) = result.write_image(
         bytes,
@@ -57,11 +50,10 @@ fn save_image(width: usize, height: usize, bytes: &[u8]) -> Result<std::path::Pa
         height as u32,
         image::ExtendedColorType::Rgba8,
     ) {
-        let _ = std::fs::remove_file(&path);
         return Err(error.to_string());
     }
     file.flush().map_err(|e| e.to_string())?;
-    Ok(path)
+    Ok(temporary.into_temp_path())
 }
 
 pub fn copy(text: &str) -> std::io::Result<()> {
@@ -102,7 +94,7 @@ mod tests {
     #[test]
     fn pasted_image_is_a_private_lossless_file_and_invalid_dimensions_are_rejected() {
         let pixels = vec![20, 40, 80, 255].repeat(16 * 8);
-        let path = save_image(16, 8, &pixels).unwrap();
+        let path = save_image(&std::env::temp_dir(), 16, 8, &pixels).unwrap();
         let decoded = image::open(&path).unwrap().into_rgba8();
         assert_eq!(decoded.dimensions(), (16, 8));
         assert_eq!(decoded.as_raw(), &pixels);
@@ -114,10 +106,15 @@ mod tests {
                 0o600
             );
         }
-        std::fs::remove_file(path).unwrap();
-        assert!(save_image(0, 8, &[]).is_err());
-        assert!(save_image(4097, 1, &[]).is_err());
-        assert!(save_image(16, 8, &pixels[..4]).is_err());
+        let removed = path.to_path_buf();
+        drop(path);
+        assert!(
+            !removed.exists(),
+            "temporary clipboard image must be deleted on drop"
+        );
+        assert!(save_image(&std::env::temp_dir(), 0, 8, &[]).is_err());
+        assert!(save_image(&std::env::temp_dir(), 4097, 1, &[]).is_err());
+        assert!(save_image(&std::env::temp_dir(), 16, 8, &pixels[..4]).is_err());
     }
 
     #[test]

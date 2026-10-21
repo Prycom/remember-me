@@ -93,7 +93,8 @@ pub const ROW_AVATAR_CLEAR: usize = 18;
 pub const ROW_AVATAR_RESOLUTION: usize = 19;
 pub const ROW_AVATAR_ROUND: usize = 20;
 pub const ROW_MEDIA_VIEW: usize = 21;
-pub const SETTINGS_ROWS: usize = 22;
+pub const ROW_CLIPBOARD: usize = 22;
+pub const SETTINGS_ROWS: usize = 23;
 
 const PENDING_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DIAL_MAX_TXT: &str = "60";
@@ -131,6 +132,7 @@ pub struct App {
     pub overlay: Option<Overlay>,
     pub media: Option<crate::media::Viewer>,
     clipboard_result: Option<std::sync::mpsc::Receiver<Result<crate::clipboard::Input, String>>>,
+    clipboard_files: Vec<tempfile::TempPath>,
     pub log: Vec<String>,
     pub chat_scroll: usize,
     pub chat_view_height: std::cell::Cell<usize>,
@@ -161,6 +163,7 @@ pub struct App {
 
 impl App {
     pub fn new(cfg: Config, engine: Arc<AudioEngine>) -> App {
+        let storage_error = crate::storage::initialize().err();
         let automatic = cfg.auto_update;
         let mut app = Self::with_devices(cfg, engine, crate::audio::list_devices());
         if (!app.cfg.avatar_contained
@@ -174,6 +177,9 @@ impl App {
         {
             let path = app.cfg.avatar_file.clone();
             app.load_avatar(&path);
+        }
+        if let Some(error) = storage_error {
+            app.set_toast(format!("перенос истории: {error}"));
         }
         if automatic {
             app.start_update(false);
@@ -231,6 +237,7 @@ impl App {
             overlay: None,
             media: None,
             clipboard_result: None,
+            clipboard_files: Vec::new(),
             log: Vec::new(),
             chat_scroll: 0,
             chat_view_height: std::cell::Cell::new(0),
@@ -277,12 +284,13 @@ impl App {
                     self.overlay = None;
                     self.media = None;
                     self.file_input = Some(path.display().to_string());
+                    self.clipboard_files.push(path);
                     self.set_toast(
                         "картинка из буфера · Enter предложить файл · Esc отменить".into(),
                     );
                 }
                 Ok(crate::clipboard::Input::Image(_)) => {
-                    self.set_toast("картинка сохранена; вернитесь в звонок для отправки".into())
+                    self.set_toast("для вставки картинки вернитесь в звонок".into())
                 }
                 Err(error) => self.set_toast(error),
             }
@@ -1089,8 +1097,9 @@ impl App {
                 let allow_image = self.screen == Screen::Call && self.overlay.is_none();
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.clipboard_result = Some(rx);
+                let directory = self.cfg.clipboard_directory();
                 std::thread::spawn(move || {
-                    let _ = tx.send(crate::clipboard::read(allow_image));
+                    let _ = tx.send(crate::clipboard::read(allow_image, &directory));
                 });
             }
             return;
@@ -1161,6 +1170,10 @@ impl App {
                     self.send_file(&path);
                 }
                 Action::Cancel => {
+                    if let Some(path) = &self.file_input {
+                        self.clipboard_files
+                            .retain(|p| p.to_string_lossy() != path.as_str());
+                    }
                     self.file_input = None;
                 }
                 Action::Insert(c) => {
@@ -1624,7 +1637,7 @@ impl App {
                 Action::Insert(c) => {
                     if let Some((row, buf)) = self.edit.as_mut()
                         && buf.len() + c.len_utf8()
-                            <= if matches!(*row, ROW_DOWNLOAD | ROW_AVATAR) {
+                            <= if matches!(*row, ROW_DOWNLOAD | ROW_AVATAR | ROW_CLIPBOARD) {
                                 4096
                             } else {
                                 64
@@ -1636,7 +1649,7 @@ impl App {
                 Action::Paste(s) => {
                     if let Some((row, buf)) = self.edit.as_mut()
                         && buf.len() + s.len()
-                            <= if matches!(*row, ROW_DOWNLOAD | ROW_AVATAR) {
+                            <= if matches!(*row, ROW_DOWNLOAD | ROW_AVATAR | ROW_CLIPBOARD) {
                                 4096
                             } else {
                                 64
@@ -1731,6 +1744,7 @@ impl App {
                 return;
             }
             ROW_SERVER => self.cfg.server_addr = buf,
+            ROW_CLIPBOARD => self.cfg.clipboard_dir = buf,
             ROW_DOWNLOAD => {
                 self.cfg.download_dir = buf;
                 if let Some(session) = &self.session {
@@ -1783,12 +1797,13 @@ impl App {
 
     fn settings_toggle(&mut self) {
         match self.settings_sel {
-            ROW_NAME | ROW_PORT | ROW_SERVER | ROW_DOWNLOAD | ROW_AVATAR => {
+            ROW_NAME | ROW_PORT | ROW_SERVER | ROW_DOWNLOAD | ROW_AVATAR | ROW_CLIPBOARD => {
                 let val = match self.settings_sel {
                     ROW_NAME => self.cfg.name.clone(),
                     ROW_PORT => self.cfg.port.to_string(),
                     ROW_DOWNLOAD => self.cfg.download_directory().display().to_string(),
                     ROW_AVATAR => self.cfg.avatar_file.clone(),
+                    ROW_CLIPBOARD => self.cfg.clipboard_dir.clone(),
                     _ => self.cfg.server_addr.clone(),
                 };
                 self.edit = Some((self.settings_sel, val));
@@ -2043,10 +2058,9 @@ fn chat_peer_key(name: &str) -> String {
 }
 
 fn chat_path(key: &str) -> std::path::PathBuf {
-    crate::config::Config::path()
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join(format!("chat-{key}.log"))
+    let directory = crate::storage::logs_directory();
+    let _ = crate::storage::private_directory(&directory);
+    directory.join(format!("chat-{key}.log"))
 }
 
 // A versioned tab-separated record keeps ownership separate from the actual
@@ -2090,21 +2104,14 @@ fn chat_record(mine: bool, name: &str, text: &str) -> String {
 }
 
 fn append_chat_log(key: &str, mine: bool, name: &str, text: &str) {
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(chat_path(key))
-    {
+    if let Ok(mut f) = crate::storage::log_options().open(chat_path(key)) {
         let _ = writeln!(f, "[{}] {}", fmt_ts(), chat_record(mine, name, text));
     }
 }
 
 fn append_file_log(key: &str, line: &ChatLine) {
     if let Ok(record) = toml::to_string(line)
-        && let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(chat_path(key))
+        && let Ok(mut file) = crate::storage::log_options().open(chat_path(key))
     {
         let _ = writeln!(file, "[{}] @rm3\t{}", fmt_ts(), escape_log(&record));
     }
@@ -2181,16 +2188,24 @@ mod tests {
         assert_eq!(app.input, "черновик");
         let (tx, rx) = std::sync::mpsc::channel();
         app.clipboard_result = Some(rx);
-        tx.send(Ok(crate::clipboard::Input::Image(path.clone())))
+        let temporary = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .unwrap()
+            .into_temp_path();
+        std::fs::copy(&path, &temporary).unwrap();
+        let pasted = temporary.to_path_buf();
+        tx.send(Ok(crate::clipboard::Input::Image(temporary)))
             .unwrap();
         app.poll();
-        assert_eq!(app.file_input.as_deref(), path.to_str());
+        assert_eq!(app.file_input.as_deref(), pasted.to_str());
         assert!(
             app.chat.is_empty(),
             "pasting must wait for Enter before offering a file"
         );
         app.on_action(Action::Cancel);
         assert!(app.file_input.is_none());
+        assert!(!pasted.exists());
         assert_eq!(app.input, "черновик");
         std::fs::remove_file(path).unwrap();
     }

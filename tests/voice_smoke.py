@@ -50,7 +50,8 @@ class Client:
         self.log_path = root / (name + ".log")
         self.log_file = self.log_path.open("wb")
         env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ.get("PATH", ""),
-                   RM_OPEN_LOG=str(root / "opened.log"), XDG_CONFIG_HOME=str(root / name), RM_DEBUG="1", TERM="xterm-256color")
+                   RM_OPEN_LOG=str(root / "opened.log"), XDG_CONFIG_HOME=str(root / name),
+                   XDG_STATE_HOME=str(root / name / "state"), RM_DEBUG="1", TERM="xterm-256color")
         for key,value in (extra_env or {}).items():
             if value is None: env.pop(key,None)
             else: env[key]=value
@@ -456,8 +457,8 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
         host.key("\x1b[127;1:2u" * 3)
         host.key("\r")
         time.sleep(0.3)
-        own_history = root / "a" / "remember-me" / "chat-b.log"
-        peer_history = root / "b" / "remember-me" / "chat-a.log"
+        own_history = root / "a" / "state" / "remember-me" / "logs" / "chat-b.log"
+        peer_history = root / "b" / "state" / "remember-me" / "logs" / "chat-a.log"
         assert "@rm2\t1\ta\tA:Ж" in own_history.read_text()
         assert "@rm2\t0\ta\tA:Ж" in peer_history.read_text()
         print("  actual terminal Shift/punctuation/Unicode/repeating Backspace + named history: PASS", flush=True)

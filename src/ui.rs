@@ -750,6 +750,14 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
         }
         .into(),
     ));
+    rows.push((
+        "временная папка буфера".into(),
+        if cfg.clipboard_dir.is_empty() {
+            "системная временная папка".into()
+        } else {
+            cfg.clipboard_dir.clone()
+        },
+    ));
     let mut lines = Vec::new();
     for (i, (label, val)) in rows.iter().enumerate() {
         let cursor = if i == app.settings_sel && app.edit.is_none() {
@@ -838,6 +846,9 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
         crate::app::ROW_AVATAR_CLEAR => "Enter: удалить свою картинку и вернуть узор по нику",
         crate::app::ROW_AUTO_UPDATE => {
             "Enter: проверять при запуске · F5: обновить сейчас · перезапуск после звонка"
+        }
+        crate::app::ROW_CLIPBOARD => {
+            "Enter: папка снимков буфера · пусто = временная · удаляются при выходе"
         }
         crate::app::ROW_DOWNLOAD => "Enter: папка новых файлов · пусто = системная Downloads",
         crate::app::ROW_GAIN_IN => "←/→: усиление до шумодава и VOX · 100% = ×1, 200% = ×2",

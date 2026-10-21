@@ -7,7 +7,7 @@ default-run = "remember-me"
 [features]
 default = ["client"]
 client = [
-    "dep:getrandom", "dep:self-replace", "dep:image", "dep:arboard", "dep:base64-simd", "dep:ratatui", "dep:ratatui-image", "dep:crossterm", "dep:cpal", "dep:opusic-sys",
+    "dep:getrandom", "dep:self-replace", "dep:image", "dep:arboard", "dep:tempfile", "dep:base64-simd", "dep:ratatui", "dep:ratatui-image", "dep:crossterm", "dep:cpal", "dep:opusic-sys",
     "dep:chacha20poly1305", "dep:x25519-dalek", "dep:sha2",
     "dep:serde", "dep:toml", "dep:libc", "dep:nnnoiseless", "dep:unicode-width",
     "tokio/sync", "tokio/signal", "tokio/fs", "tokio/io-util",
@@ -35,6 +35,7 @@ name = "clipboard_fixture"
 required-features = ["client"]
 
 [dependencies]
+tempfile = { version = "3", optional = true }
 unicode-width = { version = "0.2.2", optional = true }
 arboard = { version = "3.7", features = ["wayland-data-control"], optional = true }
 base64-simd = { version = "0.8", optional = true }

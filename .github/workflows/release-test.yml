@@ -26,6 +26,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Check repository privacy
+        run: python scripts/audit_repository.py --history
       - name: Install Linux build dependencies
         if: matrix.os == 'linux'
         run: sudo apt-get update && sudo apt-get install -y libopus-dev libpulse-dev libasound2-dev pkg-config musl-tools

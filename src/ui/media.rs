@@ -77,7 +77,24 @@ pub fn render(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
             } else {
                 image
             };
-            ui.thumbnails.render_image(&frame.image, f, area);
+            let ready = ui.thumbnails.prepare_images(frames, area);
+            let prepared = ready == frames.len();
+            if prepared
+                && !viewer.prepared.replace(prepared)
+                && std::env::var("RM_DEBUG").ok().as_deref() == Some("1")
+            {
+                eprintln!("[media] ready {} frames={}", title, frames.len());
+            }
+            viewer.prepared.set(prepared);
+            if prepared {
+                ui.thumbnails.render_image(&frame.image, f, area);
+            } else {
+                f.render_widget(
+                    Paragraph::new(format!("Готовим изображение… {ready}/{}", frames.len()))
+                        .style(dim()),
+                    image,
+                );
+            }
             if frames.len() > 1 {
                 actions.push((
                     if viewer.paused {

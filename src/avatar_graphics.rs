@@ -44,6 +44,7 @@ impl Source {
 struct Entry {
     _source: Source,
     image: Option<Protocol>,
+    completed: bool,
     last_used: u64,
     kitty_id: Option<u32>,
     bytes: usize,
@@ -131,6 +132,7 @@ impl Thumbnails {
             while let Ok((key, image)) = worker.results.try_recv() {
                 if let Some(entry) = self.cache.get_mut(&key) {
                     entry.image = image;
+                    entry.completed = true;
                 }
             }
         }
@@ -233,6 +235,58 @@ impl Thumbnails {
             );
         }
     }
+    // Queue every frame before playback. Touching the whole set also keeps it
+    // resident while an animation is playing; no per-frame quality fallback.
+    pub fn prepare_images(&mut self, frames: &[crate::media::Frame], area: Rect) -> usize {
+        let Some(worker) = &self.worker else {
+            return frames.len();
+        };
+        let w = area.width.min(1024 / worker.font.width.max(1)).min(240);
+        let h = area.height.min(1024 / worker.font.height.max(1)).min(240);
+        if w == 0 || h == 0 {
+            return frames.len();
+        }
+        let mut ready = 0;
+        for frame in frames {
+            let source = Source::Image(frame.image.clone());
+            let key = (source.ptr(), w, h, 5);
+            self.request(key, source);
+            if let Some(entry) = self.cache.get_mut(&key) {
+                entry.last_used = self.frame;
+                ready += usize::from(entry.completed);
+            }
+        }
+        ready
+    }
+    fn request(&mut self, key: Key, source: Source) {
+        let Some(worker) = &self.worker else { return };
+        if !self.cache.contains_key(&key) && self.cache.len() < 80 {
+            self.next_id = self.next_id.wrapping_add(1).max(1);
+            if worker
+                .requests
+                .try_send((key, source.clone(), self.next_id))
+                .is_ok()
+            {
+                let retained = source.retained_bytes();
+                self.cache.insert(
+                    key,
+                    Entry {
+                        _source: source,
+                        image: None,
+                        completed: false,
+                        last_used: self.frame,
+                        kitty_id: worker.kitty.then_some(self.next_id),
+                        bytes: key.1 as usize
+                            * key.2 as usize
+                            * worker.font.width as usize
+                            * worker.font.height as usize
+                            * 6
+                            + retained,
+                    },
+                );
+            }
+        }
+    }
     fn native(
         &mut self,
         source: Source,
@@ -267,31 +321,7 @@ impl Thumbnails {
                 0
             };
         let key = (source.ptr(), area.width, area.height, flags);
-        if !self.cache.contains_key(&key) && self.cache.len() < 80 {
-            self.next_id = self.next_id.wrapping_add(1).max(1);
-            if worker
-                .requests
-                .try_send((key, source.clone(), self.next_id))
-                .is_ok()
-            {
-                let retained = source.retained_bytes();
-                self.cache.insert(
-                    key,
-                    Entry {
-                        _source: source,
-                        image: None,
-                        last_used: self.frame,
-                        kitty_id: worker.kitty.then_some(self.next_id),
-                        bytes: area.width as usize
-                            * area.height as usize
-                            * worker.font.width as usize
-                            * worker.font.height as usize
-                            * 6
-                            + retained,
-                    },
-                );
-            }
-        }
+        self.request(key, source);
         if let Some(entry) = self.cache.get_mut(&key) {
             entry.last_used = self.frame;
             if let Some(image) = &entry.image {
@@ -464,6 +494,57 @@ fn detect_picker() -> Option<Picker> {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn animation_prepares_every_native_frame_before_playback_and_reprepares_on_resize() {
+        let frames: Vec<_> = (0..32)
+            .map(|i| crate::media::Frame {
+                image: Arc::new(image::RgbaImage::from_pixel(
+                    64,
+                    64,
+                    image::Rgba([i, 30, 90, 255]),
+                )),
+                delay: std::time::Duration::from_millis(100),
+            })
+            .collect();
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let mut thumbs = Thumbnails::default();
+        thumbs.configure(picker);
+        let mut terminal = Terminal::new(TestBackend::new(24, 12)).unwrap();
+        for area in [Rect::new(0, 0, 16, 8), Rect::new(0, 0, 24, 12)] {
+            assert_eq!(thumbs.prepare_images(&frames, area), 0);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                thumbs.begin_frame();
+                if thumbs.prepare_images(&frames, area) == frames.len() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "animation never became ready"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            for frame in &frames {
+                terminal
+                    .draw(|f| thumbs.render_image(&frame.image, f, area))
+                    .unwrap();
+                assert!(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .content
+                        .iter()
+                        .any(|c| c.symbol().contains('\u{10eeee}')),
+                    "a preloaded GIF frame fell back to coarse blocks"
+                );
+            }
+        }
+        assert_eq!(
+            Thumbnails::default().prepare_images(&frames, Rect::new(0, 0, 16, 8)),
+            frames.len()
+        );
+    }
     fn prepared(
         thumbs: &mut Thumbnails,
         terminal: &mut Terminal<TestBackend>,
