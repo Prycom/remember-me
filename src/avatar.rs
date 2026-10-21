@@ -78,10 +78,22 @@ impl Avatar {
         limits.max_image_width = Some(4096);
         limits.max_image_height = Some(4096);
         limits.max_alloc = Some(96 * 1024 * 1024);
-        reader.limits(limits);
-        let image = reader
-            .decode()
+        reader.limits(limits.clone());
+        use image::ImageDecoder;
+        let mut decoder = reader
+            .into_decoder()
             .map_err(|e| format!("PNG/JPEG/WebP/GIF: {e}"))?;
+        let orientation = decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        // Match ImageReader::decode's allocation accounting before decoding.
+        limits
+            .reserve(decoder.total_bytes())
+            .map_err(|e| e.to_string())?;
+        decoder.set_limits(limits).map_err(|e| e.to_string())?;
+        let mut image = image::DynamicImage::from_decoder(decoder)
+            .map_err(|e| format!("PNG/JPEG/WebP/GIF: {e}"))?;
+        image.apply_orientation(orientation);
         let side = image.width().min(image.height());
         if side == 0 {
             return Err("пустая картинка".into());
@@ -385,6 +397,34 @@ mod tests {
         let saved = toml::to_string(&config).unwrap();
         let restored: crate::config::Config = toml::from_str(&saved).unwrap();
         assert_eq!(restored.avatar, Some(avatar));
+    }
+
+    #[test]
+    fn smartphone_jpeg_orientation_is_applied_before_cropping() {
+        let path =
+            std::env::temp_dir().join(format!("remember-me-avatar-{}.jpg", std::process::id()));
+        let image = image::RgbImage::from_fn(32, 32, |_, y| {
+            if y < 16 {
+                image::Rgb([0, 0, 240])
+            } else {
+                image::Rgb([240, 0, 0])
+            }
+        });
+        image.save(&path).unwrap();
+        let jpeg = std::fs::read(&path).unwrap();
+        let mut exif =
+            b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0".to_vec();
+        let mut oriented = vec![0xff, 0xd8, 0xff, 0xe1];
+        oriented.extend(((exif.len() + 2) as u16).to_be_bytes());
+        oriented.append(&mut exif);
+        oriented.extend_from_slice(&jpeg[2..]);
+        std::fs::write(&path, oriented).unwrap();
+        let avatar = Avatar::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let left = avatar.palette[avatar.pixels[16 * SIDE + 8] as usize];
+        let right = avatar.palette[avatar.pixels[16 * SIDE + 24] as usize];
+        assert!(left[0] > 190 && left[2] < 60, "{left:?}");
+        assert!(right[2] > 190 && right[0] < 60, "{right:?}");
     }
     #[test]
     fn pixel_and_ascii_renderers_fit_and_do_not_emit_control_characters() {
