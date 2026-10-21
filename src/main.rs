@@ -9,8 +9,10 @@
 //   remember-me --server [-p порт] — ретранслятор на сервере (headless)
 //   [-p порт] [-n имя]             — переопределения настроек
 
+mod action;
 mod app;
 mod audio;
+mod clipboard;
 mod config;
 mod net;
 mod noise_suppress;
@@ -22,10 +24,12 @@ use std::time::Duration;
 
 use argh::FromArgs;
 use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use tokio::sync::mpsc;
 
+use action::Action;
 use app::App;
 use audio::AudioEngine;
 use config::Config;
@@ -144,6 +148,7 @@ async fn run(
     }
 
     let mut term = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     // kitty-style расширенные события клавиш: нужны для держания-space (PTT);
     // на терминалах без поддержки тихо игнорируется
     let _ = crossterm::execute!(
@@ -156,6 +161,7 @@ async fn run(
         )
     );
 
+    let mut ui = crate::ui::Ui::default();
     let mut res: std::io::Result<()> = Ok(());
     loop {
         app.poll();
@@ -169,7 +175,15 @@ async fn run(
             }
             match crossterm::event::read() {
                 Ok(ev) => {
-                    app.on_event(ev);
+                    match ev {
+                        Event::Mouse(m) => {
+                            if let Some(a) = ui.mouse(m) {
+                                app.on_action(a);
+                            }
+                        }
+                        Event::Paste(text) => app.on_action(Action::Paste(text)),
+                        ev => app.on_event(ev),
+                    }
                     if app.quit {
                         break;
                     }
@@ -184,13 +198,18 @@ async fn run(
             break;
         }
 
-        res = term.draw(|f| ui::render(&app, f)).map(|_| ());
+        res = term.draw(|f| ui::render(&app, f, &mut ui)).map(|_| ());
         if res.is_err() {
             break;
         }
     }
 
     let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     app.stop_session();
     if let Err(e) = res {

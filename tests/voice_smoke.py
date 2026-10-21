@@ -360,7 +360,7 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
                                      True, "fading phrase, silence, new quiet phrase", allow_pauses=True))
         # Exercise the actual crossterm parser with Kitty shifted characters
         # and Alacritty-style repeat events, rather than only typed Rust keys.
-        host.key("t")
+        host.key("i")
         host.key("\x1b[97:65;2u\x1b[59:58;2u\x1b[1078:1046;2u123")
         host.key("\x1b[127;1:2u" * 3)
         host.key("\r")
@@ -371,8 +371,10 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
         assert "@rm2\t0\ta\tA:Ж" in peer_history.read_text()
         print("  actual terminal Shift/punctuation/Unicode/repeating Backspace + named history: PASS", flush=True)
 
-        host.key("tDraft:")
-        host.key("\x1bOQ")  # F2, even while composing a message
+        host.key("iDraft:")
+        host.key("\x1b")  # leave the message field, draft survives
+        time.sleep(0.1)
+        host.key("s")     # settings on S, like everywhere else
         time.sleep(0.2)
         host.key("\x1b[B" * 5 + "\x1b[D")  # VOX threshold 25 -> 20
         time.sleep(0.2)
@@ -385,7 +387,7 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
         measure(root, names["mic_a"], names["out_b"], short, True, "light voice filter enabled live")
         host.key("\x1b")
         time.sleep(0.2)
-        host.key("\r")
+        host.key("i\r")
         time.sleep(0.3)
         assert "@rm2\t1\ta\tDraft:" in own_history.read_text(), "settings discarded the chat draft"
         assert "@rm2\t0\ta\tDraft:" in peer_history.read_text(), "settings disconnected the session"
@@ -393,7 +395,7 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
         noisy_speech(noisy)
         before = noise_metrics(measure(root, names["mic_a"], names["out_b"], noisy,
                                        None, "speech + background/keys, suppression OFF", allow_pauses=True))
-        host.key("\x1bOQ")  # settings selection was left on the light filter
+        host.key("s")  # settings selection was left on the light filter
         time.sleep(0.2)
         host.key("\x1b[B\r")
         time.sleep(0.2)

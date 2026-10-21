@@ -1,0 +1,546 @@
+// Клавиши → действия. Раскладка нормализуется по физическим позициям:
+// русская буква работает как латинская на той же клавише.
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use crate::action::{Action, Focus, Pane};
+use crate::app::{App, Screen};
+
+pub fn action_for(k: &KeyEvent, app: &App) -> Option<Action> {
+    let vox = app.engine.params.vox_mode();
+    if k.kind == KeyEventKind::Release {
+        return if k.code == KeyCode::Char(' ')
+            && app.screen == Screen::Call
+            && matches!(app.focus, Focus::Pane(_))
+            && !vox
+        {
+            Some(Action::Ptt(false))
+        } else {
+            None
+        };
+    }
+
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        return Some(Action::Quit);
+    }
+    if app.overlay.is_some() {
+        return match k.code {
+            KeyCode::Esc | KeyCode::Char('?') => Some(Action::Cancel),
+            KeyCode::Enter
+            | KeyCode::Char('y')
+            | KeyCode::Char('Y')
+            | KeyCode::Char('н')
+            | KeyCode::Char('Н')
+                if k.kind != KeyEventKind::Repeat =>
+            {
+                Some(Action::Confirm)
+            }
+            _ => None,
+        };
+    }
+
+    if app.edit.is_some() {
+        return match k.code {
+            KeyCode::Backspace => Some(Action::Backspace),
+            KeyCode::Enter | KeyCode::Esc if k.kind != KeyEventKind::Repeat => {
+                Some(Action::Confirm)
+            }
+            KeyCode::Char(c) if plain(k.modifiers) => Some(Action::Insert(typed(c, k.modifiers))),
+            _ => None,
+        };
+    }
+
+    if app.dev_pick.is_some() {
+        return match k.code {
+            KeyCode::Up => Some(Action::Up),
+            KeyCode::Down => Some(Action::Down),
+            KeyCode::Enter => Some(Action::Confirm),
+            KeyCode::Esc => Some(Action::Cancel),
+            _ => None,
+        };
+    }
+
+    if app.focus == Focus::Input
+        && matches!(
+            app.screen,
+            Screen::Call | Screen::Connect | Screen::Settings
+        )
+    {
+        let repeating = k.kind == KeyEventKind::Repeat;
+        return match k.code {
+            KeyCode::Backspace => Some(Action::Backspace),
+            KeyCode::Enter if !repeating => Some(Action::Confirm),
+            KeyCode::Esc if !repeating => Some(Action::Cancel),
+            KeyCode::Char(c) if plain(k.modifiers) => Some(Action::Insert(typed(c, k.modifiers))),
+            _ => None,
+        };
+    }
+
+    // PTT слушает и повтор, пока клавиша удерживается.
+    if k.code == KeyCode::Char(' ') && app.screen == Screen::Call && !vox && plain(k.modifiers) {
+        return Some(Action::Ptt(true));
+    }
+    if k.kind == KeyEventKind::Repeat {
+        // повтор разрешён только тексту и навигации настроек, как и раньше
+        let text = matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace);
+        let settings_nav = app.screen == Screen::Settings
+            && app.edit.is_none()
+            && matches!(
+                k.code,
+                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+            );
+        if !(text || settings_nav) {
+            return None;
+        }
+    }
+    if !plain(k.modifiers) {
+        return None;
+    }
+
+    if let KeyCode::Char(c) = k.code {
+        if latin(c) == '?' {
+            return Some(Action::Help);
+        }
+    }
+
+    screen_command(k, app)
+}
+
+fn screen_command(k: &KeyEvent, app: &App) -> Option<Action> {
+    match app.screen {
+        Screen::Home => match k.code {
+            KeyCode::Up => Some(Action::Up),
+            KeyCode::Down => Some(Action::Down),
+            KeyCode::Enter => Some(Action::Confirm),
+            KeyCode::Char(c) => Some(match latin(c).to_ascii_lowercase() {
+                'k' => Action::Up,
+                'j' => Action::Down,
+                'h' => Action::Host,
+                'c' => Action::Connect,
+                's' => Action::OpenSettings,
+                'q' => Action::Quit,
+                _ => return None,
+            }),
+            _ => None,
+        },
+        Screen::Connect => match k.code {
+            KeyCode::Enter => Some(Action::Confirm),
+            KeyCode::Esc => Some(Action::Cancel),
+            _ => None,
+        },
+        Screen::HostWait => match k.code {
+            KeyCode::Esc => Some(Action::Cancel),
+            KeyCode::Up => Some(Action::Up),
+            KeyCode::Down => Some(Action::Down),
+            KeyCode::Enter => Some(Action::Confirm),
+            KeyCode::Char(c) => match latin(c).to_ascii_lowercase() {
+                'q' => Some(Action::Cancel),
+                's' => Some(Action::OpenSettings),
+                'y' => Some(Action::Confirm),
+                _ => None,
+            },
+            _ => None,
+        },
+        Screen::Incoming => match k.code {
+            KeyCode::Enter => Some(Action::Accept),
+            KeyCode::Esc => Some(Action::Decline),
+            KeyCode::Char(c) if latin(c).to_ascii_lowercase() == 's' => Some(Action::OpenSettings),
+            _ => None,
+        },
+        Screen::Call => match k.code {
+            KeyCode::Up => Some(if app.focus == Focus::Pane(Pane::Side) {
+                Action::Up
+            } else {
+                Action::GainPeer(5)
+            }),
+            KeyCode::Down => Some(if app.focus == Focus::Pane(Pane::Side) {
+                Action::Down
+            } else {
+                Action::GainPeer(-5)
+            }),
+            KeyCode::PageUp => Some(Action::PageUp),
+            KeyCode::PageDown => Some(Action::PageDown),
+            KeyCode::Tab => Some(Action::NextPane),
+            KeyCode::Esc => Some(Action::Cancel),
+            KeyCode::Char(c) => {
+                let code = latin(c);
+                let lower = code.to_ascii_lowercase();
+                Some(match code {
+                    'O' => Action::DeviceCycle { input: false },
+                    'I' => Action::DeviceCycle { input: true },
+                    _ => match lower {
+                        'm' => Action::ToggleMute,
+                        'd' => Action::ToggleDeaf,
+                        's' => Action::OpenSettings,
+                        'i' => Action::FocusInput,
+                        'a' => Action::ToggleAutoGain,
+                        'u' => Action::HangUp,
+                        '[' => Action::GainMic(-5),
+                        ']' => Action::GainMic(5),
+                        // RU-клавиша «м» тоже глушит микрофон: привычная подпись M.
+                        _ if c == 'м' || c == 'М' => Action::ToggleMute,
+                        _ => return None,
+                    },
+                })
+            }
+            _ => None,
+        },
+        Screen::Settings => match k.code {
+            KeyCode::Up => Some(Action::Up),
+            KeyCode::Down => Some(Action::Down),
+            KeyCode::Left => Some(Action::Left),
+            KeyCode::Right => Some(Action::Right),
+            KeyCode::Enter | KeyCode::Char(' ') => Some(Action::Confirm),
+            KeyCode::Esc => Some(Action::Cancel),
+            KeyCode::Char(c) if latin(c).to_ascii_lowercase() == 'l' => Some(Action::ToggleEcho),
+            _ => None,
+        },
+    }
+}
+
+fn plain(modifiers: KeyModifiers) -> bool {
+    !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
+fn typed(c: char, modifiers: KeyModifiers) -> char {
+    if modifiers.contains(KeyModifiers::SHIFT) && c.is_lowercase() {
+        c.to_uppercase().next().unwrap_or(c)
+    } else {
+        c
+    }
+}
+
+/// Русская буква → латинская на той же физической клавише.
+fn latin(c: char) -> char {
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    let mapped = match lower {
+        'й' => 'q',
+        'ц' => 'w',
+        'у' => 'e',
+        'к' => 'r',
+        'е' => 't',
+        'н' => 'y',
+        'г' => 'u',
+        'ш' => 'i',
+        'щ' => 'o',
+        'з' => 'p',
+        'х' => '[',
+        'ъ' => ']',
+        'ф' => 'a',
+        'ы' => 's',
+        'в' => 'd',
+        'а' => 'f',
+        'п' => 'g',
+        'р' => 'h',
+        'о' => 'j',
+        'л' => 'k',
+        'д' => 'l',
+        'ж' => ';',
+        'э' => '\'',
+        'я' => 'z',
+        'ч' => 'x',
+        'с' => 'c',
+        'м' => 'v',
+        'и' => 'b',
+        'т' => 'n',
+        'ь' => 'm',
+        'б' => ',',
+        'ю' => '.',
+        _ => lower,
+    };
+    if c.is_uppercase() {
+        mapped.to_ascii_uppercase()
+    } else {
+        mapped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{ROW_ECHO, ROW_NAME};
+    use crate::config::Config;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    fn app() -> App {
+        App::for_test(Config::default())
+    }
+
+    fn call() -> App {
+        let mut app = app();
+        app.screen = Screen::Call;
+        app
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn key_mod(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn release(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Release)
+    }
+
+    #[test]
+    fn held_enter_does_not_repeat_confirm_or_cancel() {
+        let mut app = call();
+        app.focus = Focus::Input;
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert_eq!(
+            action_for(&key(KeyCode::Enter), &app),
+            Some(Action::Confirm)
+        );
+        assert_eq!(action_for(&repeat, &app), None);
+        app.screen = Screen::Connect;
+        assert_eq!(action_for(&repeat, &app), None);
+        app.overlay = Some(crate::action::Overlay::HangUp);
+        assert_eq!(action_for(&repeat, &app), None);
+    }
+
+    #[test]
+    fn ru_layout_maps_to_physical_keys() {
+        let mut app = call();
+        app.focus = Focus::Pane(Pane::Main);
+        assert_eq!(
+            action_for(&key(KeyCode::Char('м')), &app),
+            Some(Action::ToggleMute)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('ь')), &app),
+            Some(Action::ToggleMute)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('в')), &app),
+            Some(Action::ToggleDeaf)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('ы')), &app),
+            Some(Action::OpenSettings)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('ш')), &app),
+            Some(Action::FocusInput)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('ф')), &app),
+            Some(Action::ToggleAutoGain)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('г')), &app),
+            Some(Action::HangUp)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('х')), &app),
+            Some(Action::GainMic(-5))
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('ъ')), &app),
+            Some(Action::GainMic(5))
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('Щ')), &app),
+            Some(Action::DeviceCycle { input: false })
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('Ш')), &app),
+            Some(Action::DeviceCycle { input: true })
+        );
+        assert_eq!(action_for(&key(KeyCode::Char('щ')), &app), None);
+    }
+
+    #[test]
+    fn question_mark_opens_help() {
+        let app = call();
+        assert_eq!(
+            action_for(&key(KeyCode::Char('?')), &app),
+            Some(Action::Help)
+        );
+    }
+
+    #[test]
+    fn ptt_holds_in_ptt_mode_and_ignores_vox() {
+        let mut app = call();
+        app.focus = Focus::Pane(Pane::Main);
+        app.engine.params.set_vox_mode(false);
+        let press = key(KeyCode::Char(' '));
+        assert_eq!(action_for(&press, &app), Some(Action::Ptt(true)));
+        assert_eq!(
+            action_for(&release(KeyCode::Char(' ')), &app),
+            Some(Action::Ptt(false))
+        );
+
+        app.engine.params.set_vox_mode(true);
+        assert_eq!(action_for(&press, &app), None);
+        assert_eq!(action_for(&release(KeyCode::Char(' ')), &app), None);
+    }
+
+    #[test]
+    fn shift_uppercases_typed_text_and_esc_blurs_input() {
+        let mut app = call();
+        app.focus = Focus::Input;
+        assert_eq!(
+            action_for(&key_mod(KeyCode::Char('a'), KeyModifiers::SHIFT), &app),
+            Some(Action::Insert('A'))
+        );
+        assert_eq!(
+            action_for(&key_mod(KeyCode::Char('ж'), KeyModifiers::SHIFT), &app),
+            Some(Action::Insert('Ж'))
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char(':')), &app),
+            Some(Action::Insert(':'))
+        );
+        assert_eq!(action_for(&key(KeyCode::Esc), &app), Some(Action::Cancel));
+        app.on_action(Action::Cancel);
+        assert_eq!(app.focus, Focus::Pane(Pane::Main));
+    }
+
+    #[test]
+    fn call_navigation_depends_on_focus() {
+        let mut app = call();
+        app.focus = Focus::Pane(Pane::Side);
+        assert_eq!(action_for(&key(KeyCode::Up), &app), Some(Action::Up));
+        assert_eq!(action_for(&key(KeyCode::Down), &app), Some(Action::Down));
+        app.focus = Focus::Pane(Pane::Main);
+        assert_eq!(
+            action_for(&key(KeyCode::Up), &app),
+            Some(Action::GainPeer(5))
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Down), &app),
+            Some(Action::GainPeer(-5))
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::PageUp), &app),
+            Some(Action::PageUp)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::PageDown), &app),
+            Some(Action::PageDown)
+        );
+        assert_eq!(action_for(&key(KeyCode::Tab), &app), Some(Action::NextPane));
+        assert_eq!(action_for(&key(KeyCode::Esc), &app), Some(Action::Cancel));
+    }
+
+    #[test]
+    fn other_screens_map_their_keys() {
+        let mut app = app();
+        assert_eq!(
+            action_for(&key(KeyCode::Char('h')), &app),
+            Some(Action::Host)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('с')), &app),
+            Some(Action::Connect)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('ы')), &app),
+            Some(Action::OpenSettings)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('й')), &app),
+            Some(Action::Quit)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('о')), &app),
+            Some(Action::Down)
+        );
+        assert_eq!(action_for(&key(KeyCode::Char('л')), &app), Some(Action::Up));
+
+        app.screen = Screen::Connect;
+        assert_eq!(
+            action_for(&key(KeyCode::Enter), &app),
+            Some(Action::Confirm)
+        );
+        assert_eq!(action_for(&key(KeyCode::Esc), &app), Some(Action::Cancel));
+
+        app.screen = Screen::HostWait;
+        assert_eq!(
+            action_for(&key(KeyCode::Char('q')), &app),
+            Some(Action::Cancel)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('s')), &app),
+            Some(Action::OpenSettings)
+        );
+
+        app.screen = Screen::Incoming;
+        assert_eq!(action_for(&key(KeyCode::Enter), &app), Some(Action::Accept));
+        assert_eq!(action_for(&key(KeyCode::Esc), &app), Some(Action::Decline));
+        assert_eq!(
+            action_for(&key(KeyCode::Char('s')), &app),
+            Some(Action::OpenSettings)
+        );
+    }
+
+    #[test]
+    fn settings_and_edit_keys() {
+        let mut app = app();
+        app.screen = Screen::Settings;
+        app.settings_sel = ROW_ECHO;
+        assert_eq!(
+            action_for(&key(KeyCode::Char('l')), &app),
+            Some(Action::ToggleEcho)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('д')), &app),
+            Some(Action::ToggleEcho)
+        );
+        assert_eq!(action_for(&key(KeyCode::Left), &app), Some(Action::Left));
+        assert_eq!(action_for(&key(KeyCode::Right), &app), Some(Action::Right));
+        assert_eq!(
+            action_for(&key(KeyCode::Char(' ')), &app),
+            Some(Action::Confirm)
+        );
+        assert_eq!(action_for(&key(KeyCode::Tab), &app), None);
+        assert_eq!(action_for(&key(KeyCode::Esc), &app), Some(Action::Cancel));
+
+        app.settings_sel = ROW_NAME;
+        app.edit = Some((ROW_NAME, String::new()));
+        assert_eq!(
+            action_for(
+                &KeyEvent::new_with_kind(
+                    KeyCode::Backspace,
+                    KeyModifiers::NONE,
+                    KeyEventKind::Repeat
+                ),
+                &app
+            ),
+            Some(Action::Backspace)
+        );
+        assert_eq!(
+            action_for(&key_mod(KeyCode::Char('a'), KeyModifiers::SHIFT), &app),
+            Some(Action::Insert('A'))
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Enter), &app),
+            Some(Action::Confirm)
+        );
+        app.edit = None;
+        assert_eq!(action_for(&key(KeyCode::Char('m')), &app), None);
+    }
+
+    #[test]
+    fn overlay_takes_keys() {
+        let mut app = call();
+        app.overlay = Some(crate::action::Overlay::Help);
+        assert_eq!(action_for(&key(KeyCode::Char('m')), &app), None);
+        assert_eq!(action_for(&key(KeyCode::Esc), &app), Some(Action::Cancel));
+        assert_eq!(
+            action_for(&key(KeyCode::Enter), &app),
+            Some(Action::Confirm)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('?')), &app),
+            Some(Action::Cancel)
+        );
+        assert_eq!(action_for(&key(KeyCode::F(1)), &app), None);
+        assert_eq!(action_for(&key(KeyCode::F(2)), &app), None);
+    }
+}
