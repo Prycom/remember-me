@@ -219,6 +219,48 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
     #[test]
+    fn a_modal_cannot_consume_an_images_first_transmission() {
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let mut ui = crate::ui::Ui::default();
+        ui.thumbnails.configure(picker);
+        let mut app = crate::app::App::for_test(crate::config::Config::default());
+        app.screen = crate::app::Screen::Call;
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        // Queue graphics, then open a modal before background encoding finishes.
+        terminal
+            .draw(|f| crate::ui::render(&app, f, &mut ui))
+            .unwrap();
+        for _ in 0..2 {
+            let (key, image) = ui
+                .thumbnails
+                .worker
+                .as_ref()
+                .unwrap()
+                .results
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            ui.thumbnails.cache.get_mut(&key).unwrap().image = image;
+        }
+        app.overlay = Some(crate::action::Overlay::Profile);
+        terminal
+            .draw(|f| crate::ui::render(&app, f, &mut ui))
+            .unwrap();
+        app.overlay = None;
+        terminal
+            .draw(|f| crate::ui::render(&app, f, &mut ui))
+            .unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|c| c.symbol().contains("a=T,U=1")),
+            "closing the profile lost the image's only transmission"
+        );
+    }
+    #[test]
     fn native_thumbnails_keep_more_detail_inside_the_same_small_rectangle() {
         let mut picker = Picker::halfblocks();
         picker.set_protocol_type(ProtocolType::Kitty);

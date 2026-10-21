@@ -143,12 +143,21 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
             Paragraph::new((0..height).map(|_| "▎").collect::<Vec<_>>().join("\n")).style(marker),
             Rect::new(row.x, row.y, 1, row.height),
         );
-        ui.thumbnails.render(
-            card.avatar,
-            app.cfg.avatar_style,
-            f,
-            Rect::new(row.x + 1, row.y, thumbnail, row.height),
-        );
+        let image = Rect::new(row.x + 1, row.y, thumbnail, row.height);
+        if app.overlay.is_none() && app.file_input.is_none() {
+            ui.thumbnails
+                .render(card.avatar, app.cfg.avatar_style, f, image);
+        } else {
+            // A modal may overwrite the transmit cell before the frame reaches
+            // the terminal. Keep native images unrendered until they are visible.
+            f.render_widget(
+                crate::avatar::Portrait {
+                    avatar: card.avatar,
+                    mode: app.cfg.avatar_style,
+                },
+                image,
+            );
+        }
         ui.push(
             Rect::new(row.x + 1, row.y, thumbnail, row.height),
             Action::ShowProfile(index),
