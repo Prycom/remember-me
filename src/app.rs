@@ -50,6 +50,7 @@ pub struct PeerInfo {
     /// уровень входа собеседника (из Status), 0..100%
     pub level: u8,
     pub status_known: bool,
+    pub avatar: Arc<crate::avatar::Avatar>,
 }
 
 /// status для своих сообщений: 0 напоследок, 1 доставлено, 2 не доставлено
@@ -85,13 +86,18 @@ pub const ROW_FILTER: usize = 12;
 pub const ROW_DENOISE: usize = 13;
 pub const ROW_DOWNLOAD: usize = 14;
 pub const ROW_AUTO_UPDATE: usize = 15;
-pub const SETTINGS_ROWS: usize = 16;
+pub const ROW_AVATAR: usize = 16;
+pub const ROW_AVATAR_STYLE: usize = 17;
+pub const ROW_AVATAR_CLEAR: usize = 18;
+pub const SETTINGS_ROWS: usize = 19;
 
 const PENDING_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DIAL_MAX_TXT: &str = "60";
 
 pub struct App {
     pub cfg: Config,
+    pub avatar: Arc<crate::avatar::Avatar>,
+    avatar_load: Option<std::sync::mpsc::Receiver<Result<(crate::avatar::Avatar, String), String>>>,
     pub engine: Arc<AudioEngine>,
     pub devices: DeviceList,
     pub mode: Option<Mode>,
@@ -164,8 +170,11 @@ impl App {
     }
 
     fn with_devices(cfg: Config, engine: Arc<AudioEngine>, devices: DeviceList) -> App {
+        let avatar = crate::avatar::display(cfg.avatar.as_ref(), &cfg.name);
         App {
             cfg,
+            avatar,
+            avatar_load: None,
             engine,
             devices,
             mode: None,
@@ -211,6 +220,20 @@ impl App {
     // ── главный тик: события сети + перекачка аудио ─────────────────────────
 
     pub fn poll(&mut self) {
+        if let Some(rx) = &self.avatar_load
+            && let Ok(result) = rx.try_recv()
+        {
+            self.avatar_load = None;
+            match result {
+                Ok((avatar, path)) => {
+                    self.cfg.avatar = Some(avatar);
+                    self.cfg.avatar_file = path;
+                    self.apply_avatar();
+                    self.set_toast("аватарка готова · обновлена для участников звонка".into());
+                }
+                Err(error) => self.set_toast(error),
+            }
+        }
         if let Some((manual, rx)) = &self.update_result
             && let Ok(result) = rx.try_recv()
         {
@@ -477,7 +500,10 @@ impl App {
                 self.chat_layout.get_mut().take();
                 self.chat = load_chat_log(&self.peer_file.clone().unwrap(), &self.cfg.name);
                 self.chat_scroll = 0;
+                let avatar = crate::avatar::display(None, &peer_name);
+                self.call_sel = 1;
                 self.peer = Some(PeerInfo {
+                    avatar,
                     name: peer_name,
                     addr: peer_addr,
                     rtt: None,
@@ -526,6 +552,12 @@ impl App {
                         }
                     }
                 }
+                if self.group_peers.is_empty()
+                    && !peers.is_empty()
+                    && self.focus != Focus::Pane(Pane::Side)
+                {
+                    self.call_sel = 1;
+                }
                 if self.group_peers.len() != peers.len() {
                     self.push_log(format!("участников в комнате: {}", peers.len() + 1));
                 }
@@ -550,6 +582,12 @@ impl App {
                     p.deaf = deaf;
                     p.level = lvl.min(100);
                     p.status_known = true;
+                }
+            }
+            NetEvent::PeerAvatar(avatar) => {
+                if let Some(peer) = &mut self.peer {
+                    peer.avatar =
+                        avatar.unwrap_or_else(|| crate::avatar::display(None, &peer.name));
                 }
             }
             NetEvent::PeerSpeaking(v) => {
@@ -870,6 +908,31 @@ impl App {
             self.copy_text(text);
             return;
         }
+        if self.overlay == Some(Overlay::Profile) {
+            match a {
+                Action::EditAvatar if self.call_sel == 0 => {
+                    self.overlay = None;
+                    self.open_settings();
+                    self.settings_sel = ROW_AVATAR;
+                    self.settings_toggle();
+                    return;
+                }
+                Action::CycleAvatars => {
+                    self.cycle_avatars();
+                    return;
+                }
+                Action::Left => {
+                    self.call_sel = self.call_sel.saturating_sub(1);
+                    return;
+                }
+                Action::Right => {
+                    self.call_sel =
+                        (self.call_sel + 1).min(self.participant_count().saturating_sub(1));
+                    return;
+                }
+                _ => {}
+            }
+        }
         if let Some(overlay) = self.overlay {
             match a {
                 Action::Cancel | Action::Help => self.overlay = None,
@@ -884,6 +947,23 @@ impl App {
             return;
         }
         match a {
+            Action::ShowProfile(index) => {
+                if index > 0 && self.peer.is_none() && self.group_room.is_none() {
+                    self.set_toast("собеседник ещё не подключён".into());
+                    return;
+                }
+                self.call_sel = index.min(self.participant_count().saturating_sub(1));
+                self.focus = Focus::Pane(Pane::Side);
+                self.engine.params.set_ptt_active(false);
+                self.overlay = Some(Overlay::Profile);
+                return;
+            }
+            Action::EditAvatar => {
+                self.open_settings();
+                self.settings_sel = ROW_AVATAR;
+                self.settings_toggle();
+                return;
+            }
             Action::Update => {
                 self.start_update(true);
                 return;
@@ -1226,14 +1306,24 @@ impl App {
                 }
                 Action::Insert(c) => {
                     if let Some((row, buf)) = self.edit.as_mut()
-                        && buf.len() + c.len_utf8() <= if *row == ROW_DOWNLOAD { 4096 } else { 64 }
+                        && buf.len() + c.len_utf8()
+                            <= if matches!(*row, ROW_DOWNLOAD | ROW_AVATAR) {
+                                4096
+                            } else {
+                                64
+                            }
                     {
                         buf.push(c);
                     }
                 }
                 Action::Paste(s) => {
                     if let Some((row, buf)) = self.edit.as_mut()
-                        && buf.len() + s.len() <= if *row == ROW_DOWNLOAD { 4096 } else { 64 }
+                        && buf.len() + s.len()
+                            <= if matches!(*row, ROW_DOWNLOAD | ROW_AVATAR) {
+                                4096
+                            } else {
+                                64
+                            }
                     {
                         buf.push_str(&s);
                     }
@@ -1305,6 +1395,7 @@ impl App {
             ROW_NAME => {
                 if !buf.is_empty() {
                     self.cfg.name = buf;
+                    self.avatar = crate::avatar::display(self.cfg.avatar.as_ref(), &self.cfg.name);
                 }
             }
             ROW_PORT => {
@@ -1313,6 +1404,10 @@ impl App {
                 {
                     self.cfg.port = p;
                 }
+            }
+            ROW_AVATAR => {
+                self.load_avatar(&buf);
+                return;
             }
             ROW_SERVER => self.cfg.server_addr = buf,
             ROW_DOWNLOAD => {
@@ -1359,11 +1454,12 @@ impl App {
 
     fn settings_toggle(&mut self) {
         match self.settings_sel {
-            ROW_NAME | ROW_PORT | ROW_SERVER | ROW_DOWNLOAD => {
+            ROW_NAME | ROW_PORT | ROW_SERVER | ROW_DOWNLOAD | ROW_AVATAR => {
                 let val = match self.settings_sel {
                     ROW_NAME => self.cfg.name.clone(),
                     ROW_PORT => self.cfg.port.to_string(),
                     ROW_DOWNLOAD => self.cfg.download_directory().display().to_string(),
+                    ROW_AVATAR => self.cfg.avatar_file.clone(),
                     _ => self.cfg.server_addr.clone(),
                 };
                 self.edit = Some((self.settings_sel, val));
@@ -1404,6 +1500,10 @@ impl App {
                     .set_noise_suppression(!self.engine.params.noise_suppression());
                 self.cfg_save_state();
             }
+            ROW_AVATAR_STYLE => self.cycle_avatars(),
+            ROW_AVATAR_CLEAR => {
+                self.load_avatar("");
+            }
             ROW_AUTO_UPDATE => {
                 self.cfg.auto_update = !self.cfg.auto_update;
                 self.cfg.save();
@@ -1418,6 +1518,43 @@ impl App {
         }
     }
 
+    fn cycle_avatars(&mut self) {
+        self.cfg.avatar_style = if self.cfg.avatar_style == crate::avatar::AvatarStyle::Pixel {
+            crate::avatar::AvatarStyle::Ascii
+        } else {
+            crate::avatar::AvatarStyle::Pixel
+        };
+        self.cfg.save();
+    }
+    fn load_avatar(&mut self, path: &str) {
+        if path.trim().is_empty() {
+            self.cfg.avatar = None;
+            self.cfg.avatar_file.clear();
+            self.avatar_load = None;
+            self.apply_avatar();
+            return;
+        }
+        if self.avatar_load.is_some() {
+            self.set_toast("аватарка ещё обрабатывается".into());
+            return;
+        }
+        self.engine.params.set_ptt_active(false);
+        let path = crate::config::expand_path(path);
+        let source = path.display().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.avatar_load = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::avatar::Avatar::load(&path).map(|avatar| (avatar, source)));
+        });
+        self.set_toast("готовим аватарку… голос продолжает работать".into());
+    }
+    fn apply_avatar(&mut self) {
+        self.avatar = crate::avatar::display(self.cfg.avatar.as_ref(), &self.cfg.name);
+        if let Some(session) = &self.session {
+            session.send(NetCmd::Avatar(self.cfg.avatar.clone().map(Arc::new)));
+        }
+        self.cfg.save();
+    }
     pub fn toggle_echo(&mut self) {
         if self.session.is_some() {
             self.set_toast("Эхо-тест доступен после завершения сессии".into());

@@ -1,0 +1,436 @@
+//! Bounded, indexed portraits. Image decoding/quantization happens once on a
+//! background thread; peers receive pixels, never an image decoder workload.
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Style},
+    widgets::Widget,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+pub const SIDE: usize = 32;
+pub const COLORS: usize = 32;
+pub const WIRE_BYTES: usize = COLORS * 3 + SIDE * SIDE;
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Avatar {
+    palette: Vec<[u8; 3]>,
+    pixels: Vec<u8>,
+}
+impl std::fmt::Debug for Avatar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Avatar(32×32)")
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AvatarStyle {
+    #[default]
+    Pixel,
+    Ascii,
+}
+
+impl Avatar {
+    pub fn valid(&self) -> bool {
+        self.palette.len() == COLORS
+            && self.pixels.len() == SIDE * SIDE
+            && self.pixels.iter().all(|p| (*p as usize) < COLORS)
+    }
+    pub fn encode(&self) -> Vec<u8> {
+        self.palette
+            .iter()
+            .flatten()
+            .copied()
+            .chain(self.pixels.iter().copied())
+            .collect()
+    }
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != WIRE_BYTES {
+            return None;
+        }
+        let value = Self {
+            palette: bytes[..COLORS * 3]
+                .chunks_exact(3)
+                .map(|p| [p[0], p[1], p[2]])
+                .collect(),
+            pixels: bytes[COLORS * 3..].to_vec(),
+        };
+        value.valid().then_some(value)
+    }
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let metadata = std::fs::metadata(path).map_err(|e| format!("картинка: {e}"))?;
+        if !metadata.is_file() {
+            return Err("нужен обычный файл PNG/JPEG/WebP/GIF".into());
+        }
+        if metadata.len() > 16 * 1024 * 1024 {
+            return Err("картинка больше 16 МиБ".into());
+        }
+        let mut reader = image::ImageReader::open(path)
+            .map_err(|e| format!("картинка: {e}"))?
+            .with_guessed_format()
+            .map_err(|e| e.to_string())?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(4096);
+        limits.max_image_height = Some(4096);
+        limits.max_alloc = Some(96 * 1024 * 1024);
+        reader.limits(limits);
+        let image = reader
+            .decode()
+            .map_err(|e| format!("PNG/JPEG/WebP/GIF: {e}"))?;
+        let side = image.width().min(image.height());
+        if side == 0 {
+            return Err("пустая картинка".into());
+        }
+        // Crop first: an extremely wide image must not create a huge resize intermediate.
+        let square = image
+            .crop_imm(
+                (image.width() - side) / 2,
+                (image.height() - side) / 2,
+                side,
+                side,
+            )
+            .resize_exact(
+                SIDE as u32,
+                SIDE as u32,
+                image::imageops::FilterType::Lanczos3,
+            )
+            .into_rgba8();
+        Ok(Self::quantize(square.as_raw()))
+    }
+    fn quantize(rgba: &[u8]) -> Self {
+        let colors = rgba
+            .chunks_exact(4)
+            .map(|p| {
+                if p[3] < 24 {
+                    None
+                } else {
+                    Some(std::array::from_fn(|c| {
+                        ((p[c] as u32 * p[3] as u32 + [18, 22, 29][c] * (255 - p[3] as u32)) / 255)
+                            as u8
+                    }))
+                }
+            })
+            .collect::<Vec<_>>();
+        let opaque = colors.iter().flatten().copied().collect::<Vec<_>>();
+        let mut centers = vec![[0; 3]; COLORS];
+        if let Some(first) = opaque.first() {
+            centers[1] = *first;
+            let mut distance = vec![u32::MAX; opaque.len()];
+            for index in 2..COLORS {
+                for (pixel, best) in opaque.iter().zip(&mut distance) {
+                    *best = (*best).min(dist(*pixel, centers[index - 1]));
+                }
+                let next = distance
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, d)| *d)
+                    .unwrap()
+                    .0;
+                centers[index] = opaque[next];
+            }
+            for _ in 0..10 {
+                let mut sums = [[0u32; 3]; COLORS];
+                let mut count = [0u32; COLORS];
+                for pixel in &opaque {
+                    let i = nearest(*pixel, &centers);
+                    count[i] += 1;
+                    for c in 0..3 {
+                        sums[i][c] += pixel[c] as u32;
+                    }
+                }
+                for i in 1..COLORS {
+                    if count[i] > 0 {
+                        centers[i] = sums[i].map(|s| (s / count[i]) as u8);
+                    }
+                }
+            }
+        }
+        let pixels = colors
+            .into_iter()
+            .map(|p| p.map_or(0, |p| nearest(p, &centers) as u8))
+            .collect();
+        Self {
+            palette: centers,
+            pixels,
+        }
+    }
+    pub fn identicon(name: &str) -> Self {
+        let hash = Sha256::digest(name.as_bytes());
+        let mut palette = vec![[0; 3]; COLORS];
+        palette[1] = [20, 28, 40];
+        palette[2] = [85 + hash[0] / 2, 115 + hash[1] / 2, 140 + hash[2] / 3];
+        palette[3] = [120 + hash[2] / 2, 155 + hash[3] / 3, 170 + hash[4] / 3];
+        let mut pixels = vec![1; SIDE * SIDE];
+        for y in 0..5 {
+            for x in 0..5 {
+                let bit = y * 3 + x.min(4 - x);
+                if hash[5 + bit / 8] & (1 << (bit % 8)) != 0 {
+                    for dy in 0..5 {
+                        for dx in 0..5 {
+                            pixels[(3 + y * 5 + dy) * SIDE + 3 + x * 5 + dx] =
+                                2 + ((x + y) % 2) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        Self { palette, pixels }
+    }
+    fn color(&self, x: usize, y: usize) -> Option<[u8; 3]> {
+        let radius = 6i32;
+        let dx = (radius - x as i32)
+            .max(x as i32 - (SIDE as i32 - radius - 1))
+            .max(0);
+        let dy = (radius - y as i32)
+            .max(y as i32 - (SIDE as i32 - radius - 1))
+            .max(0);
+        if dx * dx + dy * dy > radius * radius {
+            return None;
+        }
+        let index = self.pixels[y * SIDE + x];
+        (index != 0).then(|| self.palette[index as usize])
+    }
+}
+fn dist(a: [u8; 3], b: [u8; 3]) -> u32 {
+    (0..3)
+        .map(|c| {
+            let d = a[c] as i32 - b[c] as i32;
+            (d * d) as u32 * [2, 3, 1][c]
+        })
+        .sum()
+}
+fn nearest(pixel: [u8; 3], palette: &[[u8; 3]]) -> usize {
+    (1..COLORS)
+        .min_by_key(|&i| dist(pixel, palette[i]))
+        .unwrap()
+}
+
+pub fn display(avatar: Option<&Avatar>, name: &str) -> Arc<Avatar> {
+    Arc::new(
+        avatar
+            .filter(|a| a.valid())
+            .cloned()
+            .unwrap_or_else(|| Avatar::identicon(name)),
+    )
+}
+
+pub struct Portrait<'a> {
+    pub avatar: &'a Avatar,
+    pub mode: AvatarStyle,
+}
+impl Widget for Portrait<'_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let width = area
+            .width
+            .min(area.height.saturating_mul(2))
+            .min(SIDE as u16)
+            / 2
+            * 2;
+        if width == 0 {
+            return;
+        }
+        let height = width / 2;
+        let left = area.x + (area.width - width) / 2;
+        let top = area.y + (area.height - height) / 2;
+        for y in 0..height {
+            for x in 0..width {
+                let upper = self.avatar.color(
+                    x as usize * SIDE / width as usize,
+                    y as usize * 2 * SIDE / (height as usize * 2),
+                );
+                let lower = self.avatar.color(
+                    x as usize * SIDE / width as usize,
+                    (y as usize * 2 + 1) * SIDE / (height as usize * 2),
+                );
+                let cell = &mut buffer[(left + x, top + y)];
+                if self.mode == AvatarStyle::Ascii {
+                    let rgb = match (upper, lower) {
+                        (Some(a), Some(b)) => {
+                            std::array::from_fn(|c| ((a[c] as u16 + b[c] as u16) / 2) as u8)
+                        }
+                        (Some(a), _) | (_, Some(a)) => a,
+                        _ => {
+                            cell.set_symbol(" ").set_style(Style::default());
+                            continue;
+                        }
+                    };
+                    let luma =
+                        (54 * rgb[0] as usize + 183 * rgb[1] as usize + 19 * rgb[2] as usize) / 256;
+                    let ramp = b" .:-=+*#%@";
+                    let symbol =
+                        std::str::from_utf8(&ramp[(luma * 9 / 255)..=(luma * 9 / 255)]).unwrap();
+                    cell.set_symbol(symbol)
+                        .set_style(Style::new().fg(Color::Gray));
+                } else {
+                    let color = |rgb: [u8; 3]| Color::Rgb(rgb[0], rgb[1], rgb[2]);
+                    match (upper, lower) {
+                        (Some(a), Some(b)) => {
+                            cell.set_symbol("▀")
+                                .set_style(Style::new().fg(color(a)).bg(color(b)));
+                        }
+                        (Some(a), None) => {
+                            cell.set_symbol("▀").set_style(Style::new().fg(color(a)));
+                        }
+                        (None, Some(b)) => {
+                            cell.set_symbol("▄").set_style(Style::new().fg(color(b)));
+                        }
+                        _ => {
+                            cell.set_symbol(" ").set_style(Style::default());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Each peer acknowledges a revision. Stop after bounded retries, including
+/// when talking to a client that predates avatars. No timer/traffic once ACKed.
+#[derive(Default)]
+pub struct Delivery {
+    revision: u64,
+    acked: bool,
+    tries: u8,
+    sent: Option<Instant>,
+}
+impl Delivery {
+    pub fn due(&mut self, revision: u64, now: Instant) -> bool {
+        if self.revision != revision {
+            *self = Self {
+                revision,
+                ..Self::default()
+            };
+        }
+        if self.acked
+            || self.tries >= 6
+            || self
+                .sent
+                .is_some_and(|sent| now.duration_since(sent) < Duration::from_secs(2))
+        {
+            return false;
+        }
+        self.sent = Some(now);
+        self.tries += 1;
+        true
+    }
+    pub fn ack(&mut self, revision: u64) {
+        if self.revision == revision {
+            self.acked = true;
+        }
+    }
+}
+pub struct Profile {
+    pub revision: u64,
+    pub avatar: Option<Arc<Avatar>>,
+}
+impl Profile {
+    pub fn new(avatar: Option<&Avatar>) -> Self {
+        Self {
+            revision: 1,
+            avatar: avatar.filter(|a| a.valid()).cloned().map(Arc::new),
+        }
+    }
+    pub fn set(&mut self, avatar: Option<Arc<Avatar>>) {
+        self.revision = self.revision.wrapping_add(1).max(1);
+        self.avatar = avatar;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn wire_roundtrip_transparency_and_bounds() {
+        let avatar = Avatar::identicon("Лексей");
+        assert_eq!(avatar.encode().len(), 1120);
+        assert_eq!(Avatar::decode(&avatar.encode()), Some(avatar.clone()));
+        assert_ne!(avatar, Avatar::identicon("Друг"));
+        let mut bytes = avatar.encode();
+        bytes[96] = 255;
+        assert!(Avatar::decode(&bytes).is_none());
+        assert!(Avatar::decode(&bytes[..bytes.len() - 1]).is_none());
+        let transparent = Avatar::quantize(&vec![0; SIDE * SIDE * 4]);
+        assert!(transparent.valid());
+        assert!(transparent.pixels.iter().all(|&p| p == 0));
+    }
+    #[test]
+    fn imports_center_crop_and_keeps_owned_pixels_after_source_is_removed() {
+        let path =
+            std::env::temp_dir().join(format!("remember-me-avatar-{}.png", std::process::id()));
+        let mut image = image::RgbaImage::from_pixel(96, 32, image::Rgba([255, 0, 0, 255]));
+        for y in 0..32 {
+            for x in 32..64 {
+                image.put_pixel(x, y, image::Rgba([20, 100, 220, 255]));
+            }
+        }
+        image.save(&path).unwrap();
+        let avatar = Avatar::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(avatar.valid());
+        assert!(
+            avatar
+                .pixels
+                .iter()
+                .all(|&i| avatar.palette[i as usize] == [20, 100, 220])
+        );
+        let config = crate::config::Config {
+            avatar: Some(avatar.clone()),
+            ..Default::default()
+        };
+        let saved = toml::to_string(&config).unwrap();
+        let restored: crate::config::Config = toml::from_str(&saved).unwrap();
+        assert_eq!(restored.avatar, Some(avatar));
+    }
+    #[test]
+    fn pixel_and_ascii_renderers_fit_and_do_not_emit_control_characters() {
+        let avatar = Avatar::identicon("test");
+        let area = Rect::new(0, 0, 32, 16);
+        for mode in [AvatarStyle::Pixel, AvatarStyle::Ascii] {
+            let mut buffer = Buffer::empty(area);
+            Portrait {
+                avatar: &avatar,
+                mode,
+            }
+            .render(area, &mut buffer);
+            let symbols = buffer
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(!symbols.chars().any(char::is_control));
+            if mode == AvatarStyle::Ascii {
+                assert!(symbols.is_ascii());
+                assert!(symbols.contains(['#', '+', '*', '=']));
+            } else {
+                assert!(symbols.contains('▀'));
+                assert!(
+                    buffer
+                        .content
+                        .iter()
+                        .any(|c| matches!(c.fg, Color::Rgb(..)))
+                );
+            }
+        }
+    }
+    #[test]
+    fn sync_retries_loss_stops_after_ack_and_resets_for_new_picture() {
+        let now = Instant::now();
+        let mut delivery = Delivery::default();
+        assert!(delivery.due(1, now));
+        assert!(!delivery.due(1, now + Duration::from_millis(20)));
+        delivery.ack(0);
+        assert!(delivery.due(1, now + Duration::from_secs(2)));
+        delivery.ack(1);
+        assert!(!delivery.due(1, now + Duration::from_secs(4)));
+        assert!(delivery.due(2, now + Duration::from_secs(4)));
+        for second in [6, 8, 10, 12, 14] {
+            assert!(delivery.due(2, now + Duration::from_secs(second)));
+        }
+        assert!(!delivery.due(2, now + Duration::from_secs(20)));
+    }
+}

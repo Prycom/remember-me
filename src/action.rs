@@ -15,6 +15,7 @@ pub enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     Help,
+    Profile,
     HangUp,
 }
 
@@ -34,6 +35,9 @@ pub enum Action {
     SendFile,
     CancelFile,
     Update,
+    EditAvatar,
+    ShowProfile(usize),
+    CycleAvatars,
     FocusInput,
     Scroll(Pane, i16),
     Insert(char),

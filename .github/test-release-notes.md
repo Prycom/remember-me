@@ -1,5 +1,6 @@
 Rolling test build for Linux x86_64.
 
+- Custom avatars in PNG/JPEG/WebP/GIF: pixel/ASCII portraits, speaking highlights, live encrypted sync and automatic nickname identicons.
 - Panel-based TUI with mouse controls, OSC 52 copy, room member scrolling and inline chat input (PR #1 by Forwall100).
 - Group voice rooms for up to 16 participants; the room survives its creator leaving.
 - Encrypted chat and file transfers, browser links and configurable download directory.

@@ -21,6 +21,17 @@ pub fn action_for(k: &KeyEvent, app: &App) -> Option<Action> {
     {
         return Some(Action::Quit);
     }
+    if app.overlay == Some(crate::action::Overlay::Profile) && k.kind == KeyEventKind::Press {
+        match k.code {
+            KeyCode::Left => return Some(Action::Left),
+            KeyCode::Right => return Some(Action::Right),
+            KeyCode::Char('v' | 'V' | 'м' | 'М') => return Some(Action::CycleAvatars),
+            KeyCode::Char('a' | 'A' | 'ф' | 'Ф') if app.call_sel == 0 => {
+                return Some(Action::EditAvatar);
+            }
+            _ => {}
+        }
+    }
     if app.overlay.is_some() {
         return match k.code {
             KeyCode::Esc | KeyCode::Char('?') => Some(Action::Cancel),
@@ -178,6 +189,9 @@ fn screen_command(k: &KeyEvent, app: &App) -> Option<Action> {
             KeyCode::PageDown => Some(Action::PageDown),
             KeyCode::Tab => Some(Action::NextPane),
             KeyCode::BackTab => Some(Action::NextLink(true)),
+            KeyCode::Enter if app.focus == Focus::Pane(Pane::Side) => {
+                Some(Action::ShowProfile(app.call_sel))
+            }
             KeyCode::Enter => Some(Action::Confirm),
             KeyCode::Esc => Some(Action::Cancel),
             KeyCode::Char(c) => {

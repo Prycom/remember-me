@@ -78,6 +78,7 @@ pub enum NetEvent {
         lvl: u8,
     },
     PeerSpeaking(bool),
+    PeerAvatar(Option<Arc<crate::avatar::Avatar>>),
     Text(String),
     Transfer(crate::transfer::TransferUpdate),
     /// наше сообщение доставлено
@@ -91,6 +92,7 @@ pub enum NetEvent {
 #[derive(Debug, Clone)]
 pub enum NetCmd {
     AcceptCall,
+    Avatar(Option<Arc<crate::avatar::Avatar>>),
     DeclineCall,
     Text(String),
     SendFile(std::path::PathBuf),
@@ -297,8 +299,11 @@ async fn run_established(
     engine: Arc<AudioEngine>,
     accepted_hello: Option<([u8; 32], Packet)>,
     download_directory: &mut std::path::PathBuf,
+    profile: &mut crate::avatar::Profile,
 ) -> Outcome {
     let mut files = crate::transfer::spawn(download_directory.clone());
+    let mut avatar_delivery = crate::avatar::Delivery::default();
+    let mut avatar_received = 0u64;
     let mut seen_text = VecDeque::new();
     let mut peer = peer0;
     let mut last_ctl_rx: u64 = 0;
@@ -367,6 +372,11 @@ async fn run_established(
                     eprintln!("[net] rx {} {} от {}", kind, classify(&buf[..n]) == WireClass::Secure, from);
                 }
                 match pkt {
+                    Some(Packet::Avatar{revision,avatar}) => {
+                        send_secure(&sock,&mut cipher,peer,&Packet::AvatarAck{revision}).await;
+                        if revision>avatar_received {avatar_received=revision;let _=events.send(NetEvent::PeerAvatar(avatar));dbg_net!("avatar received revision={revision}");}
+                    }
+                    Some(Packet::AvatarAck{revision}) => avatar_delivery.ack(revision),
                     Some(Packet::File(packet)) => { let _ = files.commands.try_send(crate::transfer::Command::Wire(packet)); }
                     Some(Packet::Audio { payload, seq, .. }) => {
                         if payload.len() <= AUDIO_PAYLOAD_MAX {
@@ -439,6 +449,7 @@ async fn run_established(
             Some(cmd) = cmd_rx.recv() => {
                 dbg_net!("← cmd {:?}", cmd);
                 match cmd {
+                    NetCmd::Avatar(avatar) => profile.set(avatar),
                     NetCmd::SendFile(path) => {
                         if files.commands.try_send(crate::transfer::Command::Send(path)).is_err() { let _ = events.send(NetEvent::Progress("очередь передачи занята, повторите отправку".into())); }
                     }
@@ -472,6 +483,7 @@ async fn run_established(
             // ── мелкие периодические дела ───────────────────────────────────
             _ = maintenance.tick() => {
                 let now = Instant::now();
+                if avatar_delivery.due(profile.revision,now) {send_secure(&sock,&mut cipher,peer,&Packet::Avatar{revision:profile.revision,avatar:profile.avatar.clone()}).await;}
                 if now.duration_since(last_ping) >= KEEPALIVE_INTERVAL {
                     last_ping = now;
                     dbg_net!("→ ping");
@@ -576,6 +588,7 @@ async fn run_host(
     });
 
     let mut download_directory = cfg.download_directory();
+    let mut profile = crate::avatar::Profile::new(cfg.avatar.as_ref());
     let mut buf = vec![0u8; MTU];
 
     // серверная комната (если настроена): код + периодическая регистрация
@@ -640,6 +653,7 @@ async fn run_host(
                 }
                 maybe = cmd_rx.recv() => match maybe {
                     Some(NetCmd::DownloadDirectory(path))=>download_directory=path,
+                    Some(NetCmd::Avatar(avatar))=>profile.set(avatar),
                     Some(NetCmd::Stop) | None => return,
                     _ => {}
                 },
@@ -697,6 +711,7 @@ async fn run_host(
             tokio::select! {
                 maybe = cmd_rx.recv() => match maybe {
                     Some(NetCmd::DownloadDirectory(path))=>download_directory=path,
+                    Some(NetCmd::Avatar(avatar))=>profile.set(avatar),
                     Some(NetCmd::AcceptCall) => accepted = Some(true),
                     Some(NetCmd::DeclineCall) => accepted = Some(false),
                     Some(NetCmd::Stop) | None => {
@@ -790,6 +805,7 @@ async fn run_host(
             engine.clone(),
             Some((pub_key, acc)),
             &mut download_directory,
+            &mut profile,
         )
         .await;
 
@@ -838,6 +854,7 @@ async fn run_joiner(
     }
 
     let mut download_directory = cfg.download_directory();
+    let mut profile = crate::avatar::Profile::new(cfg.avatar.as_ref());
     let mut buf = vec![0u8; MTU];
     let relay_addr = if room.is_some() {
         select_addr(&addr_str)
@@ -932,6 +949,7 @@ async fn run_joiner(
                     }
                     maybe = cmd_rx.recv() => match maybe {
                     Some(NetCmd::DownloadDirectory(path))=>download_directory=path,
+                    Some(NetCmd::Avatar(avatar))=>profile.set(avatar),
                         Some(NetCmd::Stop | NetCmd::HangUp { .. }) | None => break 'outer,
                         _ => {},
                     },
@@ -1031,6 +1049,7 @@ async fn run_joiner(
             engine.clone(),
             None,
             &mut download_directory,
+            &mut profile,
         )
         .await;
 

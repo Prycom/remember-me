@@ -342,6 +342,23 @@ fn render_home(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
             );
         }
     }
+    if inner.height >= 14 {
+        let area = Rect::new(inner.x, inner.y + 6, inner.width, inner.height - 6);
+        let block = Block::bordered()
+            .title(" Ваша аватарка ")
+            .title_bottom(" клик: выбрать картинку ")
+            .border_style(dim());
+        let image = block.inner(area);
+        f.render_widget(block, area);
+        f.render_widget(
+            crate::avatar::Portrait {
+                avatar: &app.avatar,
+                mode: app.cfg.avatar_style,
+            },
+            image,
+        );
+        ui.push(area, Action::EditAvatar);
+    }
     ui.push_pane(body, Pane::Side);
 }
 
@@ -539,6 +556,28 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
     if let Some(pick) = &app.dev_pick {
         return render_dev_pick(app, f, ui, body, pick.input, pick.idx);
     }
+    let body = if body.width >= 116 {
+        let [fields, preview] =
+            Layout::horizontal([Constraint::Min(70), Constraint::Length(30)]).areas(body);
+        let area = Rect::new(preview.x, preview.y, preview.width, preview.height.min(18));
+        let block = Block::bordered()
+            .title(" Аватарка · предпросмотр ")
+            .title_bottom(" клик: выбрать ")
+            .border_style(accent());
+        let image = block.inner(area);
+        f.render_widget(block, area);
+        f.render_widget(
+            crate::avatar::Portrait {
+                avatar: &app.avatar,
+                mode: app.cfg.avatar_style,
+            },
+            image,
+        );
+        ui.push(area, Action::EditAvatar);
+        fields
+    } else {
+        body
+    };
     let p = app.engine.params.clone();
     let cfg = &app.cfg;
     let cur = app.engine.current_devices();
@@ -630,6 +669,26 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
             "ВЫКЛ".into()
         },
     ));
+    rows.push((
+        "аватарка · путь к картинке".into(),
+        if cfg.avatar.is_some() {
+            cfg.avatar_file.clone()
+        } else {
+            "узор по нику · Enter выбрать".into()
+        },
+    ));
+    rows.push((
+        "вид аватарок".into(),
+        match cfg.avatar_style {
+            crate::avatar::AvatarStyle::Pixel => "цветные пиксели ▀",
+            crate::avatar::AvatarStyle::Ascii => "ASCII .:-=+*#%@",
+        }
+        .into(),
+    ));
+    rows.push((
+        "сбросить аватарку".into(),
+        "Enter: вернуть узор по нику".into(),
+    ));
     let mut lines = Vec::new();
     for (i, (label, val)) in rows.iter().enumerate() {
         let cursor = if i == app.settings_sel && app.edit.is_none() {
@@ -702,6 +761,11 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
         }
     }
     let help = match app.settings_sel {
+        crate::app::ROW_AVATAR => "Enter: PNG/JPEG/WebP/GIF, путь или ~/ · пусто = узор по нику",
+        crate::app::ROW_AVATAR_STYLE => {
+            "Enter: цветные пиксели / ASCII · действует на все аватарки у вас"
+        }
+        crate::app::ROW_AVATAR_CLEAR => "Enter: удалить свою картинку и вернуть узор по нику",
         crate::app::ROW_AUTO_UPDATE => {
             "Enter: проверять при запуске · F5: обновить сейчас · перезапуск после звонка"
         }
@@ -864,6 +928,7 @@ fn overlays(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
             f.render_widget(Paragraph::new(lines), inner);
             ui.push(area, Action::Cancel);
         }
+        Some(Overlay::Profile) => call::render_profile(app, f, ui, body),
         Some(Overlay::HangUp) => {
             let area = centered_rect(body, 36, 7);
             f.render_widget(Clear, area);
@@ -1012,6 +1077,129 @@ mod tests {
     }
 
     #[test]
+    fn avatar_cards_render_pixels_ascii_and_open_the_profile_editor() {
+        use crate::{
+            app::{ChatLine, PeerInfo},
+            avatar::{Avatar, AvatarStyle},
+        };
+        let mut app = app();
+        app.screen = Screen::Call;
+        app.focus = Focus::Pane(Pane::Side);
+        app.call_sel = 1;
+        let image = std::env::var_os("RM_AVATAR_PREVIEW_IMAGE")
+            .map(|p| Avatar::load(std::path::Path::new(&p)).unwrap());
+        app.peer = Some(PeerInfo {
+            name: "Друг".into(),
+            addr: "комната AX3P".into(),
+            rtt: Some(42),
+            mute_mic: false,
+            deaf: false,
+            speaking: true,
+            level: 72,
+            status_known: true,
+            avatar: crate::avatar::display(image.as_ref(), "Друг"),
+        });
+        app.chat.push(ChatLine {
+            mine: true,
+            name: "Лексей".into(),
+            text: "Теперь в комнате есть аватарки 🙂".into(),
+            status: 1,
+            attachment: None,
+        });
+        app.chat.push(ChatLine {
+            mine: false,
+            name: "Друг".into(),
+            text: "Красота! Свою можно сменить прямо в звонке.".into(),
+            status: 3,
+            attachment: None,
+        });
+        for mode in [AvatarStyle::Pixel, AvatarStyle::Ascii] {
+            app.cfg.avatar_style = mode;
+            let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+            let mut ui = Ui::default();
+            terminal.draw(|f| render(&app, f, &mut ui)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = buffer
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            if mode == AvatarStyle::Pixel {
+                assert!(text.contains('▀'));
+            } else {
+                assert!(!text.contains('▀'));
+            }
+            // Optional real-buffer SVG export for visual inspection, no image dependencies in production UI.
+            if let Some(prefix) = std::env::var_os("RM_AVATAR_PREVIEW") {
+                let color = |c: Color| match c {
+                    Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+                    Color::Green => "#80d9a4".into(),
+                    Color::Cyan => "#70cde8".into(),
+                    Color::DarkGray => "#6c7890".into(),
+                    Color::Red => "#ef7c91".into(),
+                    Color::Black => "#101521".into(),
+                    _ => "#d5dfed".into(),
+                };
+                let mut svg = String::from(
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1120\" height=\"672\"><rect width=\"100%\" height=\"100%\" fill=\"#101521\"/>",
+                );
+                for y in 0..42 {
+                    for x in 0..140 {
+                        let c = &buffer[(x, y)];
+                        let left = x as u32 * 8;
+                        let top = y as u32 * 16;
+                        if c.bg != Color::Reset {
+                            svg.push_str(&format!("<rect x=\"{left}\" y=\"{top}\" width=\"8\" height=\"16\" fill=\"{}\"/>",color(c.bg)));
+                        }
+                        if matches!(c.symbol(), "▀" | "▄") {
+                            let offset = if c.symbol() == "▄" { 8 } else { 0 };
+                            svg.push_str(&format!("<rect x=\"{left}\" y=\"{}\" width=\"8\" height=\"8\" fill=\"{}\"/>",top+offset,color(c.fg)));
+                        } else {
+                            let symbol = c
+                                .symbol()
+                                .replace('&', "&amp;")
+                                .replace('<', "&lt;")
+                                .replace('>', "&gt;");
+                            svg.push_str(&format!("<text x=\"{left}\" y=\"{}\" font-family=\"DejaVu Sans Mono\" font-size=\"13\" fill=\"{}\">{symbol}</text>",top+13,color(c.fg)));
+                        }
+                    }
+                }
+                svg.push_str("</svg>");
+                std::fs::write(
+                    format!("{}-{mode:?}.svg", std::path::Path::new(&prefix).display()),
+                    svg,
+                )
+                .unwrap();
+            }
+        }
+        app.cfg.avatar_style = AvatarStyle::Pixel;
+        app.on_action(Action::ShowProfile(1));
+        for (width, height) in [(40, 16), (80, 24), (120, 40)] {
+            let (screen, ui) = draw_ui(&app, width, height);
+            assert!(screen.contains("Друг"));
+            assert!(screen.contains('▀'));
+            assert!(
+                ui.hit(1, height - 1).is_none(),
+                "profile must block the call footer"
+            );
+        }
+        app.on_action(Action::Left);
+        assert_eq!(app.call_sel, 0);
+        app.on_action(Action::Right);
+        assert_eq!(app.call_sel, 1);
+        app.on_action(Action::Cancel);
+        assert_eq!(app.overlay, None);
+        app.call_sel = 0;
+        let (_, ui) = draw_ui(&app, 140, 42);
+        app.on_action(ui.hit(10, 30).unwrap());
+        assert_eq!(app.overlay, Some(Overlay::Profile));
+        app.on_action(Action::EditAvatar);
+        assert_eq!(app.screen, Screen::Settings);
+        assert_eq!(app.settings_sel, crate::app::ROW_AVATAR);
+        assert!(app.edit.is_some());
+    }
+
+    #[test]
     fn mouse_confirms_hangup_and_modals_block_underlying_actions() {
         let mut app = app();
         app.screen = Screen::Call;
@@ -1046,6 +1234,7 @@ mod tests {
                 speaking: false,
                 level: 42,
                 known: true,
+                avatar: crate::avatar::display(None, &format!("Друг{id}")),
             })
             .collect();
         app.call_sel = 15;

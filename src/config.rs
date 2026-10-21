@@ -35,6 +35,9 @@ pub struct Config {
     pub download_dir: String,
     /// Check the fixed GitHub test channel once at startup; replace atomically.
     pub auto_update: bool,
+    pub avatar: Option<crate::avatar::Avatar>,
+    pub avatar_file: String,
+    pub avatar_style: crate::avatar::AvatarStyle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +70,9 @@ impl Default for Config {
             server_addr: String::new(),
             download_dir: String::new(),
             auto_update: true,
+            avatar: None,
+            avatar_file: String::new(),
+            avatar_style: Default::default(),
         }
     }
 }

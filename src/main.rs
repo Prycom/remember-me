@@ -12,6 +12,7 @@
 mod action;
 mod app;
 mod audio;
+mod avatar;
 mod chat_links;
 mod clipboard;
 mod config;

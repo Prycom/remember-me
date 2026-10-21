@@ -1224,7 +1224,7 @@ mod tests {
             config::Config,
         };
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-        for modal in [Action::Help, Action::HangUp] {
+        for modal in [Action::Help, Action::HangUp, Action::ShowProfile(0)] {
             let mut app = App::for_test(Config::default());
             app.screen = Screen::Call;
             app.focus = Focus::Pane(Pane::Main);

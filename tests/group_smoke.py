@@ -15,6 +15,7 @@ import tempfile
 import threading
 import termios
 import time
+import avatar_helpers
 from voice_smoke import Client, LossyRelayProxy, free_port, pulse, tone, measure
 
 
@@ -117,12 +118,27 @@ def main():
             a.wait_log("код комнаты")
             code = re.search(r"код комнаты ([A-Z2-9]{4})", a.log()).group(1)
             a.wait_log("joined room")
-            for who in "bc":
-                client = Client(binary, root, who, ["--connect", f"{code}@{server}"])
-                clients.append(client)
-            b, c = clients[1:]
+            b = Client(binary, root, "b", ["--connect", f"{code}@{server}"])
+            clients.append(b)
+            for client in clients:
+                client.wait_log("roster: 1 remote members")
+            time.sleep(0.5)
+            proxy.impair_profiles = True
+            avatar = root / "avatar.png"
+            avatar_helpers.picture(avatar)
+            avatar_helpers.choose(a, root, 'a', avatar)
+            b.wait_log('avatar received from a revision=2')
+            avatar.unlink()
+            c = Client(binary, root, "c", ["--connect", f"{code}@{server}"])
+            clients.append(c)
             for client in clients:
                 client.wait_log("roster: 2 remote members")
+            c.wait_log('avatar received from a revision=2')
+            assert proxy.avatar_lost == 1 and proxy.avatar_ack_lost == 1
+            avatar_helpers.clear(a)
+            for client in (b, c):
+                client.wait_log('avatar received from a revision=3')
+            print('  group avatar: packet/ACK loss, late join after source removal, live reset: PASS', flush=True)
             time.sleep(0.5)
             ui_stalls(root, names, a)
             if options.ui_stall_only:

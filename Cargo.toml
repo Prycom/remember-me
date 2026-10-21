@@ -7,7 +7,7 @@ default-run = "remember-me"
 [features]
 default = ["client"]
 client = [
-    "dep:ratatui", "dep:crossterm", "dep:cpal", "dep:opusic-sys",
+    "dep:image", "dep:ratatui", "dep:crossterm", "dep:cpal", "dep:opusic-sys",
     "dep:chacha20poly1305", "dep:x25519-dalek", "dep:sha2",
     "dep:serde", "dep:toml", "dep:libc", "dep:nnnoiseless", "dep:unicode-width",
     "tokio/sync", "tokio/signal", "tokio/fs", "tokio/io-util",
@@ -46,6 +46,7 @@ toml = { version = "1", optional = true }
 argh = "0.1.19"
 libc = { version = "0.2", optional = true }
 nnnoiseless = { version = "=0.5.2", default-features = false, optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"], optional = true }
 
 [profile.release]
 opt-level = 3

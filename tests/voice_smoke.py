@@ -26,6 +26,7 @@ import threading
 import time
 import tomllib
 import wave
+import avatar_helpers
 
 
 def pulse(*args):
@@ -107,6 +108,9 @@ class LossyRelayProxy:
         self.impair_audio = False
         self.audio_lost = 0
         self.file_lost = 0
+        self.impair_profiles = False
+        self.avatar_lost = 0
+        self.avatar_ack_lost = 0
         self.threads = []
         self.thread = threading.Thread(target=self.forward, daemon=True)
         self.thread.start()
@@ -126,6 +130,12 @@ class LossyRelayProxy:
                 thread.start()
                 self.threads.append(thread)
             payload = data[17:] if data[:1] == b"\x1b" else data
+            if self.impair_profiles and payload[:1] == b"\x0d" and self.avatar_lost < 1:
+                self.avatar_lost += 1
+                continue
+            if self.impair_profiles and payload[:1] == b"\x0e" and self.avatar_ack_lost < 1:
+                self.avatar_ack_lost += 1
+                continue
             if payload[:1] == b"\x0c" and self.file_lost < 2:
                 self.file_lost += 1
                 continue
@@ -356,6 +366,14 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
             host.wait_log("повторяем ACCEPT")
             print("recovery after first ACCEPT is lost: PASS", flush=True)
         time.sleep(0.5)
+        avatar = root / 'avatar.png'
+        avatar_helpers.picture(avatar)
+        avatar_helpers.choose(host, root, 'a', avatar)
+        joiner.wait_log('avatar received revision=2')
+        avatar.unlink()  # the cached pixels must survive removing the source
+        avatar_helpers.clear(host)
+        joiner.wait_log('avatar received revision=3')
+        print('  live avatar import + encrypted delivery + source removal + reset: PASS', flush=True)
         short, long = root / "short.wav", root / "long.wav"
         quiet, loud = root / "quiet.wav", root / "loud.wav"
         transient = root / "bursts.wav"
