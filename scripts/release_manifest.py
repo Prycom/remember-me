@@ -15,8 +15,8 @@ with binary.open("rb") as source:
     for block in iter(lambda: source.read(65536), b""):
         checksum.update(block)
     digest = checksum.hexdigest()
-(output / "remember-me.manifest.toml").write_text(
+(output / f"{binary.name}.manifest.toml").write_text(
     f'version = "{info["version"]}"\nbuild = {int(info["build"])}\n'
     f'target = "{info["target"]}"\nsha256 = "{digest}"\nsize = {binary.stat().st_size}\n')
-(output / "remember-me.sha256").write_text(f"{digest}  remember-me\n")
+(output / f"{binary.name}.sha256").write_text(f"{digest}  {binary.name}\n")
 print(f"{info['target']} build {info['build']}: {digest}")

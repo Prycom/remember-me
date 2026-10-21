@@ -798,8 +798,6 @@ mod tests {
     }
 
     fn rand_bytes(b: &mut [u8]) {
-        use std::io::Read;
-        let mut f = std::fs::File::open("/dev/urandom").unwrap();
-        f.read_exact(b).unwrap();
+        getrandom::fill(b).unwrap();
     }
 }

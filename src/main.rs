@@ -28,6 +28,7 @@ mod voice_level;
 use std::time::{Duration, Instant};
 
 use argh::FromArgs;
+#[cfg(not(windows))]
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
@@ -180,7 +181,12 @@ async fn run(
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableMouseCapture,
-        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableBracketedPaste
+    );
+    // Windows receives key-up/repeat events through native console input.
+    #[cfg(not(windows))]
+    let _ = crossterm::execute!(
+        std::io::stdout(),
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
@@ -252,9 +258,10 @@ async fn run(
         }
     }
 
+    #[cfg(not(windows))]
+    let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     let _ = crossterm::execute!(
         std::io::stdout(),
-        PopKeyboardEnhancementFlags,
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste
     );

@@ -1,7 +1,7 @@
 # remember-me
 
 Личные звонки и групповые комнаты до 16 человек + чат, файлы и аватарки в терминале. Rust, ratatui. Стек: ratatui 0.30 +
-crossterm + cpal + libopus (системный) + XChaCha20-Poly1305 +
+crossterm + cpal + libopus (Linux: системный, Windows: встроенный) + XChaCha20-Poly1305 +
 X25519.
 
 Прямой личный звонок работает по UDP с подтверждением входящего вызова.
@@ -26,6 +26,45 @@ libopus — системная зависимость: на Arch это паке
 
 Без флагов открывается главный экран: `[H]` host, `[C]` connect,
 `[S]` настройки, `[Q]` выход.
+
+## Windows
+
+Готовая сборка для **Windows 10/11 x64**:
+[скачать remember-me.exe](https://github.com/Prycom/remember-me/releases/download/test/remember-me.exe).
+Это один переносимый файл: Opus и runtime C встроены, отдельные DLL,
+Rust и PulseAudio на компьютере пользователя не нужны. Звук работает
+через системный WASAPI.
+
+Сохраните EXE в свою папку, откройте её в Windows Terminal / PowerShell
+и запустите:
+
+```powershell
+.\remember-me.exe
+# Сразу подключиться к комнате на VPS:
+.\remember-me.exe --connect КОД@IP_СЕРВЕРА:51900
+# Проверка UDP без открытия микрофона:
+.\remember-me.exe --check-server IP_СЕРВЕРА:51900
+```
+
+Настройки хранятся в `%APPDATA%\remember-me\config.toml`, принятые файлы —
+в `%USERPROFILE%\Downloads` или папке из F2. При первом запуске разрешите
+приложению доступ к микрофону и нужный UDP-трафик в настройках Windows.
+Все функции совместимы с Linux-клиентами и тем же сервером на VPS.
+
+Автообновление и **F5** выбирают Windows-сборку, проверяют SHA-256 и
+заменяют EXE без обрыва текущего звонка. После обновления закройте
+и снова запустите клиент. Папка с EXE должна быть доступна для записи.
+
+Для самостоятельной сборки нужны Rust stable MSVC, Visual Studio Build
+Tools с компонентом «Desktop development with C++» и CMake:
+
+```powershell
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
+cargo build --release --locked --bin remember-me --target x86_64-pc-windows-msvc
+```
+
+Результат: `target\x86_64-pc-windows-msvc\release\remember-me.exe`.
+GitHub Actions собирает и тестирует Linux и Windows перед обновлением релиза.
 
 ## Звонок через сервер (владельцу сервера)
 

@@ -2,8 +2,11 @@ use cpal::traits::{DeviceTrait, HostTrait};
 
 fn main() {
     println!("доступные хосты: {:?}", cpal::available_hosts());
+    #[cfg(target_os = "linux")]
     let host = cpal::host_from_id(cpal::HostId::PulseAudio).expect("pulse host");
-    println!("=== PULSE входы ===");
+    #[cfg(not(target_os = "linux"))]
+    let host = cpal::default_host();
+    println!("=== входы ===");
     if let Ok(it) = host.input_devices() {
         for d in it {
             println!("  [{}]", d.to_string());
@@ -11,7 +14,7 @@ fn main() {
     }
     println!("дефолт-вход: {:?}",
         host.default_input_device().map(|d| d.to_string()));
-    println!("=== PULSE выходы ===");
+    println!("=== выходы ===");
     if let Ok(it) = host.output_devices() {
         for d in it {
             println!("  [{}]", d.to_string());

@@ -446,8 +446,8 @@ static AUDIO_HOST: std::sync::OnceLock<cpal::Host> = std::sync::OnceLock::new();
 
 pub fn audio_host() -> &'static cpal::Host {
     AUDIO_HOST.get_or_init(|| {
-        let pulse = cpal::host_from_id(cpal::HostId::PulseAudio);
-        if let Ok(h) = pulse {
+        #[cfg(target_os = "linux")]
+        if let Ok(h) = cpal::host_from_id(cpal::HostId::PulseAudio) {
             let outputs = h.output_devices().map(|it| it.count()).unwrap_or(0);
             let inputs = h.input_devices().map(|it| it.count()).unwrap_or(0);
             if outputs > 0 || inputs > 0 {

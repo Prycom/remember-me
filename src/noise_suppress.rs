@@ -292,6 +292,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     #[ignore = "manual denoiser CPU and RSS measurement in a release build"]
     fn denoiser_cpu_and_memory() {
         fn rss_kib() -> usize {

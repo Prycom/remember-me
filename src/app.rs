@@ -1667,10 +1667,13 @@ fn fmt_ts() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0) as i64;
+        .unwrap_or(0) as libc::time_t;
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
+        #[cfg(unix)]
         libc::localtime_r(&secs, &mut tm);
+        #[cfg(windows)]
+        libc::localtime_s(&mut tm, &secs);
         format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
     }
 }

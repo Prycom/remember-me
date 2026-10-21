@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 fn main() {
+    #[cfg(target_os = "linux")]
     let host = cpal::host_from_id(cpal::HostId::PulseAudio).expect("pulse");
+    #[cfg(not(target_os = "linux"))]
+    let host = cpal::default_host();
     let mut names: Vec<Option<String>> = vec![None];
     if let Some(d) = host.default_input_device() {
         names.push(Some(d.to_string()));

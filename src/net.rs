@@ -199,6 +199,7 @@ macro_rules! dbg_net {
 /// Тоннельные интерфейсы (wireguard/tun/…, флаг POINTOPOINT) помечаются VPN.
 fn local_addrs(port: u16) -> Vec<String> {
     let mut out: Vec<(u8, String)> = Vec::new();
+    #[cfg(unix)]
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifap) == 0 {
@@ -230,16 +231,22 @@ fn local_addrs(port: u16) -> Vec<String> {
             libc::freeifaddrs(ifap);
         }
     }
+    #[cfg(windows)]
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0")
+        && socket.connect("1.1.1.1:80").is_ok()
+        && let Ok(addr) = socket.local_addr()
+    {
+        // UDP connect selects a local route without sending any packets.
+        out.push((1, format!("локальный адрес {}:{port}", addr.ip())));
+    }
     out.sort();
     out.into_iter().map(|(_, s)| s).collect()
 }
 
 fn rnd_vec(n: usize) -> Vec<u8> {
-    use std::io::Read;
     let mut buf = vec![0u8; n];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
-    }
+    // Fail closed: never create predictable X25519 keys/nonce domains if the OS RNG fails.
+    getrandom::fill(&mut buf).expect("системный генератор случайных чисел недоступен");
     buf
 }
 

@@ -4,40 +4,90 @@ on:
     branches: [main]
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: release-test
   cancel-in-progress: false
 jobs:
-  release:
-    runs-on: ubuntu-22.04
+  build:
+    name: Build ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-22.04
+          - os: windows
+            runner: windows-2022
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Install audio and static server build dependencies
+      - name: Install Linux build dependencies
+        if: matrix.os == 'linux'
         run: sudo apt-get update && sudo apt-get install -y libopus-dev libpulse-dev libasound2-dev pkg-config musl-tools
       - name: Install Rust
+        shell: bash
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add x86_64-unknown-linux-musl
-      - name: Test
-        run: cargo test --locked
-      - name: Build client and static relay
+      - name: Test and build Linux
+        if: matrix.os == 'linux'
         run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo test --locked
           cargo build --release --locked --bin remember-me
           cargo build --release --locked --no-default-features --bin remember-me-server --target x86_64-unknown-linux-musl
           python3 tests/update_smoke.py
-          python3 scripts/release_manifest.py target/release/remember-me target/release
+          mkdir -p dist
+          cp target/release/remember-me target/x86_64-unknown-linux-musl/release/remember-me-server dist/
+          python3 scripts/release_manifest.py dist/remember-me dist
+      - name: Test and build Windows
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release --locked --bin remember-me --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:RM_UPDATE_BINARY = 'target/x86_64-pc-windows-msvc/release/remember-me.exe'
+          python tests/update_smoke.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/remember-me.exe dist/
+          python scripts/release_manifest.py dist/remember-me.exe dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binaries-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binaries-*
+          path: dist
+          merge-multiple: true
       - name: Publish stable test URLs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view test --repo "$GITHUB_REPOSITORY" >/dev/null || gh release create test --repo "$GITHUB_REPOSITORY" --prerelease --title "Test build" --notes "Rolling test binaries. See README for installation and update instructions."
           gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/test" --method PATCH -f sha="$GITHUB_SHA" -F force=true
-          gh release upload test target/release/remember-me target/release/remember-me.sha256 target/x86_64-unknown-linux-musl/release/remember-me-server --repo "$GITHUB_REPOSITORY" --clobber
-          gh release upload test target/release/remember-me.manifest.toml --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload test dist/remember-me dist/remember-me.sha256 dist/remember-me-server dist/remember-me.exe dist/remember-me.exe.sha256 --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload test dist/remember-me.manifest.toml dist/remember-me.exe.manifest.toml --repo "$GITHUB_REPOSITORY" --clobber
           cp .github/test-release-notes.md "$RUNNER_TEMP/release-notes.md"
           printf '\nBuilt from commit: %s\n' "$GITHUB_SHA" >> "$RUNNER_TEMP/release-notes.md"
           gh release edit test --repo "$GITHUB_REPOSITORY" --prerelease --title "Test build ${GITHUB_SHA:0:7}" --notes-file "$RUNNER_TEMP/release-notes.md"

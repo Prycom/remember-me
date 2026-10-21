@@ -1,4 +1,4 @@
-//! HTTPS download, checksum/target validation and atomic executable replacement.
+//! HTTPS download, checksum/target validation and platform-aware executable replacement.
 //! No background daemon, in-place writes, sudo, or restart during a call.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -8,6 +8,24 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+fn binary_asset() -> &'static str {
+    if cfg!(windows) {
+        "remember-me.exe"
+    } else {
+        "remember-me"
+    }
+}
+fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW: no flashes while updating in a call.
+    }
+    #[cfg(not(windows))]
+    let _ = &mut command;
+    command
+}
 pub const BASE: &str = "https://github.com/Prycom/remember-me/releases/download/test";
 pub fn build() -> u64 {
     env!("RM_BUILD_UNIX").parse().unwrap()
@@ -55,7 +73,7 @@ fn checksum(path: &Path) -> Result<String, String> {
         .collect())
 }
 fn download(url: &str, path: &Path, limit: u64) -> Result<(), String> {
-    let status = Command::new("curl")
+    let status = command(if cfg!(windows) { "curl.exe" } else { "curl" })
         .args([
             "--fail",
             "--silent",
@@ -93,8 +111,13 @@ fn temporary(parent: &Path, label: &str) -> Result<Temporary, String> {
         .unwrap()
         .as_nanos();
     let path = parent.join(format!(
-        ".remember-me-{label}-{}-{nonce}.tmp",
-        std::process::id()
+        ".remember-me-{label}-{}-{nonce}{}",
+        std::process::id(),
+        if cfg!(windows) && label == "update" {
+            ".tmp.exe"
+        } else {
+            ".tmp"
+        }
     ));
     fs::OpenOptions::new()
         .write(true)
@@ -123,25 +146,54 @@ fn validate(path: &Path, manifest: &Manifest) -> Result<(), String> {
     {
         return Err("SHA-256 обновления не совпал; текущий бинарник сохранён".into());
     }
-    let mut header = [0; 64];
-    fs::File::open(path)
-        .map_err(|e| e.to_string())?
-        .read_exact(&mut header)
-        .map_err(|e| e.to_string())?;
-    let machine = match std::env::consts::ARCH {
-        "x86_64" => 62,
-        "aarch64" => 183,
-        _ => return Err("обновление этой архитектуры пока не поддерживается".into()),
-    };
-    if &header[..4] != b"\x7fELF"
-        || header[4] != 2
-        || header[5] != 1
-        || u16::from_le_bytes([header[18], header[19]]) != machine
-    {
-        return Err("скачан неподходящий ELF-бинарник".into());
+    validate_executable(path, std::env::consts::OS, std::env::consts::ARCH)
+}
+fn validate_executable(path: &Path, os: &str, arch: &str) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header).map_err(|e| e.to_string())?;
+    if os == "windows" {
+        if &header[..2] != b"MZ" {
+            return Err("скачан неподходящий Windows EXE".into());
+        }
+        let offset = u32::from_le_bytes(header[60..64].try_into().unwrap()) as u64;
+        if !(64..=1024 * 1024).contains(&offset) {
+            return Err("повреждён заголовок PE".into());
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| e.to_string())?;
+        let mut pe = [0; 26];
+        file.read_exact(&mut pe)
+            .map_err(|e| format!("заголовок PE: {e}"))?;
+        let machine = match arch {
+            "x86_64" => 0x8664,
+            "aarch64" => 0xaa64,
+            _ => return Err("неподдерживаемая архитектура EXE".into()),
+        };
+        if &pe[..4] != b"PE\0\0"
+            || u16::from_le_bytes([pe[4], pe[5]]) != machine
+            || u16::from_le_bytes([pe[24], pe[25]]) != 0x20b
+        {
+            return Err("скачан EXE другой архитектуры или повреждённый PE".into());
+        }
+    } else {
+        let machine = match arch {
+            "x86_64" => 62,
+            "aarch64" => 183,
+            _ => return Err("обновление этой архитектуры пока не поддерживается".into()),
+        };
+        if &header[..4] != b"\x7fELF"
+            || header[4] != 2
+            || header[5] != 1
+            || u16::from_le_bytes([header[18], header[19]]) != machine
+        {
+            return Err("скачан неподходящий ELF-бинарник".into());
+        }
     }
     Ok(())
 }
+
 fn install(current: &Path, replacement: &Path, manifest: &Manifest) -> Result<(), String> {
     validate(replacement, manifest)?;
     #[cfg(unix)]
@@ -163,8 +215,33 @@ fn install(current: &Path, replacement: &Path, manifest: &Manifest) -> Result<()
         .map_err(|e| e.to_string())?
         .sync_all()
         .map_err(|e| e.to_string())?;
-    // The temporary file is on the same filesystem. A failed download or
-    // validation never touches the installed executable; rename is atomic.
+    // A failed download or validation never touches the installed executable.
+    // Unix uses atomic rename; Windows keeps a rollback copy while replacing
+    // the locked EXE and schedules deletion of the old image after exit.
+    #[cfg(windows)]
+    if fs::canonicalize(current).ok() == std::env::current_exe().and_then(fs::canonicalize).ok() {
+        // self-replace moves the locked running EXE aside and cleans it up
+        // after exit. Calls and the terminal keep running until the user exits.
+        // Retain a rollback copy: self-replace can fail after moving the locked
+        // original aside (for example, if a virus scanner blocks the new file).
+        let backup = temporary(current.parent().ok_or("нет папки EXE")?, "rollback")?;
+        fs::copy(current, &backup.0).map_err(|e| format!("резервная копия EXE: {e}"))?;
+        if let Err(error) = self_replace::self_replace(replacement) {
+            if !current.exists()
+                && let Err(restore) = fs::rename(&backup.0, current)
+            {
+                let path = backup.0.display().to_string();
+                std::mem::forget(backup);
+                return Err(format!(
+                    "замена EXE: {error}; восстановление: {restore}; копия сохранена: {path}"
+                ));
+            }
+            return Err(format!("замена EXE: {error}; исходная сборка сохранена"));
+        }
+    } else {
+        fs::rename(replacement, current).map_err(|e| format!("замена EXE: {e}"))?;
+    }
+    #[cfg(not(windows))]
     fs::rename(replacement, current).map_err(|e| format!("замена бинарника: {e}"))?;
     if let Some(parent) = current.parent() {
         let _ = fs::File::open(parent).and_then(|f| f.sync_all());
@@ -172,7 +249,7 @@ fn install(current: &Path, replacement: &Path, manifest: &Manifest) -> Result<()
     Ok(())
 }
 fn probe(path: &Path, manifest: &Manifest) -> Result<(), String> {
-    let mut process = Command::new(path)
+    let mut process = command(path)
         .arg("--build-info")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -204,6 +281,15 @@ fn probe(path: &Path, manifest: &Manifest) -> Result<(), String> {
     Ok(())
 }
 pub fn run() -> Result<Option<String>, String> {
+    // Serialize startup/F5 updates. On Windows self-replace must run only once
+    // per process because the loader's current_exe path is moved aside.
+    static UPDATED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    let mut updated = UPDATED.lock().map_err(|e| e.to_string())?;
+    if *updated {
+        return Ok(Some(
+            "бинарник уже обновлён; перезапустите клиент после звонка".into(),
+        ));
+    }
     static EXECUTABLE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let executable = if let Some(path) = EXECUTABLE.get() {
         path.clone()
@@ -217,7 +303,7 @@ pub fn run() -> Result<Option<String>, String> {
     let parent = executable.parent().ok_or("нет папки исполняемого файла")?;
     let metadata_file = temporary(&std::env::temp_dir(), "manifest")?;
     download(
-        &format!("{BASE}/remember-me.manifest.toml"),
+        &format!("{BASE}/{}.manifest.toml", binary_asset()),
         &metadata_file.0,
         16384,
     )?;
@@ -236,7 +322,11 @@ pub fn run() -> Result<Option<String>, String> {
         ));
     }
     let binary = temporary(parent, "update")?;
-    download(&format!("{BASE}/remember-me"), &binary.0, 64 * 1024 * 1024)?;
+    download(
+        &format!("{BASE}/{}", binary_asset()),
+        &binary.0,
+        64 * 1024 * 1024,
+    )?;
     validate(&binary.0, &manifest)?;
     #[cfg(unix)]
     {
@@ -253,6 +343,7 @@ pub fn run() -> Result<Option<String>, String> {
     }
     probe(&binary.0, &manifest)?;
     install(&executable, &binary.0, &manifest)?;
+    *updated = true;
     Ok(Some(format!(
         "обновлено до {} ({}); перезапустите клиент после звонка",
         manifest.version, manifest.build
@@ -263,6 +354,24 @@ pub fn run() -> Result<Option<String>, String> {
 mod tests {
     use super::*;
     #[test]
+    fn rejects_wrong_architecture_and_corrupt_pe_offsets_before_replacement() {
+        let path = std::env::temp_dir().join(format!("rm-pe-{}", std::process::id()));
+        let mut bytes = vec![0; 128];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[60..64].copy_from_slice(&64u32.to_le_bytes());
+        bytes[64..68].copy_from_slice(b"PE\0\0");
+        bytes[68..70].copy_from_slice(&0x8664u16.to_le_bytes());
+        bytes[88..90].copy_from_slice(&0x20bu16.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        assert!(validate_executable(&path, "windows", "x86_64").is_ok());
+        assert!(validate_executable(&path, "windows", "aarch64").is_err());
+        assert!(validate_executable(&path, "linux", "x86_64").is_err());
+        bytes[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        assert!(validate_executable(&path, "windows", "x86_64").is_err());
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
     fn atomic_update_preserves_old_binary_on_bad_hash_and_replaces_on_success() {
         let dir = std::env::temp_dir().join(format!("rm-update-test-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
@@ -270,14 +379,22 @@ mod tests {
         let incoming = dir.join("incoming");
         fs::write(&current, b"old running binary").unwrap();
         let mut bytes = vec![0; 128];
-        bytes[..4].copy_from_slice(b"\x7fELF");
-        bytes[4] = 2;
-        bytes[5] = 1;
-        bytes[18] = if std::env::consts::ARCH == "aarch64" {
-            183
+        if cfg!(windows) {
+            bytes[..2].copy_from_slice(b"MZ");
+            bytes[60..64].copy_from_slice(&64u32.to_le_bytes());
+            bytes[64..68].copy_from_slice(b"PE\0\0");
+            bytes[68..70].copy_from_slice(&0x8664u16.to_le_bytes());
+            bytes[88..90].copy_from_slice(&0x20bu16.to_le_bytes());
         } else {
-            62
-        };
+            bytes[..4].copy_from_slice(b"\x7fELF");
+            bytes[4] = 2;
+            bytes[5] = 1;
+            bytes[18] = if std::env::consts::ARCH == "aarch64" {
+                183
+            } else {
+                62
+            };
+        }
         fs::write(&incoming, &bytes).unwrap();
         let mut manifest = Manifest {
             version: "test".into(),
