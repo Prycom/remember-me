@@ -151,7 +151,7 @@ def main():
             levels = [amplitude(block, f) for f in (440, 660)]
             assert min(levels) > 0.025, levels
             print(f"  separate decoders/mixing: amplitudes {levels}: PASS", flush=True)
-            a.key("tгрупповое сообщение https://example.org/\r")
+            a.key("iгрупповое сообщение https://example.org/\r")
             wait(lambda: all(any("групповое сообщение" in p.read_text() and "@rm2\t0\ta\t" in p.read_text() for p in (root / who / "remember-me").glob("chat-group-*.log")) for who in "bc"), "group text missing or wrong author")
             source = root / "group file.bin"
             payload = random.Random(17).randbytes(256 * 1024 + 57)

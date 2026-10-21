@@ -9,9 +9,11 @@
 //   remember-me --server [-p порт] — ретранслятор на сервере (headless)
 //   [-p порт] [-n имя]             — переопределения настроек
 
+mod action;
 mod app;
 mod audio;
 mod chat_links;
+mod clipboard;
 mod config;
 mod group;
 mod net;
@@ -186,6 +188,7 @@ async fn run(
         )
     );
 
+    let mut ui = crate::ui::Ui::default();
     let mut res: std::io::Result<()> = Ok(());
     let frame_period = Duration::from_millis(33);
     let mut next_draw = Instant::now();
@@ -206,7 +209,13 @@ async fn run(
             }
             match crossterm::event::read() {
                 Ok(ev) => {
-                    app.on_event(ev);
+                    if let crossterm::event::Event::Mouse(mouse) = ev {
+                        if let Some(action) = ui.mouse(mouse) {
+                            app.on_action(action);
+                        }
+                    } else {
+                        app.on_event(ev);
+                    }
                     if app.quit {
                         break;
                     }
@@ -226,7 +235,7 @@ async fn run(
 
         if Instant::now() >= next_draw {
             let draw_started = Instant::now();
-            res = term.draw(|f| ui::render(&app, f)).map(|_| ());
+            res = term.draw(|f| ui::render(&app, f, &mut ui)).map(|_| ());
             if draw_started.elapsed() > Duration::from_millis(100)
                 && std::env::var("RM_DEBUG").ok().as_deref() == Some("1")
             {

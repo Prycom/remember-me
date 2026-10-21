@@ -7,6 +7,7 @@
 //   Текст поверх звонка          ↔  переписка (DM)
 //   Настройки сохраняются сразу  ↔  appSettings.set (см. config.rs)
 
+use crate::action::{Action, Focus, Overlay, Pane};
 use crate::chat_links::{Hit, OpenTarget};
 use crate::transfer::{TransferStatus, TransferUpdate};
 use std::cell::RefCell;
@@ -15,7 +16,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::Event;
 use tokio::sync::mpsc;
 
 use crate::audio::{AudioEngine, DeviceList};
@@ -107,7 +108,12 @@ pub struct App {
     /// файл истории прошлого чата (per-peer), Some только в звонке
     pub peer_file: Option<String>,
     pub input: String,
-    pub input_focus: bool,
+    pub focus: Focus,
+    pub home_sel: usize,
+    pub call_sel: usize,
+    pub host_sel: usize,
+    pub overlay: Option<Overlay>,
+    pub log: Vec<String>,
     pub chat_scroll: usize,
     pub file_input: Option<String>,
     pub chat_hits: RefCell<Vec<Hit>>,
@@ -122,10 +128,10 @@ pub struct App {
     pending: HashMap<u32, (usize, Instant)>,
     pub settings_sel: usize,
     settings_return: Screen,
+    settings_focus: Focus,
     pub dev_pick: Option<DevPick>,
     pub edit: Option<(usize, String)>,
     pub conn_input: String,
-    pub arm_hangup: bool,
     pub toast: Option<(String, Instant)>,
     pub quit: bool,
     update_result: Option<(
@@ -175,7 +181,12 @@ impl App {
             chat: Vec::new(),
             peer_file: None,
             input: String::new(),
-            input_focus: false,
+            focus: Focus::Pane(Pane::Main),
+            home_sel: 0,
+            call_sel: 0,
+            host_sel: 0,
+            overlay: None,
+            log: Vec::new(),
             chat_scroll: 0,
             file_input: None,
             chat_hits: RefCell::new(Vec::new()),
@@ -187,10 +198,10 @@ impl App {
             pending: HashMap::new(),
             settings_sel: 0,
             settings_return: Screen::Home,
+            settings_focus: Focus::Pane(Pane::Main),
             dev_pick: None,
             edit: None,
             conn_input: String::new(),
-            arm_hangup: false,
             toast: None,
             quit: false,
             update_result: None,
@@ -236,9 +247,11 @@ impl App {
         if dead {
             self.session = None;
             self.mode = None;
+            self.overlay = None;
+            self.engine.params.set_ptt_active(false);
             if self.session_screen() == Screen::Call {
                 self.set_session_screen(Screen::Home);
-                self.input_focus = false;
+                self.focus = Focus::Pane(Pane::Main);
                 self.peer = None;
                 self.group_room = None;
                 self.group_peers.clear();
@@ -418,7 +431,10 @@ impl App {
                     ));
                 }
             }
-            NetEvent::Progress(message) => self.status = message,
+            NetEvent::Progress(message) => {
+                self.status = message.clone();
+                self.push_log(message);
+            }
             NetEvent::Waiting { local_addrs } => {
                 self.hint_addrs = local_addrs;
                 if matches!(self.mode, Some(Mode::Host))
@@ -431,6 +447,7 @@ impl App {
                 self.status = "ожидаю звонок".into();
             }
             NetEvent::RoomCode(code) => {
+                self.push_log(format!("код комнаты: {code}"));
                 self.room_code = Some(code);
             }
             NetEvent::Joining { attempt, addr } => {
@@ -509,7 +526,13 @@ impl App {
                         }
                     }
                 }
+                if self.group_peers.len() != peers.len() {
+                    self.push_log(format!("участников в комнате: {}", peers.len() + 1));
+                }
                 self.group_peers = peers;
+                self.call_sel = self
+                    .call_sel
+                    .min(self.participant_count().saturating_sub(1));
             }
             NetEvent::GroupText { name, text } => self.received_text(name, text),
             NetEvent::Rtt(rtt) => {
@@ -552,6 +575,8 @@ impl App {
             }
             NetEvent::CallEnded(msg) => {
                 self.interrupt_transfers();
+                self.overlay = None;
+                self.engine.params.set_ptt_active(false);
                 self.file_input = None;
                 self.selected_link = None;
                 self.peer = None;
@@ -560,7 +585,7 @@ impl App {
                 self.incoming = None;
                 self.peer_file = None;
                 self.input.clear();
-                self.input_focus = false;
+                self.focus = Focus::Pane(Pane::Main);
                 self.chat_scroll = 0;
                 self.status = msg;
                 match self.mode {
@@ -629,7 +654,9 @@ impl App {
         self.group_peers.clear();
         self.incoming = None;
         self.peer_file = None;
-        self.input_focus = false;
+        self.focus = Focus::Pane(Pane::Main);
+        self.overlay = None;
+        self.engine.params.set_ptt_active(false);
     }
 
     // ── настройки: публичные действия ──────────────────────────────────────
@@ -736,6 +763,19 @@ impl App {
 
     // ── клавиатура ─────────────────────────────────────────────────────────
 
+    pub fn participant_count(&self) -> usize {
+        if self.group_room.is_some() {
+            self.group_peers.len() + 1
+        } else {
+            2
+        }
+    }
+    fn push_log(&mut self, message: String) {
+        if self.log.len() >= 200 {
+            self.log.remove(0);
+        }
+        self.log.push(message);
+    }
     pub fn session_screen(&self) -> Screen {
         if self.screen == Screen::Settings {
             self.settings_return
@@ -755,628 +795,626 @@ impl App {
     pub fn open_settings(&mut self) {
         if self.screen != Screen::Settings {
             self.settings_return = self.screen;
+            self.settings_focus = self.focus;
+            self.focus = Focus::Pane(Pane::Main);
             self.screen = Screen::Settings;
             self.engine.params.set_ptt_active(false);
-            self.arm_hangup = false;
         }
     }
 
     pub fn on_event(&mut self, ev: Event) {
-        if let Event::Key(k) = &ev
-            && k.code == KeyCode::F(5)
-            && k.kind == KeyEventKind::Press
-        {
-            self.start_update(true);
+        if let Event::Paste(text) = ev {
+            self.on_action(Action::Paste(text));
             return;
         }
-        if let Event::Paste(text) = &ev {
-            if let Some(path) = &mut self.file_input {
-                path.push_str(text.trim_end_matches(['\r', '\n']));
-            } else if let Some((_, buf)) = &mut self.edit {
-                if buf.len() + text.len() <= 4096 {
-                    buf.push_str(text);
-                }
-            } else if self.screen == Screen::Call && self.input_focus {
-                if self.input.len() + text.len() <= crate::proto::TEXT_MAX {
-                    self.input.push_str(text);
-                }
-            } else if self.screen == Screen::Connect {
-                self.conn_input.push_str(text.trim());
+        if let Event::Key(k) = ev {
+            if let Some(a) = crate::ui::keymap::action_for(&k, self) {
+                self.on_action(a);
             }
+        }
+    }
+
+    fn home_item(i: usize) -> Action {
+        match i {
+            0 => Action::Host,
+            1 => Action::Connect,
+            2 => Action::OpenSettings,
+            _ => Action::Quit,
+        }
+    }
+
+    fn run_home_item(&mut self) {
+        self.home_sel = self.home_sel.min(3);
+        self.on_action(App::home_item(self.home_sel));
+    }
+
+    pub fn on_action(&mut self, a: Action) {
+        if a == Action::Ptt(false) {
+            self.engine.params.set_ptt_active(false);
+            return;
+        }
+        if a == Action::Quit {
+            self.quit = true;
             return;
         }
         if self.file_input.is_some() {
-            if let Event::Key(k) = ev {
-                if k.kind == KeyEventKind::Release {
-                    return;
+            match a {
+                Action::Confirm => {
+                    let path = self.file_input.take().unwrap();
+                    self.send_file(&path);
                 }
-                match k.code {
-                    KeyCode::Esc => self.file_input = None,
-                    KeyCode::Enter => {
-                        let path = self.file_input.take().unwrap();
-                        self.send_file(&path);
-                    }
-                    KeyCode::Backspace => {
-                        self.file_input.as_mut().unwrap().pop();
-                    }
-                    KeyCode::Char(c)
-                        if !k
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        let path = self.file_input.as_mut().unwrap();
-                        if path.len() < 4096 {
-                            push_text_key(path, c, k.modifiers);
-                        }
-                    }
-                    _ => {}
+                Action::Cancel => {
+                    self.file_input = None;
                 }
+                Action::Insert(c) => {
+                    let path = self.file_input.as_mut().unwrap();
+                    if path.len() + c.len_utf8() <= 4096 {
+                        path.push(c);
+                    }
+                }
+                Action::Backspace => {
+                    self.file_input.as_mut().unwrap().pop();
+                }
+                Action::Paste(text) => {
+                    let text = text.trim_end_matches(['\r', '\n']);
+                    let path = self.file_input.as_mut().unwrap();
+                    if path.len() + text.len() <= 4096 {
+                        path.push_str(text);
+                    }
+                }
+                _ => {}
             }
             return;
         }
-        if self.screen == Screen::Call {
-            if let Event::Mouse(mouse) = &ev {
-                match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let index = self
-                            .chat_hits
-                            .borrow()
-                            .iter()
-                            .find(|hit| hit.area.contains((mouse.column, mouse.row).into()))
-                            .map(|hit| hit.index);
-                        if let Some(index) = index {
-                            self.open_link(index);
-                        }
+        if let Action::Copy(text) = a {
+            self.copy_text(text);
+            return;
+        }
+        if let Some(overlay) = self.overlay {
+            match a {
+                Action::Cancel | Action::Help => self.overlay = None,
+                Action::Confirm => {
+                    self.overlay = None;
+                    if overlay == Overlay::HangUp {
+                        self.perform_hangup();
                     }
-                    MouseEventKind::ScrollUp => self.scroll_chat(true),
-                    MouseEventKind::ScrollDown => self.scroll_chat(false),
-                    _ => {}
                 }
+                _ => {}
+            }
+            return;
+        }
+        match a {
+            Action::Update => {
+                self.start_update(true);
                 return;
             }
-            if let Event::Key(k) = &ev
-                && k.kind == KeyEventKind::Press
-            {
-                if k.code == KeyCode::F(3) {
-                    self.file_input = Some(String::new());
-                    self.selected_link = None;
-                    self.engine.params.set_ptt_active(false);
-                    return;
-                }
-                if k.code == KeyCode::F(4) {
-                    if let Some(file) = self
-                        .chat
-                        .iter()
-                        .rev()
-                        .filter_map(|line| line.attachment.as_ref())
-                        .find(|file| file.active())
-                        && let Some(session) = &self.session
-                    {
-                        session.send(NetCmd::CancelFile(file.id));
-                    }
-                    return;
-                }
-                if !self.input_focus {
-                    if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
-                        let count = self.chat_targets.borrow().len();
-                        if count > 0 {
-                            let reverse = k.code == KeyCode::BackTab
-                                || k.modifiers.contains(KeyModifiers::SHIFT);
-                            self.selected_link = Some(match self.selected_link {
-                                Some(i) => {
-                                    if reverse {
-                                        (i + count - 1) % count
-                                    } else {
-                                        (i + 1) % count
-                                    }
-                                }
-                                None => self.chat_hits.borrow().first().map_or(0, |h| h.index),
-                            });
-                        }
-                        return;
-                    }
-                    if k.code == KeyCode::Enter
-                        && let Some(index) = self.selected_link
-                    {
-                        self.open_link(index);
-                        return;
-                    }
-                }
-            }
-        }
-
-        if let Event::Key(k) = &ev {
-            if k.code == KeyCode::F(2) && k.kind == KeyEventKind::Press {
+            Action::OpenSettings => {
                 self.open_settings();
                 return;
             }
+            Action::Help => {
+                self.engine.params.set_ptt_active(false);
+                self.overlay = Some(Overlay::Help);
+                return;
+            }
+            _ => {}
         }
-        match self.screen {
-            Screen::Home => self.keys_home(ev),
-            Screen::Connect => self.keys_connect(ev),
-            Screen::HostWait => self.keys_hostwait(ev),
-            Screen::Incoming => self.keys_incoming(ev),
-            Screen::Call => self.keys_call(ev),
-            Screen::Settings => self.keys_settings(ev),
+        if self.edit.is_some() {
+            self.settings_action(a);
+            return;
+        }
+        if self.dev_pick.is_some() {
+            self.settings_action(a);
+            return;
+        }
+        match a {
+            Action::Insert(c) => self.insert_char(c),
+            Action::Backspace => self.backspace_char(),
+            Action::Paste(s) => self.paste_text(s),
+            _ => match self.screen {
+                Screen::Home => self.home_action(a),
+                Screen::Connect => self.connect_action(a),
+                Screen::HostWait => self.hostwait_action(a),
+                Screen::Incoming => self.incoming_action(a),
+                Screen::Call => self.call_action(a),
+                Screen::Settings => self.settings_action(a),
+            },
         }
     }
 
-    fn keys_home(&mut self, ev: Event) {
-        if let Event::Key(k) = ev {
-            if k.kind != KeyEventKind::Press {
-                return;
-            }
-            match (k.code, k.modifiers.contains(KeyModifiers::CONTROL)) {
-                (KeyCode::Char('c'), true) => self.quit = true,
-                (KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('х'), _) => {
-                    self.start_host()
-                }
-                (KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('с'), _) => {
-                    self.conn_input.clear();
-                    self.screen = Screen::Connect;
-                }
-                (KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('ы'), _) => {
-                    self.open_settings();
-                }
-                (KeyCode::Char('q') | KeyCode::Char('й'), _) => self.quit = true,
-                _ => {}
-            }
-        }
-    }
-
-    fn keys_connect(&mut self, ev: Event) {
-        if let Event::Key(k) = ev {
-            if k.kind == KeyEventKind::Release
-                || (k.kind == KeyEventKind::Repeat
-                    && !matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace))
-            {
-                return;
-            }
-            match k.code {
-                KeyCode::Esc => {
-                    self.screen = Screen::Home;
-                }
-                KeyCode::Enter => {
-                    let t = self.conn_input.trim().to_string();
-                    if t.contains(':') && t.len() > 3 {
-                        let target = t.clone();
-                        self.conn_input = t;
-                        self.start_connect(target);
-                    } else {
-                        self.set_toast("адрес в форме ip:port".into());
-                    }
-                }
-                KeyCode::Backspace => {
-                    self.conn_input.pop();
-                }
-                KeyCode::Char(c) => {
-                    if k.modifiers.contains(KeyModifiers::CONTROL) {
-                        if c == 'c' {
-                            self.quit = true;
-                        }
-                        return;
-                    }
-                    push_text_key(&mut self.conn_input, c, k.modifiers);
-                }
-                _ => {}
+    fn insert_char(&mut self, c: char) {
+        if self.screen == Screen::Connect {
+            self.conn_input.push(c);
+        } else if self.screen == Screen::Call && self.focus == Focus::Input {
+            if self.input.len() + c.len_utf8() <= crate::proto::TEXT_MAX {
+                self.input.push(c);
             }
         }
     }
 
-    fn keys_hostwait(&mut self, ev: Event) {
-        if let Event::Key(k) = ev {
-            if k.kind != KeyEventKind::Press {
-                return;
-            }
-            match (k.code, k.modifiers.contains(KeyModifiers::CONTROL)) {
-                (KeyCode::Esc, _) | (KeyCode::Char('q') | KeyCode::Char('й'), _) => {
-                    self.stop_session();
-                    self.screen = Screen::Home;
-                    self.status = "меню".into();
-                }
-                (KeyCode::Char('c'), true) => self.quit = true,
-                _ => {}
+    fn backspace_char(&mut self) {
+        if self.screen == Screen::Connect {
+            self.conn_input.pop();
+        } else if self.screen == Screen::Call && self.focus == Focus::Input {
+            self.input.pop();
+        }
+    }
+
+    fn paste_text(&mut self, s: String) {
+        if self.screen == Screen::Connect {
+            self.conn_input.push_str(&s);
+        } else if self.screen == Screen::Call && self.focus == Focus::Input {
+            if self.input.len() + s.len() <= crate::proto::TEXT_MAX {
+                self.input.push_str(&s);
             }
         }
     }
 
-    fn keys_incoming(&mut self, ev: Event) {
-        if let Event::Key(k) = ev {
-            if k.kind != KeyEventKind::Press {
-                return;
+    fn home_action(&mut self, a: Action) {
+        match a {
+            Action::Up => self.home_sel = self.home_sel.saturating_sub(1),
+            Action::Down => self.home_sel = (self.home_sel + 1).min(3),
+            Action::Confirm => self.run_home_item(),
+            Action::Host => self.start_host(),
+            Action::Connect => {
+                self.conn_input.clear();
+                self.screen = Screen::Connect;
+                self.focus = Focus::Input;
             }
-            match (k.code, k.modifiers.contains(KeyModifiers::CONTROL)) {
-                (KeyCode::Enter, _) => {
-                    if let Some(s) = self.session.as_mut() {
-                        s.send(NetCmd::AcceptCall);
-                    }
-                    self.screen = Screen::Call;
-                    self.status = "принимаю…".into();
-                }
-                (KeyCode::Esc, _) => {
-                    if let Some(s) = self.session.as_mut() {
-                        s.send(NetCmd::DeclineCall);
-                    }
-                    self.screen = Screen::HostWait;
-                    self.status = "звонок отклонён".into();
-                }
-                (KeyCode::Char('c'), true) => self.quit = true,
-                _ => {}
+            Action::Click(Pane::Side, i) => {
+                self.home_sel = i.min(3);
+                self.run_home_item();
             }
+            Action::Scroll(pane, d) => {
+                self.focus = Focus::Pane(pane);
+                if pane == Pane::Side {
+                    self.home_sel = (self.home_sel as i16 + d.signum()).clamp(0, 3) as usize;
+                }
+            }
+            _ => {}
         }
     }
 
-    fn keys_call(&mut self, ev: Event) {
-        if let Event::Key(k) = ev {
-            // PTT: спейсику интересны и press, и release
-            if k.code == KeyCode::Char(' ') && !self.input_focus {
-                if self.engine.params.vox_mode() {
-                    return; // VOX — спейс не влияет
+    fn connect_action(&mut self, a: Action) {
+        match a {
+            Action::Confirm => {
+                let t = self.conn_input.trim().to_string();
+                if t.contains(':') && t.len() > 3 {
+                    self.conn_input = t.clone();
+                    self.start_connect(t);
+                } else {
+                    self.set_toast("адрес в форме ip:port".into());
                 }
-                match k.kind {
-                    KeyEventKind::Press | KeyEventKind::Repeat => {
-                        self.engine.params.set_ptt_active(true);
-                    }
-                    KeyEventKind::Release => {
-                        self.engine.params.set_ptt_active(false);
-                    }
-                }
-                return;
             }
-            if k.kind == KeyEventKind::Release
-                || (k.kind == KeyEventKind::Repeat
-                    && !(self.input_focus
-                        && matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace)))
-            {
-                return;
+            Action::Cancel => {
+                self.screen = Screen::Home;
+                self.focus = Focus::Pane(Pane::Side);
             }
+            _ => {}
+        }
+    }
 
-            if self.input_focus {
-                match k.code {
-                    KeyCode::Enter => {
-                        self.send_chat();
-                        // после отправки возвращаем управление голосу (Discord
-                        // вернул бы фокус через Esc — здесь всегда)
-                        self.input_focus = false;
-                    }
-                    KeyCode::Esc => self.input_focus = false,
-                    KeyCode::Backspace => {
-                        self.input.pop();
-                    }
-                    KeyCode::Char(c) => {
-                        if k.modifiers.contains(KeyModifiers::CONTROL) {
-                            if c == 'c' {
-                                self.quit = true;
+    fn hostwait_action(&mut self, a: Action) {
+        match a {
+            Action::Up => self.host_sel = self.host_sel.saturating_sub(1),
+            Action::Down => {
+                let n = self.copy_targets().len();
+                if n > 0 {
+                    self.host_sel = (self.host_sel + 1).min(n - 1);
+                }
+            }
+            Action::Confirm => {
+                let targets = self.copy_targets();
+                if let Some((_, text)) =
+                    targets.get(self.host_sel.min(targets.len().saturating_sub(1)))
+                {
+                    self.copy_text(text.clone());
+                }
+            }
+            Action::Cancel => {
+                self.stop_session();
+                self.screen = Screen::Home;
+                self.focus = Focus::Pane(Pane::Side);
+                self.status = "меню".into();
+            }
+            _ => {}
+        }
+    }
+
+    /// Строки экрана ожидания: (что видно, что копируется).
+    pub fn copy_targets(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .hint_addrs
+            .iter()
+            .map(|a| {
+                let ip = a.rsplit_once(' ').map(|(_, t)| t).unwrap_or(a);
+                (a.clone(), ip.to_string())
+            })
+            .collect();
+        if let Some(code) = &self.room_code {
+            out.push((format!("код комнаты: {code}"), code.clone()));
+            let target = format!("{code}@{}", self.cfg.server_addr);
+            out.push((target.clone(), target));
+        }
+        out
+    }
+
+    fn copy_text(&mut self, text: String) {
+        match crate::clipboard::copy(&text) {
+            Ok(()) => self.set_toast(format!("скопировано: {text}")),
+            Err(e) => self.set_toast(format!("буфер обмена: {e}")),
+        }
+    }
+
+    fn incoming_action(&mut self, a: Action) {
+        match a {
+            Action::Accept => {
+                if let Some(s) = self.session.as_mut() {
+                    s.send(NetCmd::AcceptCall);
+                }
+                self.screen = Screen::Call;
+                self.status = "принимаю…".into();
+            }
+            Action::Decline => {
+                if let Some(s) = self.session.as_mut() {
+                    s.send(NetCmd::DeclineCall);
+                }
+                self.screen = Screen::HostWait;
+                self.status = "звонок отклонён".into();
+            }
+            _ => {}
+        }
+    }
+
+    fn call_action(&mut self, a: Action) {
+        match a {
+            Action::ToggleMute => {
+                let v = !self.engine.params.mute_mic();
+                self.engine.params.set_mute_mic(v);
+                self.cfg_save_state();
+            }
+            Action::ToggleDeaf => {
+                let v = !self.engine.params.deaf();
+                self.engine.params.set_deaf(v);
+                self.cfg_save_state();
+            }
+            Action::ToggleAutoGain => {
+                let v = !self.engine.params.auto_gain();
+                self.engine.params.set_auto_gain(v);
+                self.cfg_save_state();
+            }
+            Action::ToggleEcho => self.toggle_echo(),
+            Action::GainPeer(d) => {
+                let v = (self.engine.params.gain_peer() as i16 + d).clamp(0, 200) as u8;
+                self.engine.params.set_gain_peer(v);
+                self.cfg_save_state();
+            }
+            Action::GainMic(d) => {
+                let v = (self.engine.params.gain_in() as i16 + d).clamp(0, 200) as u8;
+                self.engine.params.set_gain_in(v);
+                self.cfg_save_state();
+            }
+            Action::DeviceCycle { input } => self.cycle_device(input, false),
+            Action::SendFile => {
+                self.engine.params.set_ptt_active(false);
+                self.file_input = Some(String::new());
+                self.selected_link = None;
+            }
+            Action::CancelFile => {
+                if let Some(file) = self
+                    .chat
+                    .iter()
+                    .rev()
+                    .filter_map(|l| l.attachment.as_ref())
+                    .find(|f| f.active())
+                    && let Some(session) = &self.session
+                {
+                    session.send(NetCmd::CancelFile(file.id));
+                }
+            }
+            Action::OpenLink(index) => self.open_link(index),
+            Action::NextLink(reverse) => {
+                let count = self.chat_targets.borrow().len();
+                if count > 0 {
+                    self.focus = Focus::Pane(Pane::Main);
+                    self.selected_link = Some(match self.selected_link {
+                        Some(i) => {
+                            if reverse {
+                                (i + count - 1) % count
+                            } else {
+                                (i + 1) % count
                             }
-                            return;
                         }
-                        push_text_key(&mut self.input, c, k.modifiers);
-                    }
-                    _ => {}
+                        None => self
+                            .chat_hits
+                            .borrow()
+                            .iter()
+                            .min_by_key(|h| (h.area.y, h.area.x))
+                            .map_or(0, |h| h.index),
+                    });
                 }
-                return;
             }
-
-            let vox = self.engine.params.vox_mode();
-            match (k.code, k.modifiers.contains(KeyModifiers::CONTROL)) {
-                (KeyCode::Char('m') | KeyCode::Char('ь'), _) => {
-                    let v = !self.engine.params.mute_mic();
-                    self.engine.params.set_mute_mic(v);
-                    self.cfg_save_state();
+            Action::HangUp => {
+                self.engine.params.set_ptt_active(false);
+                self.overlay = Some(Overlay::HangUp);
+            }
+            Action::Confirm => {
+                if self.focus == Focus::Input {
+                    self.send_chat();
+                    self.focus = Focus::Pane(Pane::Main);
+                } else if let Some(index) = self.selected_link {
+                    self.open_link(index);
                 }
-                (KeyCode::Char('d') | KeyCode::Char('в'), _) => {
-                    let v = !self.engine.params.deaf();
-                    self.engine.params.set_deaf(v);
-                    self.cfg_save_state();
+            }
+            Action::Cancel => {
+                if self.focus == Focus::Input {
+                    self.focus = Focus::Pane(Pane::Main);
                 }
-                (KeyCode::Char('s') | KeyCode::Char('ы'), _) => self.open_settings(),
-                (KeyCode::Char('t') | KeyCode::Char('е'), _) => {
-                    self.engine.params.set_ptt_active(false);
-                    self.input_focus = true;
-                    self.selected_link = None;
-                    self.chat_scroll = 0;
+            }
+            Action::FocusInput => {
+                self.engine.params.set_ptt_active(false);
+                self.focus = Focus::Input;
+                self.selected_link = None;
+                self.chat_scroll = 0;
+            }
+            Action::NextPane => {
+                self.selected_link = None;
+                self.engine.params.set_ptt_active(false);
+                self.focus = match self.focus {
+                    Focus::Pane(Pane::Side) => Focus::Pane(Pane::Main),
+                    _ => Focus::Pane(Pane::Side),
+                };
+            }
+            Action::Up => {
+                if self.focus == Focus::Pane(Pane::Side) {
+                    self.call_sel = self.call_sel.saturating_sub(1);
                 }
-                (KeyCode::Char('a') | KeyCode::Char('ф'), _) => {
-                    let enabled = !self.engine.params.auto_gain();
-                    self.engine.params.set_auto_gain(enabled);
-                    self.cfg_save_state();
+            }
+            Action::Down => {
+                if self.focus == Focus::Pane(Pane::Side) {
+                    self.call_sel =
+                        (self.call_sel + 1).min(self.participant_count().saturating_sub(1));
                 }
-                (KeyCode::Up, _) => {
-                    let v = self.engine.params.gain_peer().saturating_add(5).min(200);
-                    self.engine.params.set_gain_peer(v);
-                    self.cfg_save_state();
-                }
-                (KeyCode::Down, _) => {
-                    let v = self.engine.params.gain_peer().saturating_sub(5);
-                    self.engine.params.set_gain_peer(v);
-                    self.cfg_save_state();
-                }
-                (KeyCode::Char('[') | KeyCode::Char('х'), _) => {
-                    let v = self.engine.params.gain_in().saturating_sub(5);
-                    self.engine.params.set_gain_in(v);
-                    self.cfg_save_state();
-                }
-                (KeyCode::Char(']') | KeyCode::Char('ъ'), _) => {
-                    let v = self.engine.params.gain_in().saturating_add(5).min(200);
-                    self.engine.params.set_gain_in(v);
-                    self.cfg_save_state();
-                }
-                (KeyCode::Char('u') | KeyCode::Char('г'), _) => self.arm_hangup = true,
-                // смена устройств на лету: I/O (рус. ш/щ), Shift — назад
-                (KeyCode::Char('o') | KeyCode::Char('щ'), false) => {
-                    self.cycle_device(false, false)
-                }
-                (KeyCode::Char('O') | KeyCode::Char('Щ'), _) => self.cycle_device(false, true),
-                (KeyCode::Char('i') | KeyCode::Char('ш'), false) => self.cycle_device(true, false),
-                (KeyCode::Char('I') | KeyCode::Char('Ш'), _) => self.cycle_device(true, true),
-                (KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('н'), _) => {
-                    if self.arm_hangup {
-                        self.arm_hangup = false;
-                        if !vox {
-                            self.engine.params.set_ptt_active(false);
+            }
+            Action::PageUp => self.scroll_chat(true),
+            Action::PageDown => self.scroll_chat(false),
+            Action::Click(Pane::Side, i) => {
+                self.call_sel = i.min(self.participant_count().saturating_sub(1));
+                self.focus = Focus::Pane(Pane::Side);
+            }
+            Action::Click(Pane::Main, _) => self.focus = Focus::Pane(Pane::Main),
+            Action::Scroll(pane, d) => {
+                self.focus = Focus::Pane(pane);
+                match pane {
+                    Pane::Main => {
+                        if d >= 0 {
+                            self.chat_scroll = self.chat_scroll.saturating_sub(d as usize);
+                        } else {
+                            self.chat_scroll =
+                                self.chat_scroll.saturating_add(d.unsigned_abs() as usize);
                         }
-                        if let Some(s) = self.session.as_mut() {
-                            s.send(NetCmd::HangUp {
-                                reason: REASON_HANGUP,
-                            });
-                        }
-                        self.status = "завершаю звонок…".into();
+                    }
+                    Pane::Side => {
+                        self.call_sel = (self.call_sel as i16 + d.signum())
+                            .clamp(0, self.participant_count().saturating_sub(1) as i16)
+                            as usize;
                     }
                 }
-                (KeyCode::Esc, _) => self.arm_hangup = false,
-                (KeyCode::PageUp, _) => self.scroll_chat(true),
-                (KeyCode::PageDown, _) => self.scroll_chat(false),
-                (KeyCode::Char('c'), true) => self.quit = true,
-                _ => {}
             }
+            Action::Ptt(v) => self.engine.params.set_ptt_active(v),
+            _ => {}
         }
     }
 
-    fn keys_settings(&mut self, ev: Event) {
-        if let Event::Key(k) = ev {
-            if k.kind == KeyEventKind::Release
-                || (k.kind == KeyEventKind::Repeat
-                    && !matches!(
-                        k.code,
-                        KeyCode::Backspace
-                            | KeyCode::Up
-                            | KeyCode::Down
-                            | KeyCode::Left
-                            | KeyCode::Right
-                    )
-                    && !(self.edit.is_some() && matches!(k.code, KeyCode::Char(_))))
-            {
-                return;
-            }
+    fn perform_hangup(&mut self) {
+        self.engine.params.set_ptt_active(false);
+        if let Some(s) = self.session.as_mut() {
+            s.send(NetCmd::HangUp {
+                reason: REASON_HANGUP,
+            });
+        }
+        self.status = "завершаю звонок…".into();
+    }
 
-            // редактирование строки
-            if let Some((row, buf)) = self.edit.as_mut() {
-                match k.code {
-                    KeyCode::Enter | KeyCode::Esc => {
-                        let row = *row;
-                        let buf = std::mem::take(buf);
-                        self.edit = None;
-                        if row == ROW_NAME {
-                            if !buf.trim().is_empty() {
-                                self.cfg.name = buf.trim().to_string();
-                            }
-                        } else if row == ROW_PORT {
-                            if let Ok(p) = buf.trim().parse::<u16>() {
-                                if p > 0 {
-                                    self.cfg.port = p;
-                                }
-                            }
-                        } else if row == ROW_DOWNLOAD {
-                            self.cfg.download_dir = buf.trim().to_owned();
-                            if let Some(session) = &self.session {
-                                session
-                                    .send(NetCmd::DownloadDirectory(self.cfg.download_directory()));
-                            }
-                        } else if row == ROW_SERVER {
-                            let v = buf.trim().to_string();
-                            // пусто = прямой режим; иначе ip:порт или host:порт
-                            self.cfg.server_addr = v;
-                        }
-                        self.save_all();
-                    }
-                    KeyCode::Backspace => {
+    fn settings_action(&mut self, a: Action) {
+        if self.edit.is_some() {
+            match a {
+                Action::Backspace => {
+                    if let Some((_, buf)) = self.edit.as_mut() {
                         buf.pop();
                     }
-                    KeyCode::Char(c) => {
-                        if k.modifiers.contains(KeyModifiers::CONTROL) {
-                            if c == 'c' {
-                                self.quit = true;
-                                return;
-                            }
-                        }
-                        if buf.len() < if *row == ROW_DOWNLOAD { 4096 } else { 64 } {
-                            push_text_key(buf, c, k.modifiers);
-                        }
-                    }
-                    _ => {}
                 }
-                return;
+                Action::Insert(c) => {
+                    if let Some((row, buf)) = self.edit.as_mut()
+                        && buf.len() + c.len_utf8() <= if *row == ROW_DOWNLOAD { 4096 } else { 64 }
+                    {
+                        buf.push(c);
+                    }
+                }
+                Action::Paste(s) => {
+                    if let Some((row, buf)) = self.edit.as_mut()
+                        && buf.len() + s.len() <= if *row == ROW_DOWNLOAD { 4096 } else { 64 }
+                    {
+                        buf.push_str(&s);
+                    }
+                }
+                Action::Confirm => self.commit_edit(),
+                _ => {}
             }
+            return;
+        }
+        if self.dev_pick.is_some() {
+            match a {
+                Action::Up => {
+                    if let Some(pick) = self.dev_pick.as_mut() {
+                        pick.idx = pick.idx.saturating_sub(1);
+                    }
+                }
+                Action::Down => {
+                    let len = if self.dev_pick.as_ref().unwrap().input {
+                        self.devices.inputs.len()
+                    } else {
+                        self.devices.outputs.len()
+                    };
+                    if let Some(pick) = self.dev_pick.as_mut() {
+                        pick.idx = (pick.idx + 1).min(len);
+                    }
+                }
+                Action::Confirm => self.commit_dev_pick(),
+                Action::Click(Pane::Side, index) => {
+                    if let Some(pick) = self.dev_pick.as_mut() {
+                        pick.idx = index;
+                    }
+                    self.commit_dev_pick();
+                }
+                Action::Cancel => self.dev_pick = None,
+                _ => {}
+            }
+            return;
+        }
+        match a {
+            Action::Up => self.settings_sel = self.settings_sel.saturating_sub(1),
+            Action::Click(Pane::Side, index) => {
+                self.settings_sel = index.min(SETTINGS_ROWS - 1);
+                self.settings_toggle();
+            }
+            Action::Scroll(_, delta) => {
+                self.settings_sel = (self.settings_sel as i16 + delta)
+                    .clamp(0, (SETTINGS_ROWS - 1) as i16)
+                    as usize;
+            }
+            Action::Down => self.settings_sel = (self.settings_sel + 1).min(SETTINGS_ROWS - 1),
+            Action::Left => self.settings_adjust(-5),
+            Action::Right => self.settings_adjust(5),
+            Action::Confirm => self.settings_toggle(),
+            Action::Cancel => {
+                self.screen = self.settings_return;
+                self.focus = self.settings_focus;
+            }
+            Action::ToggleEcho => self.toggle_echo(),
+            _ => {}
+        }
+    }
 
-            // выбор устройства
-            if let Some(pick) = self.dev_pick.as_mut() {
-                let len = if pick.input {
-                    self.devices.inputs.len()
-                } else {
-                    self.devices.outputs.len()
+    fn commit_edit(&mut self) {
+        let Some((row, buf)) = self.edit.take() else {
+            return;
+        };
+        let buf = buf.trim().to_string();
+        match row {
+            ROW_NAME => {
+                if !buf.is_empty() {
+                    self.cfg.name = buf;
+                }
+            }
+            ROW_PORT => {
+                if let Ok(p) = buf.parse::<u16>()
+                    && p > 0
+                {
+                    self.cfg.port = p;
+                }
+            }
+            ROW_SERVER => self.cfg.server_addr = buf,
+            ROW_DOWNLOAD => {
+                self.cfg.download_dir = buf;
+                if let Some(session) = &self.session {
+                    session.send(NetCmd::DownloadDirectory(self.cfg.download_directory()));
+                }
+            }
+            _ => {}
+        }
+        self.save_all();
+    }
+
+    fn commit_dev_pick(&mut self) {
+        let Some(pick) = self.dev_pick.take() else {
+            return;
+        };
+        let dev = if pick.idx == 0 {
+            String::new()
+        } else if pick.input {
+            self.devices.inputs[pick.idx - 1].clone()
+        } else {
+            self.devices.outputs[pick.idx - 1].clone()
+        };
+        let (ci, co) = self.engine.current_devices();
+        if pick.input {
+            self.apply_devices(&dev, &co);
+        } else {
+            self.apply_devices(&ci, &dev);
+        }
+        self.devices = crate::audio::list_devices();
+    }
+
+    fn settings_adjust(&mut self, d: i16) {
+        let p = self.engine.params.clone();
+        match self.settings_sel {
+            ROW_GAIN_IN => p.set_gain_in((p.gain_in() as i16 + d).clamp(0, 200) as u8),
+            ROW_GAIN_PEER => p.set_gain_peer((p.gain_peer() as i16 + d).clamp(0, 200) as u8),
+            ROW_VAD => p.set_vad_threshold((p.vad_threshold() as i16 + d).clamp(0, 100) as u8),
+            _ => return,
+        }
+        self.cfg_save_state();
+    }
+
+    fn settings_toggle(&mut self) {
+        match self.settings_sel {
+            ROW_NAME | ROW_PORT | ROW_SERVER | ROW_DOWNLOAD => {
+                let val = match self.settings_sel {
+                    ROW_NAME => self.cfg.name.clone(),
+                    ROW_PORT => self.cfg.port.to_string(),
+                    ROW_DOWNLOAD => self.cfg.download_directory().display().to_string(),
+                    _ => self.cfg.server_addr.clone(),
                 };
-                match k.code {
-                    KeyCode::Up => pick.idx = pick.idx.saturating_sub(1),
-                    KeyCode::Down => pick.idx = (pick.idx + 1).min(len), // + «(по умолчанию)»
-                    KeyCode::Enter => {
-                        let (input, idx) = (pick.input, pick.idx);
-                        self.dev_pick = None;
-                        let dev = if idx == 0 {
-                            String::new()
-                        } else if input {
-                            self.devices.inputs[idx - 1].clone()
-                        } else {
-                            self.devices.outputs[idx - 1].clone()
-                        };
-                        let (ci, co) = self.engine.current_devices();
-                        if input {
-                            self.apply_devices(&dev, &co);
-                        } else {
-                            self.apply_devices(&ci, &dev);
-                        }
-                        self.devices = crate::audio::list_devices();
-                    }
-                    KeyCode::Esc => self.dev_pick = None,
-                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.quit = true
-                    }
-                    _ => {}
-                }
-                return;
+                self.edit = Some((self.settings_sel, val));
             }
-
-            // навигация и правка
-            let sel = self.settings_sel;
-            match (k.code, k.modifiers.contains(KeyModifiers::CONTROL)) {
-                (KeyCode::Up, _) => self.settings_sel = sel.saturating_sub(1),
-                (KeyCode::Down, _) => {
-                    self.settings_sel = (sel + 1).min(SETTINGS_ROWS.saturating_sub(1))
-                }
-                (KeyCode::Esc, _) => {
-                    self.screen = self.settings_return;
-                }
-                (KeyCode::Char('l') | KeyCode::Char('д'), _) => self.toggle_echo(),
-                (KeyCode::Char('c'), true) => self.quit = true,
-                _ => {}
+            ROW_GAIN_IN | ROW_GAIN_PEER | ROW_VAD => {}
+            ROW_MIC_MODE => {
+                let vox = !self.engine.params.vox_mode();
+                self.engine.params.set_vox_mode(vox);
+                self.cfg.mic_mode = if vox { MicMode::Vox } else { MicMode::Ptt };
+                self.cfg_save_state();
             }
-            match sel {
-                ROW_NAME | ROW_PORT | ROW_SERVER | ROW_DOWNLOAD => {
-                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                        let val = match sel {
-                            ROW_NAME => self.cfg.name.clone(),
-                            ROW_PORT => self.cfg.port.to_string(),
-                            ROW_DOWNLOAD => self.cfg.download_directory().display().to_string(),
-                            _ => self.cfg.server_addr.clone(),
-                        };
-                        self.edit = Some((sel, val));
-                    }
-                }
-                ROW_GAIN_IN => match k.code {
-                    KeyCode::Left => {
-                        self.engine
-                            .params
-                            .set_gain_in(self.engine.params.gain_in().saturating_sub(5));
-                        self.cfg_save_state();
-                    }
-                    KeyCode::Right => {
-                        self.engine
-                            .params
-                            .set_gain_in(self.engine.params.gain_in().saturating_add(5).min(200));
-                        self.cfg_save_state();
-                    }
-                    _ => {}
-                },
-                ROW_GAIN_PEER => match k.code {
-                    KeyCode::Left => {
-                        self.engine
-                            .params
-                            .set_gain_peer(self.engine.params.gain_peer().saturating_sub(5));
-                        self.cfg_save_state();
-                    }
-                    KeyCode::Right => {
-                        self.engine.params.set_gain_peer(
-                            self.engine.params.gain_peer().saturating_add(5).min(200),
-                        );
-                        self.cfg_save_state();
-                    }
-                    _ => {}
-                },
-                ROW_MIC_MODE => {
-                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                        let vox = !self.engine.params.vox_mode();
-                        self.engine.params.set_vox_mode(vox);
-                        self.cfg.mic_mode = if vox { MicMode::Vox } else { MicMode::Ptt };
-                        self.cfg_save_state();
-                    }
-                }
-                ROW_VAD => match k.code {
-                    KeyCode::Left => {
-                        self.engine.params.set_vad_threshold(
-                            self.engine.params.vad_threshold().saturating_sub(5),
-                        );
-                        self.cfg_save_state();
-                    }
-                    KeyCode::Right => {
-                        self.engine.params.set_vad_threshold(
-                            self.engine
-                                .params
-                                .vad_threshold()
-                                .saturating_add(5)
-                                .min(100),
-                        );
-                        self.cfg_save_state();
-                    }
-                    _ => {}
-                },
-                ROW_GATE => {
-                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                        self.engine.params.set_noise_gate(!self.noise_gate_on());
-                        self.cfg_save_state();
-                    }
-                }
-                ROW_IN_DEV => {
-                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                        self.dev_pick = Some(DevPick {
-                            input: true,
-                            idx: 0,
-                        });
-                    }
-                }
-                ROW_OUT_DEV => {
-                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                        self.dev_pick = Some(DevPick {
-                            input: false,
-                            idx: 0,
-                        });
-                    }
-                }
-                ROW_ECHO => {
-                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                        self.toggle_echo();
-                    }
-                }
-                ROW_FILTER => {
-                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                        self.engine
-                            .params
-                            .set_voice_filter(!self.engine.params.voice_filter());
-                        self.cfg_save_state();
-                    }
-                }
-                ROW_DENOISE => {
-                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                        self.engine
-                            .params
-                            .set_noise_suppression(!self.engine.params.noise_suppression());
-                        self.cfg_save_state();
-                    }
-                }
-                ROW_AUTO_UPDATE => {
-                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                        self.cfg.auto_update = !self.cfg.auto_update;
-                        self.cfg.save();
-                    }
-                }
-                ROW_AUTO_GAIN => {
-                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                        self.engine
-                            .params
-                            .set_auto_gain(!self.engine.params.auto_gain());
-                        self.cfg_save_state();
-                    }
-                }
-                _ => {}
+            ROW_GATE => {
+                self.engine.params.set_noise_gate(!self.noise_gate_on());
+                self.cfg_save_state();
             }
+            ROW_IN_DEV => {
+                self.dev_pick = Some(DevPick {
+                    input: true,
+                    idx: 0,
+                })
+            }
+            ROW_OUT_DEV => {
+                self.dev_pick = Some(DevPick {
+                    input: false,
+                    idx: 0,
+                })
+            }
+            ROW_ECHO => self.toggle_echo(),
+            ROW_FILTER => {
+                self.engine
+                    .params
+                    .set_voice_filter(!self.engine.params.voice_filter());
+                self.cfg_save_state();
+            }
+            ROW_DENOISE => {
+                self.engine
+                    .params
+                    .set_noise_suppression(!self.engine.params.noise_suppression());
+                self.cfg_save_state();
+            }
+            ROW_AUTO_UPDATE => {
+                self.cfg.auto_update = !self.cfg.auto_update;
+                self.cfg.save();
+            }
+            ROW_AUTO_GAIN => {
+                self.engine
+                    .params
+                    .set_auto_gain(!self.engine.params.auto_gain());
+                self.cfg_save_state();
+            }
+            _ => {}
         }
     }
 
@@ -1422,16 +1460,6 @@ impl App {
             if t.elapsed() > Duration::from_secs(4) {
                 self.toast = None;
             }
-        }
-    }
-}
-
-fn push_text_key(buffer: &mut String, c: char, modifiers: KeyModifiers) {
-    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) {
-        if modifiers.contains(KeyModifiers::SHIFT) && c.is_lowercase() {
-            buffer.extend(c.to_uppercase());
-        } else {
-            buffer.push(c);
         }
     }
 }
@@ -1624,7 +1652,7 @@ mod tests {
     fn file_prompt_preserves_chat_draft_and_bracketed_paste() {
         let mut app = App::for_test(Config::default());
         app.screen = Screen::Call;
-        app.input_focus = true;
+        app.focus = Focus::Input;
         app.input = "черновик".into();
         key(
             &mut app,
@@ -1645,9 +1673,9 @@ mod tests {
         );
         assert!(app.file_input.is_none());
         assert_eq!(app.input, "черновик");
-        assert!(app.input_focus);
+        assert_eq!(app.focus, Focus::Input);
     }
-    use crossterm::event::KeyEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) {
         app.on_event(Event::Key(KeyEvent::new_with_kind(code, modifiers, kind)));
@@ -1679,7 +1707,7 @@ mod tests {
     fn chat_accepts_shift_unicode_and_repeat_but_ignores_release() {
         let mut app = App::for_test(Config::default());
         app.screen = Screen::Call;
-        app.input_focus = true;
+        app.focus = Focus::Input;
         for c in ['a', 'ж'] {
             key(
                 &mut app,
@@ -1748,7 +1776,7 @@ mod tests {
         app.screen = Screen::Call;
         app.mode = Some(Mode::Joiner);
         app.input = "Черновик: Привет!".into();
-        app.input_focus = true;
+        app.focus = Focus::Input;
         key(
             &mut app,
             KeyCode::F(2),
@@ -1764,7 +1792,7 @@ mod tests {
             KeyEventKind::Press,
         );
         assert_eq!(app.screen, Screen::Call);
-        assert!(app.input_focus);
+        assert_eq!(app.focus, Focus::Input);
         assert_eq!(app.input, "Черновик: Привет!");
         app.open_settings();
         app.handle_net(NetEvent::CallEnded("Друг вышел".into()));

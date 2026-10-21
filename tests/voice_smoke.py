@@ -377,7 +377,7 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
                                      True, "fading phrase, silence, new quiet phrase", allow_pauses=True))
         # Exercise the actual crossterm parser with Kitty shifted characters
         # and Alacritty-style repeat events, rather than only typed Rust keys.
-        host.key("t")
+        host.key("i")
         host.key("\x1b[97:65;2u\x1b[59:58;2u\x1b[1078:1046;2u123")
         host.key("\x1b[127;1:2u" * 3)
         host.key("\r")
@@ -391,10 +391,10 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
         # Open a real chat link by SGR mouse and by keyboard. The opener is a
         # private test stub: no browser or external network is launched.
         url = "https://example.org/voice?a=1&b=2"
-        host.key("t\x1b[200~" + url + "\x1b[201~\r")
+        host.key("i\x1b[200~" + url + "\x1b[201~\r")
         time.sleep(0.3)
-        joiner.key("\x1b[<0;10;8M\x1b[<0;10;8m")
-        host.key("\t\r")
+        joiner.key("\x1b[<0;60;4M\x1b[<0;60;4m")
+        host.key("l\r")
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             opened = root / "opened.log"
@@ -402,7 +402,7 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
                 break
             time.sleep(0.05)
         assert opened.read_text().splitlines() == [url, url], "mouse/keyboard link opener lost URL arguments"
-        print("  chat links: mouse + Tab/Enter open exact browser URL: PASS", flush=True)
+        print("  chat links: mouse + L/Enter open exact browser URL: PASS", flush=True)
         # Change the receiver directory live; then transfer in both directions
         # while audio is active. Existing names must be preserved.
         custom = root / "chosen downloads"
@@ -438,7 +438,7 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
             assert proxy.file_lost == 2, "file packet loss was not exercised"
         print("  files: bidirectional + live folder + SHA-256 + collisions + history: PASS", flush=True)
 
-        host.key("tDraft:")
+        host.key("iDraft:")
         host.key("\x1bOQ")  # F2, even while composing a message
         time.sleep(0.2)
         host.key("\x1b[B" * 5 + "\x1b[D")  # VOX threshold 25 -> 20

@@ -1216,6 +1216,36 @@ pub fn start(
 mod tests {
     use super::*;
 
+    #[test]
+    fn ptt_release_and_modals_always_stop_capture() {
+        use crate::{
+            action::{Action, Focus, Pane},
+            app::{App, Screen},
+            config::Config,
+        };
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        for modal in [Action::Help, Action::HangUp] {
+            let mut app = App::for_test(Config::default());
+            app.screen = Screen::Call;
+            app.focus = Focus::Pane(Pane::Main);
+            app.engine.params.set_vox_mode(false);
+            app.on_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+            )));
+            assert!(app.engine.params.ptt_active.load(Ordering::Relaxed));
+            app.on_action(modal);
+            assert!(!app.engine.params.ptt_active.load(Ordering::Relaxed));
+            app.on_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )));
+            app.on_action(Action::Cancel);
+            assert!(!app.engine.params.ptt_active.load(Ordering::Relaxed));
+        }
+    }
+
     #[tokio::test]
     async fn voice_routing_does_not_need_ui_polling_and_bounds_old_audio() {
         let (engine, rx) = AudioEngine::for_test();
