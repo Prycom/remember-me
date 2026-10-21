@@ -89,7 +89,8 @@ pub const ROW_AUTO_UPDATE: usize = 15;
 pub const ROW_AVATAR: usize = 16;
 pub const ROW_AVATAR_STYLE: usize = 17;
 pub const ROW_AVATAR_CLEAR: usize = 18;
-pub const SETTINGS_ROWS: usize = 19;
+pub const ROW_AVATAR_RESOLUTION: usize = 19;
+pub const SETTINGS_ROWS: usize = 20;
 
 const PENDING_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DIAL_MAX_TXT: &str = "60";
@@ -97,7 +98,11 @@ pub const DIAL_MAX_TXT: &str = "60";
 pub struct App {
     pub cfg: Config,
     pub avatar: Arc<crate::avatar::Avatar>,
-    avatar_load: Option<std::sync::mpsc::Receiver<Result<(crate::avatar::Avatar, String), String>>>,
+    avatar_load: Option<
+        std::sync::mpsc::Receiver<
+            Result<(crate::avatar::Avatar, crate::avatar::Avatar, String), String>,
+        >,
+    >,
     pub engine: Arc<AudioEngine>,
     pub devices: DeviceList,
     pub mode: Option<Mode>,
@@ -169,7 +174,10 @@ impl App {
         )
     }
 
-    fn with_devices(cfg: Config, engine: Arc<AudioEngine>, devices: DeviceList) -> App {
+    fn with_devices(mut cfg: Config, engine: Arc<AudioEngine>, devices: DeviceList) -> App {
+        if !crate::avatar::RESOLUTIONS.contains(&cfg.avatar_resolution) {
+            cfg.avatar_resolution = 32;
+        }
         let avatar = crate::avatar::display(cfg.avatar.as_ref(), &cfg.name);
         App {
             cfg,
@@ -225,7 +233,9 @@ impl App {
         {
             self.avatar_load = None;
             match result {
-                Ok((avatar, path)) => {
+                Ok((avatar, original, path)) => {
+                    self.cfg.avatar_resolution = avatar.side() as u16;
+                    self.cfg.avatar_original = Some(original);
                     self.cfg.avatar = Some(avatar);
                     self.cfg.avatar_file = path;
                     self.apply_avatar();
@@ -1442,6 +1452,10 @@ impl App {
     }
 
     fn settings_adjust(&mut self, d: i16) {
+        if self.settings_sel == ROW_AVATAR_RESOLUTION {
+            self.adjust_avatar_resolution(d.signum());
+            return;
+        }
         let p = self.engine.params.clone();
         match self.settings_sel {
             ROW_GAIN_IN => p.set_gain_in((p.gain_in() as i16 + d).clamp(0, 200) as u8),
@@ -1501,6 +1515,7 @@ impl App {
                 self.cfg_save_state();
             }
             ROW_AVATAR_STYLE => self.cycle_avatars(),
+            ROW_AVATAR_RESOLUTION => self.adjust_avatar_resolution(1),
             ROW_AVATAR_CLEAR => {
                 self.load_avatar("");
             }
@@ -1529,6 +1544,7 @@ impl App {
     fn load_avatar(&mut self, path: &str) {
         if path.trim().is_empty() {
             self.cfg.avatar = None;
+            self.cfg.avatar_original = None;
             self.cfg.avatar_file.clear();
             self.avatar_load = None;
             self.apply_avatar();
@@ -1541,12 +1557,56 @@ impl App {
         self.engine.params.set_ptt_active(false);
         let path = crate::config::expand_path(path);
         let source = path.display().to_string();
+        let resolution = self.cfg.avatar_resolution;
         let (tx, rx) = std::sync::mpsc::channel();
         self.avatar_load = Some(rx);
         std::thread::spawn(move || {
-            let _ = tx.send(crate::avatar::Avatar::load(&path).map(|avatar| (avatar, source)));
+            let result = crate::avatar::Avatar::load_at(&path, crate::avatar::MAX_SIDE as u16)
+                .map(|original| (original.resized(resolution), original, source));
+            let _ = tx.send(result);
         });
         self.set_toast("готовим аватарку… голос продолжает работать".into());
+    }
+    fn adjust_avatar_resolution(&mut self, direction: i16) {
+        if self.avatar_load.is_some() {
+            self.set_toast("аватарка ещё обрабатывается".into());
+            return;
+        }
+        let sizes = crate::avatar::RESOLUTIONS;
+        let index = sizes
+            .iter()
+            .position(|&n| n == self.cfg.avatar_resolution)
+            .unwrap_or(1);
+        let resolution = sizes[(index as i16 + direction).rem_euclid(sizes.len() as i16) as usize];
+        if self.cfg.avatar.is_none() {
+            self.cfg.avatar_resolution = resolution;
+            self.cfg.save();
+            return;
+        }
+        let cached = self
+            .cfg
+            .avatar_original
+            .as_ref()
+            .filter(|a| a.valid())
+            .cloned();
+        let source = self.cfg.avatar_file.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.avatar_load = Some(rx);
+        std::thread::spawn(move || {
+            let original = cached.map(Ok).unwrap_or_else(|| {
+                crate::avatar::Avatar::load_at(
+                    &crate::config::expand_path(&source),
+                    crate::avatar::MAX_SIDE as u16,
+                )
+                .map_err(|_| {
+                    "для старой аватарки выберите картинку заново: исходный файл не найден"
+                        .to_string()
+                })
+            });
+            let _ =
+                tx.send(original.map(|original| (original.resized(resolution), original, source)));
+        });
+        self.set_toast(format!("готовим аватарку {resolution}×{resolution}…"));
     }
     fn apply_avatar(&mut self) {
         self.avatar = crate::avatar::display(self.cfg.avatar.as_ref(), &self.cfg.name);
@@ -1905,6 +1965,34 @@ mod tests {
             );
         }
         assert_eq!(app.edit.as_ref().unwrap().1, "Имя");
+    }
+
+    #[test]
+    fn avatar_detail_changes_live_from_cached_source_and_preserves_call_draft() {
+        let original = crate::avatar::Avatar::identicon("source").resized(128);
+        let cfg = Config {
+            avatar: Some(original.resized(32)),
+            avatar_original: Some(original),
+            avatar_file: "/removed/image.png".into(),
+            ..Default::default()
+        };
+        let mut app = App::for_test(cfg);
+        app.screen = Screen::Call;
+        app.input = "черновик".into();
+        app.open_settings();
+        app.settings_sel = ROW_AVATAR_RESOLUTION;
+        app.settings_adjust(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.avatar_load.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.avatar_load.is_none());
+        assert_eq!(app.cfg.avatar_resolution, 48);
+        assert_eq!(app.avatar.side(), 48);
+        assert_eq!(app.cfg.avatar_original.as_ref().unwrap().side(), 128);
+        assert_eq!(app.session_screen(), Screen::Call);
+        assert_eq!(app.input, "черновик");
     }
 
     #[test]

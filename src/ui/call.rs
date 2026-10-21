@@ -110,7 +110,10 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
     }
     let selected = app.call_sel.min(cards.len() - 1);
     let portrait_height = if inner.height >= 28 && inner.width >= 32 {
-        18
+        ((cards[selected].avatar.side() as u16 / 2 + 2)
+            .min(inner.width / 2 + 2)
+            .min(inner.height.saturating_sub((cards.len().min(3) * 3) as u16)))
+        .max(18)
     } else {
         0
     };
@@ -290,7 +293,11 @@ pub(super) fn render_profile(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) 
             false,
         )
     };
-    let area = super::centered_rect(body, 48, 24);
+    // Use available terminal cells for actual detail, instead of stretching a 32px thumbnail.
+    let side = (avatar.side() as u16)
+        .min(body.width.saturating_sub(4))
+        .min(body.height.saturating_sub(7).saturating_mul(2));
+    let area = super::centered_rect(body, (side + 4).max(48), (side / 2 + 7).max(24));
     f.render_widget(ratatui::widgets::Clear, area);
     let block = Block::bordered()
         .title(format!(

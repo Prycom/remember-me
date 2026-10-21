@@ -126,6 +126,7 @@ def main():
             proxy.impair_profiles = True
             avatar = root / "avatar.png"
             avatar_helpers.picture(avatar)
+            avatar_helpers.resolution(a, root, 'a', 128)
             avatar_helpers.choose(a, root, 'a', avatar)
             b.wait_log('avatar received from a revision=2')
             avatar.unlink()
@@ -135,10 +136,13 @@ def main():
                 client.wait_log("roster: 2 remote members")
             c.wait_log('avatar received from a revision=2')
             assert proxy.avatar_lost == 1 and proxy.avatar_ack_lost == 1
-            avatar_helpers.clear(a)
+            avatar_helpers.resolution(a, root, 'a', 64)
             for client in (b, c):
                 client.wait_log('avatar received from a revision=3')
-            print('  group avatar: packet/ACK loss, late join after source removal, live reset: PASS', flush=True)
+            avatar_helpers.clear(a)
+            for client in (b, c):
+                client.wait_log('avatar received from a revision=4')
+            print('  group 128px avatar: chunk/ACK loss, late join, cached resize, live reset: PASS', flush=True)
             time.sleep(0.5)
             ui_stalls(root, names, a)
             if options.ui_stall_only:

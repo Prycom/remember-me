@@ -16,7 +16,11 @@ use std::{
 
 pub const SIDE: usize = 32;
 pub const COLORS: usize = 32;
-pub const WIRE_BYTES: usize = COLORS * 3 + SIDE * SIDE;
+pub const RESOLUTIONS: [u16; 6] = [16, 32, 48, 64, 96, 128];
+pub const MAX_SIDE: usize = 128;
+pub const MAX_BYTES: usize = COLORS * 3 + MAX_SIDE * MAX_SIDE;
+pub const CHUNK_BYTES: usize = 1024;
+pub const MAX_CHUNKS: usize = MAX_BYTES.div_ceil(CHUNK_BYTES);
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Avatar {
@@ -25,7 +29,7 @@ pub struct Avatar {
 }
 impl std::fmt::Debug for Avatar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Avatar(32×32)")
+        write!(f, "Avatar({0}×{0})", self.side())
     }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,9 +40,16 @@ pub enum AvatarStyle {
 }
 
 impl Avatar {
+    pub fn side(&self) -> usize {
+        RESOLUTIONS
+            .into_iter()
+            .map(usize::from)
+            .find(|n| n * n == self.pixels.len())
+            .unwrap_or(0)
+    }
     pub fn valid(&self) -> bool {
         self.palette.len() == COLORS
-            && self.pixels.len() == SIDE * SIDE
+            && self.side() != 0
             && self.pixels.iter().all(|p| (*p as usize) < COLORS)
     }
     pub fn encode(&self) -> Vec<u8> {
@@ -50,7 +61,10 @@ impl Avatar {
             .collect()
     }
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != WIRE_BYTES {
+        if !RESOLUTIONS
+            .iter()
+            .any(|&n| bytes.len() == COLORS * 3 + n as usize * n as usize)
+        {
             return None;
         }
         let value = Self {
@@ -62,7 +76,14 @@ impl Avatar {
         };
         value.valid().then_some(value)
     }
+    #[cfg(test)]
     pub fn load(path: &Path) -> Result<Self, String> {
+        Self::load_at(path, SIDE as u16)
+    }
+    pub fn load_at(path: &Path, resolution: u16) -> Result<Self, String> {
+        if !RESOLUTIONS.contains(&resolution) {
+            return Err("размер аватарки: 16, 32, 48, 64, 96 или 128".into());
+        }
         let metadata = std::fs::metadata(path).map_err(|e| format!("картинка: {e}"))?;
         if !metadata.is_file() {
             return Err("нужен обычный файл PNG/JPEG/WebP/GIF".into());
@@ -107,12 +128,36 @@ impl Avatar {
                 side,
             )
             .resize_exact(
-                SIDE as u32,
-                SIDE as u32,
+                resolution as u32,
+                resolution as u32,
                 image::imageops::FilterType::Lanczos3,
             )
             .into_rgba8();
         Ok(Self::quantize(square.as_raw()))
+    }
+    /// Rebuild from the cached 128px source; never repeatedly resize the thumbnail.
+    pub fn resized(&self, resolution: u16) -> Self {
+        assert!(self.valid() && RESOLUTIONS.contains(&resolution));
+        if self.side() == resolution as usize {
+            return self.clone();
+        }
+        let rgba = self
+            .pixels
+            .iter()
+            .flat_map(|&i| {
+                let [r, g, b] = self.palette[i as usize];
+                [r, g, b, if i == 0 { 0 } else { 255 }]
+            })
+            .collect();
+        let image =
+            image::RgbaImage::from_raw(self.side() as u32, self.side() as u32, rgba).unwrap();
+        let scaled = image::imageops::resize(
+            &image,
+            resolution as u32,
+            resolution as u32,
+            image::imageops::FilterType::Lanczos3,
+        );
+        Self::quantize(scaled.as_raw())
     }
     fn quantize(rgba: &[u8]) -> Self {
         let colors = rgba
@@ -194,17 +239,18 @@ impl Avatar {
         Self { palette, pixels }
     }
     fn color(&self, x: usize, y: usize) -> Option<[u8; 3]> {
-        let radius = 6i32;
+        let side = self.side();
+        let radius = (side * 6 / 32) as i32;
         let dx = (radius - x as i32)
-            .max(x as i32 - (SIDE as i32 - radius - 1))
+            .max(x as i32 - (side as i32 - radius - 1))
             .max(0);
         let dy = (radius - y as i32)
-            .max(y as i32 - (SIDE as i32 - radius - 1))
+            .max(y as i32 - (side as i32 - radius - 1))
             .max(0);
         if dx * dx + dy * dy > radius * radius {
             return None;
         }
-        let index = self.pixels[y * SIDE + x];
+        let index = self.pixels[y * side + x];
         (index != 0).then(|| self.palette[index as usize])
     }
 }
@@ -240,7 +286,7 @@ impl Widget for Portrait<'_> {
         let width = area
             .width
             .min(area.height.saturating_mul(2))
-            .min(SIDE as u16)
+            .min(self.avatar.side() as u16)
             / 2
             * 2;
         if width == 0 {
@@ -252,12 +298,12 @@ impl Widget for Portrait<'_> {
         for y in 0..height {
             for x in 0..width {
                 let upper = self.avatar.color(
-                    x as usize * SIDE / width as usize,
-                    y as usize * 2 * SIDE / (height as usize * 2),
+                    x as usize * self.avatar.side() / width as usize,
+                    y as usize * 2 * self.avatar.side() / (height as usize * 2),
                 );
                 let lower = self.avatar.color(
-                    x as usize * SIDE / width as usize,
-                    (y as usize * 2 + 1) * SIDE / (height as usize * 2),
+                    x as usize * self.avatar.side() / width as usize,
+                    (y as usize * 2 + 1) * self.avatar.side() / (height as usize * 2),
                 );
                 let cell = &mut buffer[(left + x, top + y)];
                 if self.mode == AvatarStyle::Ascii {
@@ -309,6 +355,7 @@ pub struct Delivery {
     acked: bool,
     tries: u8,
     sent: Option<Instant>,
+    chunk: usize,
 }
 impl Delivery {
     pub fn due(&mut self, revision: u64, now: Instant) -> bool {
@@ -336,19 +383,109 @@ impl Delivery {
         }
     }
 }
+/// A single bounded revision per peer. Partial retries preserve received chunks;
+/// a newer revision replaces the assembly, including after avatar reset.
+#[derive(Default)]
+pub struct Assembly {
+    revision: u64,
+    chunks: Vec<Option<Vec<u8>>>,
+}
+impl Assembly {
+    pub fn push(
+        &mut self,
+        revision: u64,
+        index: u8,
+        count: u8,
+        bytes: Vec<u8>,
+    ) -> Option<Arc<Avatar>> {
+        let (index, count) = (index as usize, count as usize);
+        if revision == 0
+            || count == 0
+            || count > MAX_CHUNKS
+            || index >= count
+            || bytes.is_empty()
+            || bytes.len() > CHUNK_BYTES
+            || (index + 1 < count && bytes.len() != CHUNK_BYTES)
+        {
+            return None;
+        }
+        if revision < self.revision {
+            return None;
+        }
+        if revision > self.revision {
+            self.revision = revision;
+            self.chunks = vec![None; count];
+        }
+        if self.chunks.len() != count {
+            return None;
+        }
+        self.chunks[index] = Some(bytes);
+        if self.chunks.iter().any(Option::is_none) {
+            return None;
+        }
+        let bytes = self
+            .chunks
+            .iter()
+            .flat_map(|c| c.as_ref().unwrap().iter().copied())
+            .collect::<Vec<_>>();
+        Avatar::decode(&bytes).map(Arc::new)
+    }
+}
+
 pub struct Profile {
     pub revision: u64,
     pub avatar: Option<Arc<Avatar>>,
+    bytes: Vec<u8>,
 }
 impl Profile {
     pub fn new(avatar: Option<&Avatar>) -> Self {
+        let avatar = avatar.filter(|a| a.valid()).cloned().map(Arc::new);
+        let bytes = avatar.as_ref().map_or_else(Vec::new, |a| a.encode());
         Self {
             revision: 1,
-            avatar: avatar.filter(|a| a.valid()).cloned().map(Arc::new),
+            avatar,
+            bytes,
         }
+    }
+    /// At most one small packet per maintenance tick; cached bytes avoid image
+    /// work in the voice loop. One ACK covers the completed image revision.
+    pub fn next(&self, delivery: &mut Delivery, now: Instant) -> Option<crate::proto::Packet> {
+        if delivery.revision != self.revision {
+            *delivery = Delivery {
+                revision: self.revision,
+                ..Default::default()
+            };
+        }
+        if delivery.acked {
+            return None;
+        }
+        let count = self.bytes.len().div_ceil(CHUNK_BYTES);
+        if self.bytes.len() <= COLORS * 3 + SIDE * SIDE {
+            return delivery
+                .due(self.revision, now)
+                .then(|| crate::proto::Packet::Avatar {
+                    revision: self.revision,
+                    avatar: self.avatar.clone(),
+                });
+        }
+        if delivery.chunk == 0 && !delivery.due(self.revision, now) {
+            return None;
+        }
+        let index = delivery.chunk;
+        let bytes = self.bytes
+            [index * CHUNK_BYTES..((index + 1) * CHUNK_BYTES).min(self.bytes.len())]
+            .to_vec();
+        delivery.chunk = (index + 1) % count;
+        Some(crate::proto::Packet::AvatarChunk {
+            revision: self.revision,
+            index: index as u8,
+            count: count as u8,
+            bytes,
+        })
     }
     pub fn set(&mut self, avatar: Option<Arc<Avatar>>) {
         self.revision = self.revision.wrapping_add(1).max(1);
+        self.bytes = avatar.as_ref().map_or_else(Vec::new, |a| a.encode());
         self.avatar = avatar;
     }
 }
@@ -454,6 +591,136 @@ mod tests {
                         .iter()
                         .any(|c| matches!(c.fg, Color::Rgb(..)))
                 );
+            }
+        }
+    }
+    #[test]
+    fn detail_preserves_fine_source_pixels_and_old_configs_still_load() {
+        let path =
+            std::env::temp_dir().join(format!("remember-me-detail-{}.png", std::process::id()));
+        let source = image::RgbaImage::from_fn(128, 128, |x, _| {
+            if x % 2 == 0 {
+                image::Rgba([240, 20, 20, 255])
+            } else {
+                image::Rgba([20, 20, 240, 255])
+            }
+        });
+        source.save(&path).unwrap();
+        let master = Avatar::load_at(&path, 128).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_ne!(master.color(64, 64), master.color(65, 64));
+        let small = master.resized(32);
+        // Increasing detail uses the cached source, not the already blurred 32px image.
+        assert_ne!(small.resized(128), master);
+        for size in RESOLUTIONS {
+            let avatar = master.resized(size);
+            assert_eq!(avatar.side(), size as usize);
+            assert_eq!(Avatar::decode(&avatar.encode()), Some(avatar.clone()));
+            let cfg = crate::config::Config {
+                avatar: Some(avatar.clone()),
+                avatar_original: Some(master.clone()),
+                avatar_resolution: size,
+                ..Default::default()
+            };
+            let restored: crate::config::Config =
+                toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(restored.avatar, Some(avatar));
+            assert_eq!(restored.avatar_original, Some(master.clone()));
+            assert_eq!(restored.avatar_resolution, size);
+        }
+        let old: crate::config::Config = toml::from_str("name='old'\n").unwrap();
+        assert_eq!(old.avatar_resolution, 32);
+        assert!(old.avatar_original.is_none());
+        assert!(Avatar::decode(&vec![0; MAX_BYTES + 1]).is_none());
+        assert!(Avatar::load_at(Path::new("unused"), 256).is_err());
+    }
+    #[test]
+    fn chunk_sync_survives_data_and_ack_loss_and_stays_within_vpn_mtu() {
+        use crate::proto::{Cipher, Packet};
+        for size in RESOLUTIONS {
+            let image = Avatar::identicon("high detail").resized(size);
+            let profile = Profile::new(Some(&image));
+            let mut delivery = Delivery::default();
+            let mut assembly = Assembly::default();
+            let mut tx = Cipher::new(&[5; 32], &[7; 32], true);
+            let rx = Cipher::new(&[5; 32], &[7; 32], false);
+            let (mut control, mut audio) = (0, 0);
+            let start = Instant::now();
+            let (mut lost_data, mut completions) = (false, 0);
+            for tick in 0..250 {
+                let now = start + Duration::from_millis(tick * 25);
+                let Some(packet) = profile.next(&mut delivery, now) else {
+                    continue;
+                };
+                let wire = Packet::encrypt_wire(&mut tx, &packet);
+                assert!(wire.len() + 17 + 28 <= 1280);
+                if !lost_data
+                    && matches!(
+                        &packet,
+                        Packet::AvatarChunk { index: 1, .. } | Packet::Avatar { .. }
+                    )
+                {
+                    lost_data = true;
+                    continue;
+                }
+                match Packet::decrypt_wire(&rx, &wire, &mut control, &mut audio).unwrap() {
+                    Packet::AvatarChunk {
+                        revision,
+                        index,
+                        count,
+                        bytes,
+                    } => {
+                        if let Some(received) = assembly.push(revision, index, count, bytes) {
+                            assert_eq!(*received, image);
+                            completions += 1;
+                        }
+                    }
+                    Packet::Avatar {
+                        avatar: Some(received),
+                        ..
+                    } => {
+                        assert_eq!(*received, image);
+                        completions += 1;
+                    }
+                    _ => panic!("unexpected packet"),
+                }
+                // Lose the first complete-revision ACK too.
+                if completions >= 2 {
+                    delivery.ack(profile.revision);
+                    break;
+                }
+            }
+            assert!(lost_data && completions >= 2, "{size}px");
+            assert!(
+                profile
+                    .next(&mut delivery, start + Duration::from_secs(20))
+                    .is_none()
+            );
+        }
+    }
+    #[test]
+    fn partial_assembly_is_bounded_and_newer_revision_discards_older_chunks() {
+        let image = Avatar::identicon("chunks").resized(128);
+        let data = image.encode();
+        let chunks = data.chunks(CHUNK_BYTES).map(Vec::from).collect::<Vec<_>>();
+        let count = chunks.len() as u8;
+        let mut assembly = Assembly::default();
+        assert!(assembly.push(1, 0, 255, vec![0; CHUNK_BYTES]).is_none());
+        assert!(assembly.chunks.is_empty());
+        assert!(
+            assembly
+                .push(1, 0, count, vec![0; CHUNK_BYTES + 1])
+                .is_none()
+        );
+        assert!(assembly.push(1, 0, count, chunks[0].clone()).is_none());
+        assert!(assembly.push(2, 1, count, chunks[1].clone()).is_none());
+        assert!(assembly.push(1, 0, count, chunks[0].clone()).is_none());
+        for index in (0..chunks.len()).rev().filter(|&i| i != 1) {
+            let result = assembly.push(2, index as u8, count, chunks[index].clone());
+            if index == 0 {
+                assert_eq!(result, Some(Arc::new(image.clone())));
+            } else {
+                assert!(result.is_none());
             }
         }
     }

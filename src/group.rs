@@ -33,6 +33,7 @@ struct Peer {
     identity: wire::Identity,
     avatar_delivery: crate::avatar::Delivery,
     avatar_received: u64,
+    avatar_assembly: crate::avatar::Assembly,
     cipher: Cipher,
     control: u64,
     sequence: u32,
@@ -195,7 +196,7 @@ async fn session(
                         if peers.contains_key(&identity.id){continue}
                         let shared=secret.diffie_hellman(&PublicKey::from(identity.key)).to_bytes();if shared==[0;32]{continue}
                         let salt=prefixes(&own,&identity,epoch,code);let id=identity.id;
-                        peers.insert(id,Peer{status:Participant{id,name:identity.name.clone(),rtt:None,mute:false,deaf:false,speaking:false,level:0,known:false,avatar:crate::avatar::display(None,&identity.name)},avatar_delivery:Default::default(),avatar_received:0,cipher:Cipher::new(&shared,&salt,own_id<id),identity,control:0,sequence:0,decoder:Decoder::new()?,audio:VecDeque::new(),buffering:true,last_audio:Instant::now()-Duration::from_secs(10),last_authenticated:Instant::now()-Duration::from_secs(10),files:transfer::spawn_routed(download_dir.clone(),id,files_tx.clone()),seen_text:VecDeque::new(),pings:VecDeque::new()});
+                        peers.insert(id,Peer{status:Participant{id,name:identity.name.clone(),rtt:None,mute:false,deaf:false,speaking:false,level:0,known:false,avatar:crate::avatar::display(None,&identity.name)},avatar_delivery:Default::default(),avatar_received:0,avatar_assembly:Default::default(),cipher:Cipher::new(&shared,&salt,own_id<id),identity,control:0,sequence:0,decoder:Decoder::new()?,audio:VecDeque::new(),buffering:true,last_audio:Instant::now()-Duration::from_secs(10),last_authenticated:Instant::now()-Duration::from_secs(10),files:transfer::spawn_routed(download_dir.clone(),id,files_tx.clone()),seen_text:VecDeque::new(),pings:VecDeque::new()});
                     }
                     roster_version=Some((epoch,revision,own.generation));
                     if !entered{entered=true;let _=events.send(NetEvent::GroupEntered{room:String::from_utf8_lossy(&code).into_owned(),server:target.clone()});trace("joined room");}
@@ -213,6 +214,14 @@ async fn session(
                             peer.last_audio=Instant::now();peer.status.speaking=true;
                         }
                         Packet::Avatar{revision,avatar}=>{send(&socket,server,own_id,peer,Packet::AvatarAck{revision}).await;if revision>peer.avatar_received{peer.avatar_received=revision;peer.status.avatar=avatar.unwrap_or_else(||crate::avatar::display(None,&peer.identity.name));trace(&format!("avatar received from {} revision={revision}",peer.identity.name));}}
+                        Packet::AvatarChunk{revision,index,count,bytes}=>{
+                            if revision<=peer.avatar_received {send(&socket,server,own_id,peer,Packet::AvatarAck{revision}).await;}
+                            else if let Some(avatar)=peer.avatar_assembly.push(revision,index,count,bytes){
+                                peer.avatar_received=revision;peer.status.avatar=avatar;
+                                send(&socket,server,own_id,peer,Packet::AvatarAck{revision}).await;
+                                trace(&format!("avatar received from {} revision={revision}",peer.identity.name));
+                            }
+                        }
                         Packet::AvatarAck{revision}=>peer.avatar_delivery.ack(revision),
                         Packet::Ping{msg_id,ts_ms}=>send(&socket,server,own_id,peer,Packet::Pong{msg_id,ts_ms}).await,
                         Packet::Pong{msg_id,..}=>{if let Some(index)=peer.pings.iter().position(|(id,_)|*id==msg_id){let (_,sent)=peer.pings.remove(index).unwrap();peer.status.rtt=Some(sent.elapsed().as_millis().min(u16::MAX as u128) as u16);}}
@@ -251,7 +260,7 @@ async fn session(
                     if !p.buffering&&p.audio.len()>=FRAME_SAMPLES {for sample in &mut mixed{*sample+=p.audio.pop_front().unwrap();}}else{p.buffering=true;}
                 }
                 engine.push_out(&mixed);
-                for p in peers.values_mut(){if p.avatar_delivery.due(profile.revision,now){send(&socket,server,own_id,p,Packet::Avatar{revision:profile.revision,avatar:profile.avatar.clone()}).await;}}
+                for p in peers.values_mut(){if let Some(packet)=profile.next(&mut p.avatar_delivery,now){send(&socket,server,own_id,p,packet).await;}}
                 if last_status.elapsed()>=Duration::from_secs(1){last_status=now;for p in peers.values_mut(){send(&socket,server,own_id,p,Packet::Status{mute_mic:engine.params.mute_mic(),deaf:engine.params.deaf(),lvl:engine.params.in_level()}).await;}}
                 if last_ping.elapsed()>=Duration::from_secs(2){last_ping=now;ping_id+=1;for p in peers.values_mut(){p.pings.push_back((ping_id,now));while p.pings.len()>8{p.pings.pop_front();}send(&socket,server,own_id,p,Packet::Ping{msg_id:ping_id,ts_ms:0}).await;}}
                 for message in &mut pending{if message.sent.elapsed()>Duration::from_millis(1500){message.tries+=1;message.sent=now;for id in &message.waiting{if let Some(p)=peers.get_mut(id){send(&socket,server,own_id,p,Packet::Text{msg_id:message.id,text:message.text.clone()}).await;}}}}

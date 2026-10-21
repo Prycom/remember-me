@@ -33,6 +33,7 @@ pub const OP_STATUS: u8 = 10; // mute_mic / deafen (для отображени�
 pub const OP_FILE: u8 = 12;
 pub const OP_AVATAR: u8 = 13;
 pub const OP_AVATAR_ACK: u8 = 14;
+pub const OP_AVATAR_CHUNK: u8 = 15;
 pub const OP_BYE: u8 = 11;
 pub use remember_me::server::OP_RELAY_REG;
 
@@ -97,6 +98,12 @@ pub enum Packet {
         revision: u64,
         avatar: Option<std::sync::Arc<crate::avatar::Avatar>>,
     },
+    AvatarChunk {
+        revision: u64,
+        index: u8,
+        count: u8,
+        bytes: Vec<u8>,
+    },
     AvatarAck {
         revision: u64,
     },
@@ -133,9 +140,17 @@ pub fn classify(b: &[u8]) -> WireClass {
     match b.first().copied() {
         Some(OP_HELLO) | Some(OP_INCOMING) | Some(OP_ACCEPT) | Some(OP_DECLINE)
         | Some(OP_RELAY_REG) => WireClass::Open,
-        Some(OP_PING) | Some(OP_PONG) | Some(OP_AUDIO) | Some(OP_TEXT) | Some(OP_ACK)
-        | Some(OP_STATUS) | Some(OP_BYE) | Some(OP_FILE) | Some(OP_AVATAR)
-        | Some(OP_AVATAR_ACK) => WireClass::Secure,
+        Some(OP_PING)
+        | Some(OP_PONG)
+        | Some(OP_AUDIO)
+        | Some(OP_TEXT)
+        | Some(OP_ACK)
+        | Some(OP_STATUS)
+        | Some(OP_BYE)
+        | Some(OP_FILE)
+        | Some(OP_AVATAR)
+        | Some(OP_AVATAR_ACK)
+        | Some(OP_AVATAR_CHUNK) => WireClass::Secure,
         Some(_) => WireClass::Unknown,
         None => WireClass::Unknown,
     }
@@ -273,6 +288,17 @@ impl Cipher {
                     pt.extend(avatar.encode());
                 }
             }
+            Packet::AvatarChunk {
+                revision,
+                index,
+                count,
+                bytes,
+            } => {
+                pt.push(OP_AVATAR_CHUNK);
+                pt.extend(revision.to_be_bytes());
+                pt.extend([*index, *count]);
+                pt.extend(bytes);
+            }
             Packet::AvatarAck { revision } => {
                 pt.push(OP_AVATAR_ACK);
                 pt.extend(revision.to_be_bytes());
@@ -318,6 +344,7 @@ fn op_of(p: &Packet) -> u8 {
         Packet::File(_) => OP_FILE,
         Packet::Avatar { .. } => OP_AVATAR,
         Packet::AvatarAck { .. } => OP_AVATAR_ACK,
+        Packet::AvatarChunk { .. } => OP_AVATAR_CHUNK,
         Packet::Text { .. } => OP_TEXT,
         Packet::Ack { .. } => OP_ACK,
         Packet::Status { .. } => OP_STATUS,
@@ -477,7 +504,7 @@ impl Packet {
                 })
             }
             OP_PING | OP_PONG | OP_TEXT | OP_ACK | OP_STATUS | OP_BYE | OP_FILE | OP_AVATAR
-            | OP_AVATAR_ACK => {
+            | OP_AVATAR_ACK | OP_AVATAR_CHUNK => {
                 let mut b = [0u8; 8];
                 b.copy_from_slice(&clear[1..9]);
                 let counter = u64::from_be_bytes(b);
@@ -507,6 +534,20 @@ impl Packet {
                             _ => return None,
                         };
                         Some(Packet::Avatar { revision, avatar })
+                    }
+                    OP_AVATAR_CHUNK
+                        if body.len() > 10
+                            && body.len() <= 10 + crate::avatar::CHUNK_BYTES
+                            && body[9] > 0
+                            && body[9] as usize <= crate::avatar::MAX_CHUNKS
+                            && body[8] < body[9] =>
+                    {
+                        Some(Packet::AvatarChunk {
+                            revision: u64::from_be_bytes(body[..8].try_into().ok()?),
+                            index: body[8],
+                            count: body[9],
+                            bytes: body[10..].to_vec(),
+                        })
                     }
                     OP_AVATAR_ACK if body.len() == 8 => Some(Packet::AvatarAck {
                         revision: u64::from_be_bytes(body.try_into().ok()?),

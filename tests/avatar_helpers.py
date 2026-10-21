@@ -32,7 +32,8 @@ def choose(client, root, who, path):
         try:
             cfg = tomllib.loads(config.read_text())
             if cfg.get('avatar_file') == str(path):
-                assert len(cfg['avatar']['pixels']) == 1024
+                assert len(cfg['avatar']['pixels']) == cfg.get('avatar_resolution', 32)**2
+                assert len(cfg['avatar_original']['pixels']) == 128**2
                 assert len(cfg['avatar']['palette']) == 32
                 break
         except (OSError, tomllib.TOMLDecodeError):
@@ -49,3 +50,28 @@ def clear(client):
     time.sleep(0.12)
     client.key('\x1b[A' * 24 + '\x1b[B' * 18 + '\r' + '\x1b[A' * 24 + '\x1b')
     time.sleep(0.15)
+
+
+def resolution(client, root, who, size):
+    config = root / who / 'remember-me/config.toml'
+    before = tomllib.loads(config.read_text())
+    sizes = [16, 32, 48, 64, 96, 128]
+    steps = (sizes.index(size) - sizes.index(before.get('avatar_resolution', 32))) % len(sizes)
+    client.key('\x1bOQ')
+    time.sleep(0.12)
+    client.key('\x1b[A' * 24 + '\x1b[B' * 19)
+    for _ in range(steps):
+        client.key('\r')
+        time.sleep(0.4)  # background resize, including on a slow debug build
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        cfg = tomllib.loads(config.read_text())
+        if cfg.get('avatar_resolution') == size:
+            if 'avatar' in cfg:
+                assert len(cfg['avatar']['pixels']) == size**2
+            break
+        time.sleep(0.03)
+    else:
+        raise AssertionError(f'avatar detail did not change to {size}px')
+    client.key('\x1b[A' * 24 + '\x1b')
+    time.sleep(0.12)

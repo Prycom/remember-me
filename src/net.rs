@@ -304,6 +304,7 @@ async fn run_established(
     let mut files = crate::transfer::spawn(download_directory.clone());
     let mut avatar_delivery = crate::avatar::Delivery::default();
     let mut avatar_received = 0u64;
+    let mut avatar_assembly = crate::avatar::Assembly::default();
     let mut seen_text = VecDeque::new();
     let mut peer = peer0;
     let mut last_ctl_rx: u64 = 0;
@@ -375,6 +376,16 @@ async fn run_established(
                     Some(Packet::Avatar{revision,avatar}) => {
                         send_secure(&sock,&mut cipher,peer,&Packet::AvatarAck{revision}).await;
                         if revision>avatar_received {avatar_received=revision;let _=events.send(NetEvent::PeerAvatar(avatar));dbg_net!("avatar received revision={revision}");}
+                    }
+                    Some(Packet::AvatarChunk{revision,index,count,bytes}) => {
+                        if revision <= avatar_received {
+                            send_secure(&sock,&mut cipher,peer,&Packet::AvatarAck{revision}).await;
+                        } else if let Some(avatar) = avatar_assembly.push(revision,index,count,bytes) {
+                            avatar_received=revision;
+                            send_secure(&sock,&mut cipher,peer,&Packet::AvatarAck{revision}).await;
+                            let _=events.send(NetEvent::PeerAvatar(Some(avatar)));
+                            dbg_net!("avatar received revision={revision}");
+                        }
                     }
                     Some(Packet::AvatarAck{revision}) => avatar_delivery.ack(revision),
                     Some(Packet::File(packet)) => { let _ = files.commands.try_send(crate::transfer::Command::Wire(packet)); }
@@ -483,7 +494,7 @@ async fn run_established(
             // ── мелкие периодические дела ───────────────────────────────────
             _ = maintenance.tick() => {
                 let now = Instant::now();
-                if avatar_delivery.due(profile.revision,now) {send_secure(&sock,&mut cipher,peer,&Packet::Avatar{revision:profile.revision,avatar:profile.avatar.clone()}).await;}
+                if let Some(packet)=profile.next(&mut avatar_delivery,now) {send_secure(&sock,&mut cipher,peer,&packet).await;}
                 if now.duration_since(last_ping) >= KEEPALIVE_INTERVAL {
                     last_ping = now;
                     dbg_net!("→ ping");

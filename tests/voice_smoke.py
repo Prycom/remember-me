@@ -130,7 +130,7 @@ class LossyRelayProxy:
                 thread.start()
                 self.threads.append(thread)
             payload = data[17:] if data[:1] == b"\x1b" else data
-            if self.impair_profiles and payload[:1] == b"\x0d" and self.avatar_lost < 1:
+            if self.impair_profiles and payload[:1] == b"\x0f" and self.avatar_lost < 1:
                 self.avatar_lost += 1
                 continue
             if self.impair_profiles and payload[:1] == b"\x0e" and self.avatar_ack_lost < 1:
@@ -368,12 +368,15 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
         time.sleep(0.5)
         avatar = root / 'avatar.png'
         avatar_helpers.picture(avatar)
+        avatar_helpers.resolution(host, root, 'a', 128)
         avatar_helpers.choose(host, root, 'a', avatar)
         joiner.wait_log('avatar received revision=2')
         avatar.unlink()  # the cached pixels must survive removing the source
-        avatar_helpers.clear(host)
+        avatar_helpers.resolution(host, root, 'a', 64)
         joiner.wait_log('avatar received revision=3')
-        print('  live avatar import + encrypted delivery + source removal + reset: PASS', flush=True)
+        avatar_helpers.clear(host)
+        joiner.wait_log('avatar received revision=4')
+        print('  128px avatar import + encrypted chunks + cached resize after source removal + reset: PASS', flush=True)
         short, long = root / "short.wav", root / "long.wav"
         quiet, loud = root / "quiet.wav", root / "loud.wav"
         transient = root / "bursts.wav"

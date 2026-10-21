@@ -38,6 +38,10 @@ pub struct Config {
     pub avatar: Option<crate::avatar::Avatar>,
     pub avatar_file: String,
     pub avatar_style: crate::avatar::AvatarStyle,
+    /// Pixel width/height of the transmitted thumbnail (16..128 presets).
+    pub avatar_resolution: u16,
+    /// Cached 128px source, so changing detail does not require the original file.
+    pub avatar_original: Option<crate::avatar::Avatar>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +77,8 @@ impl Default for Config {
             avatar: None,
             avatar_file: String::new(),
             avatar_style: Default::default(),
+            avatar_resolution: 32,
+            avatar_original: None,
         }
     }
 }

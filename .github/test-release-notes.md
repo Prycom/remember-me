@@ -1,5 +1,6 @@
 Rolling test build for Linux x86_64.
 
+- Configurable avatar detail from 16×16 to 128×128, larger profile viewer, cached source for live resizing and MTU-safe encrypted chunk delivery. Update both clients; no relay update needed.
 - Custom avatars in PNG/JPEG/WebP/GIF: pixel/ASCII portraits, speaking highlights, live encrypted sync and automatic nickname identicons.
 - Panel-based TUI with mouse controls, OSC 52 copy, room member scrolling and inline chat input (PR #1 by Forwall100).
 - Group voice rooms for up to 16 participants; the room survives its creator leaving.

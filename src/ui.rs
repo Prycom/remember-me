@@ -689,6 +689,10 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
         "сбросить аватарку".into(),
         "Enter: вернуть узор по нику".into(),
     ));
+    rows.push((
+        "чёткость аватарки".into(),
+        format!("{0}×{0} пикселей · ←/→ или Enter", cfg.avatar_resolution),
+    ));
     let mut lines = Vec::new();
     for (i, (label, val)) in rows.iter().enumerate() {
         let cursor = if i == app.settings_sel && app.edit.is_none() {
@@ -762,6 +766,9 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
     }
     let help = match app.settings_sel {
         crate::app::ROW_AVATAR => "Enter: PNG/JPEG/WebP/GIF, путь или ~/ · пусто = узор по нику",
+        crate::app::ROW_AVATAR_RESOLUTION => {
+            "←/→ или Enter: 16–128 px · видно в профиле по клику на аватарку"
+        }
         crate::app::ROW_AVATAR_STYLE => {
             "Enter: цветные пиксели / ASCII · действует на все аватарки у вас"
         }
@@ -1087,7 +1094,7 @@ mod tests {
         app.focus = Focus::Pane(Pane::Side);
         app.call_sel = 1;
         let image = std::env::var_os("RM_AVATAR_PREVIEW_IMAGE")
-            .map(|p| Avatar::load(std::path::Path::new(&p)).unwrap());
+            .map(|p| Avatar::load_at(std::path::Path::new(&p), 128).unwrap());
         app.peer = Some(PeerInfo {
             name: "Друг".into(),
             addr: "комната AX3P".into(),
@@ -1115,9 +1122,21 @@ mod tests {
         });
         for mode in [AvatarStyle::Pixel, AvatarStyle::Ascii] {
             app.cfg.avatar_style = mode;
-            let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+            let profile_preview = std::env::var_os("RM_AVATAR_PREVIEW_PROFILE").is_some();
+            if profile_preview {
+                app.overlay = Some(Overlay::Profile);
+            }
+            let mut terminal = Terminal::new(if profile_preview {
+                TestBackend::new(160, 80)
+            } else {
+                TestBackend::new(140, 42)
+            })
+            .unwrap();
             let mut ui = Ui::default();
             terminal.draw(|f| render(&app, f, &mut ui)).unwrap();
+            if profile_preview {
+                app.overlay = None;
+            }
             let buffer = terminal.backend().buffer();
             let text = buffer
                 .content
@@ -1140,11 +1159,13 @@ mod tests {
                     Color::Black => "#101521".into(),
                     _ => "#d5dfed".into(),
                 };
-                let mut svg = String::from(
-                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1120\" height=\"672\"><rect width=\"100%\" height=\"100%\" fill=\"#101521\"/>",
+                let mut svg = format!(
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\"><rect width=\"100%\" height=\"100%\" fill=\"#101521\"/>",
+                    buffer.area.width as u32 * 8,
+                    buffer.area.height as u32 * 16,
                 );
-                for y in 0..42 {
-                    for x in 0..140 {
+                for y in 0..buffer.area.height {
+                    for x in 0..buffer.area.width {
                         let c = &buffer[(x, y)];
                         let left = x as u32 * 8;
                         let top = y as u32 * 16;
@@ -1197,6 +1218,28 @@ mod tests {
         assert_eq!(app.screen, Screen::Settings);
         assert_eq!(app.settings_sel, crate::app::ROW_AVATAR);
         assert!(app.edit.is_some());
+    }
+
+    #[test]
+    fn high_detail_profile_uses_available_cells_and_settings_expose_resolution() {
+        let mut app = app();
+        app.screen = Screen::Call;
+        app.avatar = std::sync::Arc::new(crate::avatar::Avatar::identicon("128px").resized(128));
+        app.call_sel = 0;
+        app.on_action(Action::ShowProfile(0));
+        let (screen, _) = draw_ui(&app, 180, 80);
+        assert!(screen.chars().filter(|&c| c == '▀' || c == '▄').count() > 7000);
+        for (w, h) in [(40, 16), (80, 24), (120, 40)] {
+            let (screen, _) = draw_ui(&app, w, h);
+            assert!(screen.contains('▀'));
+        }
+        app.on_action(Action::Cancel);
+        app.on_action(Action::OpenSettings);
+        app.settings_sel = crate::app::ROW_AVATAR_RESOLUTION;
+        app.cfg.avatar_resolution = 128;
+        let (screen, _) = draw_ui(&app, 100, 24);
+        assert!(screen.contains("чёткость аватарки"));
+        assert!(screen.contains("128×128"));
     }
 
     #[test]
