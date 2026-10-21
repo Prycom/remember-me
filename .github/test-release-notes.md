@@ -1,7 +1,9 @@
 Rolling test builds for Linux x86_64 and Windows 10/11 x64.
 
+- File offers require each recipient’s consent within two minutes; Y/Enter accepts, N declines. Update all clients; the relay is unchanged.
+- Chat message selection/scrolling with arrows, highlighted rows, contextual file actions and Unicode cursor editing.
 - Portable `remember-me.exe` for Windows x64: bundled Opus and C runtime, WASAPI audio, verified self-updates with F5.
-- Configurable avatar detail from 16×16 to 128×128, larger profile viewer, cached source for live resizing and MTU-safe encrypted chunk delivery. Update both clients; no relay update needed.
+- Configurable avatar detail from 8×8 to 256×256 with larger thumbnails, larger profile viewer, cached source for live resizing and MTU-safe encrypted chunk delivery. Update both clients; no relay update needed.
 - Custom avatars in PNG/JPEG/WebP/GIF: pixel/ASCII portraits, speaking highlights, live encrypted sync and automatic nickname identicons.
 - Panel-based TUI with mouse controls, OSC 52 copy, room member scrolling and inline chat input (PR #1 by Forwall100).
 - Group voice rooms for up to 16 participants; the room survives its creator leaving.

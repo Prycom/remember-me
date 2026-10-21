@@ -21,6 +21,7 @@ pub struct Hit {
 }
 pub struct Row {
     pub line: Line<'static>,
+    pub message: usize,
     pub hits: Vec<(u16, u16, usize)>,
 }
 pub struct Layout {
@@ -99,7 +100,7 @@ pub fn layout(chat: &[ChatLine], width: u16, selected: Option<usize>) -> Layout 
     if width == 0 {
         return result;
     }
-    for message in chat {
+    for (message_index, message) in chat.iter().enumerate() {
         let who = if message.mine {
             format!("{} (вы): ", message.name)
         } else {
@@ -158,6 +159,7 @@ pub fn layout(chat: &[ChatLine], width: u16, selected: Option<usize>) -> Layout 
         }
         let mut row = Row {
             line: Line::default(),
+            message: message_index,
             hits: Vec::new(),
         };
         let mut column = 0u16;
@@ -184,6 +186,7 @@ pub fn layout(chat: &[ChatLine], width: u16, selected: Option<usize>) -> Layout 
                     result.rows.push(row);
                     row = Row {
                         line: Line::default(),
+                        message: message_index,
                         hits: Vec::new(),
                     };
                     column = 0;

@@ -98,7 +98,14 @@ pub enum NetCmd {
     SendFile(std::path::PathBuf),
     DownloadDirectory(std::path::PathBuf),
     CancelFile(u64),
-    HangUp { reason: u8 },
+    FileDecision {
+        id: u64,
+        peer_id: Option<u64>,
+        accept: bool,
+    },
+    HangUp {
+        reason: u8,
+    },
     Stop,
 }
 
@@ -472,6 +479,7 @@ async fn run_established(
                         if files.commands.try_send(crate::transfer::Command::Send(path)).is_err() { let _ = events.send(NetEvent::Progress("очередь передачи занята, повторите отправку".into())); }
                     }
                     NetCmd::DownloadDirectory(path) => { *download_directory=path.clone(); files.set_directory(path); }
+                    NetCmd::FileDecision{id,accept,..} => {let _=files.commands.try_send(if accept {crate::transfer::Command::Accept(id)} else {crate::transfer::Command::Decline(id)});}
                     NetCmd::CancelFile(id) => { let _ = files.commands.try_send(crate::transfer::Command::Cancel(id)); }
                     NetCmd::Text(t) => {
                         msg_counter += 1;

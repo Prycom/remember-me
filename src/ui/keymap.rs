@@ -94,6 +94,11 @@ pub fn action_for(k: &KeyEvent, app: &App) -> Option<Action> {
         let repeating = k.kind == KeyEventKind::Repeat;
         return match k.code {
             KeyCode::Backspace => Some(Action::Backspace),
+            KeyCode::Left => Some(Action::Left),
+            KeyCode::Right => Some(Action::Right),
+            KeyCode::Home => Some(Action::Home),
+            KeyCode::End => Some(Action::End),
+            KeyCode::Delete => Some(Action::Delete),
             KeyCode::Enter if !repeating => Some(Action::Confirm),
             KeyCode::Esc if !repeating => Some(Action::Cancel),
             KeyCode::Char(c) if plain(k.modifiers) => Some(Action::Insert(typed(c, k.modifiers))),
@@ -118,6 +123,13 @@ pub fn action_for(k: &KeyEvent, app: &App) -> Option<Action> {
         );
         if !navigation {
             return None;
+        }
+    }
+    if app.screen == Screen::Call && k.modifiers == KeyModifiers::CONTROL {
+        match k.code {
+            KeyCode::Up => return Some(Action::GainPeer(5)),
+            KeyCode::Down => return Some(Action::GainPeer(-5)),
+            _ => {}
         }
     }
     if !plain(k.modifiers) {
@@ -175,16 +187,10 @@ fn screen_command(k: &KeyEvent, app: &App) -> Option<Action> {
             _ => None,
         },
         Screen::Call => match k.code {
-            KeyCode::Up => Some(if app.focus == Focus::Pane(Pane::Side) {
-                Action::Up
-            } else {
-                Action::GainPeer(5)
-            }),
-            KeyCode::Down => Some(if app.focus == Focus::Pane(Pane::Side) {
-                Action::Down
-            } else {
-                Action::GainPeer(-5)
-            }),
+            KeyCode::Up => Some(Action::Up),
+            KeyCode::Down => Some(Action::Down),
+            KeyCode::Home => Some(Action::Home),
+            KeyCode::End => Some(Action::End),
             KeyCode::PageUp => Some(Action::PageUp),
             KeyCode::PageDown => Some(Action::PageDown),
             KeyCode::Tab => Some(Action::NextPane),
@@ -201,6 +207,8 @@ fn screen_command(k: &KeyEvent, app: &App) -> Option<Action> {
                     'O' => Action::DeviceCycle { input: false },
                     'I' => Action::DeviceCycle { input: true },
                     _ => match lower {
+                        'y' if app.focus == Focus::Pane(Pane::Main) => Action::FileDecision(true),
+                        'n' if app.focus == Focus::Pane(Pane::Main) => Action::FileDecision(false),
                         'm' => Action::ToggleMute,
                         'd' => Action::ToggleDeaf,
                         's' => Action::OpenSettings,
@@ -466,14 +474,8 @@ mod tests {
         assert_eq!(action_for(&key(KeyCode::Up), &app), Some(Action::Up));
         assert_eq!(action_for(&key(KeyCode::Down), &app), Some(Action::Down));
         app.focus = Focus::Pane(Pane::Main);
-        assert_eq!(
-            action_for(&key(KeyCode::Up), &app),
-            Some(Action::GainPeer(5))
-        );
-        assert_eq!(
-            action_for(&key(KeyCode::Down), &app),
-            Some(Action::GainPeer(-5))
-        );
+        assert_eq!(action_for(&key(KeyCode::Up), &app), Some(Action::Up));
+        assert_eq!(action_for(&key(KeyCode::Down), &app), Some(Action::Down));
         assert_eq!(
             action_for(&key(KeyCode::PageUp), &app),
             Some(Action::PageUp)

@@ -156,8 +156,8 @@ fn footer_hint(app: &App) -> &'static str {
         Screen::Incoming => "⏎ принять · esc отклонить",
         Screen::Settings => "↑↓ поле · ←→ значение · ⏎ изменить · esc назад",
         Screen::Call => match app.focus {
-            Focus::Input => "⏎ отправить · esc назад",
-            Focus::Pane(Pane::Main) => "i писать · tab участники · space говорить",
+            Focus::Input => "←→ курсор · ⏎ отправить · esc назад",
+            Focus::Pane(Pane::Main) => "↑↓ история · Enter открыть · Y/N файл · i писать",
             Focus::Pane(Pane::Side) => "tab чат · m микро · d звук · u завершить",
         },
     }
@@ -767,7 +767,7 @@ fn render_settings(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
     let help = match app.settings_sel {
         crate::app::ROW_AVATAR => "Enter: PNG/JPEG/WebP/GIF, путь или ~/ · пусто = узор по нику",
         crate::app::ROW_AVATAR_RESOLUTION => {
-            "←/→ или Enter: 16–128 px · видно в профиле по клику на аватарку"
+            "←/→ или Enter: 8–256 px · видно в профиле по клику на аватарку"
         }
         crate::app::ROW_AVATAR_STYLE => {
             "Enter: цветные пиксели / ASCII · действует на все аватарки у вас"
@@ -912,7 +912,7 @@ fn overlays(app: &App, f: &mut Frame, ui: &mut Ui, body: Rect) {
                     "m  микрофон · d  звук",
                     "s  настройки · u  завершить",
                     "a  автогромкость · [ ]  громкость микрофона",
-                    "↑↓  громкость собеседника",
+                    "↑↓  сообщения · Ctrl+↑↓ громкость",
                     "shift+i / shift+o  устройство ввода / вывода",
                 ],
                 Screen::Settings => &["↑↓  поле", "←→  значение", "⏎  изменить", "esc  назад"],
@@ -1120,6 +1120,34 @@ mod tests {
             status: 3,
             attachment: None,
         });
+        if std::env::var_os("RM_CHAT_PREVIEW").is_some() {
+            app.cfg.avatar_resolution = 128;
+            app.focus = Focus::Pane(Pane::Main);
+            let expires_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 120;
+            app.chat.push(ChatLine {
+                mine: false,
+                name: "Друг".into(),
+                text: String::new(),
+                status: 3,
+                attachment: Some(crate::transfer::TransferUpdate {
+                    id: 77,
+                    sending: false,
+                    peer_id: Some(4),
+                    peer_name: None,
+                    name: "фотография.png".into(),
+                    size: 2_400_000,
+                    done: 0,
+                    status: crate::transfer::TransferStatus::Offered { expires_at },
+                    path: None,
+                }),
+            });
+            app.chat_selected = Some(2);
+            app.input = "Черновик остаётся здесь".into();
+        }
         for mode in [AvatarStyle::Pixel, AvatarStyle::Ascii] {
             app.cfg.avatar_style = mode;
             let profile_preview = std::env::var_os("RM_AVATAR_PREVIEW_PROFILE").is_some();
@@ -1194,6 +1222,8 @@ mod tests {
             }
         }
         app.cfg.avatar_style = AvatarStyle::Pixel;
+        app.cfg.avatar_resolution = 32;
+        app.focus = Focus::Pane(Pane::Side);
         app.on_action(Action::ShowProfile(1));
         for (width, height) in [(40, 16), (80, 24), (120, 40)] {
             let (screen, ui) = draw_ui(&app, width, height);

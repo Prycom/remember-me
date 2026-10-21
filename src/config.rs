@@ -38,9 +38,9 @@ pub struct Config {
     pub avatar: Option<crate::avatar::Avatar>,
     pub avatar_file: String,
     pub avatar_style: crate::avatar::AvatarStyle,
-    /// Pixel width/height of the transmitted thumbnail (16..128 presets).
+    /// Pixel width/height of the transmitted thumbnail (8..256 presets).
     pub avatar_resolution: u16,
-    /// Cached 128px source, so changing detail does not require the original file.
+    /// Cached full-detail source, so changing detail does not require the original file.
     pub avatar_original: Option<crate::avatar::Avatar>,
 }
 

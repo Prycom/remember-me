@@ -93,6 +93,14 @@ class Client:
         self.reader.join(timeout=1)
 
 
+def file_consent(client, name, accept=True):
+    client.wait_log('[file] offer ' + name)
+    client.key('\x1b')
+    time.sleep(0.08)
+    client.key('\x1b[F' + ('y' if accept else 'n'))
+    time.sleep(0.12)
+
+
 class LossyRelayProxy:
     """Preserve relay endpoints; lose the first handshake/roster and file packets."""
     def __init__(self, target):
@@ -368,15 +376,15 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
         time.sleep(0.5)
         avatar = root / 'avatar.png'
         avatar_helpers.picture(avatar)
-        avatar_helpers.resolution(host, root, 'a', 128)
+        avatar_helpers.resolution(host, root, 'a', 256)
         avatar_helpers.choose(host, root, 'a', avatar)
         joiner.wait_log('avatar received revision=2')
         avatar.unlink()  # the cached pixels must survive removing the source
-        avatar_helpers.resolution(host, root, 'a', 64)
+        avatar_helpers.resolution(host, root, 'a', 224)
         joiner.wait_log('avatar received revision=3')
         avatar_helpers.clear(host)
         joiner.wait_log('avatar received revision=4')
-        print('  128px avatar import + encrypted chunks + cached resize after source removal + reset: PASS', flush=True)
+        print('  256px avatar import + encrypted chunks + cached resize after source removal + reset: PASS', flush=True)
         short, long = root / "short.wav", root / "long.wav"
         quiet, loud = root / "quiet.wav", root / "loud.wav"
         transient = root / "bursts.wav"
@@ -414,7 +422,7 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
         url = "https://example.org/voice?a=1&b=2"
         host.key("i\x1b[200~" + url + "\x1b[201~\r")
         time.sleep(0.3)
-        joiner.key("\x1b[<0;60;4M\x1b[<0;60;4m")
+        joiner.key("\x1b[<0;80;4M\x1b[<0;80;4m")
         host.key("l\r")
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
@@ -444,6 +452,8 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
         (custom / source.name).write_bytes(b"keep existing file")
         host.key("\x1bOR\x1b[200~" + str(source) + "\x1b[201~\r")
         joiner.key("\x1bOR\x1b[200~" + str(reverse) + "\x1b[201~\r")
+        file_consent(joiner, source.name)
+        file_consent(host, reverse.name)
         measure(root, names["mic_a"], names["out_b"], long, True, "voice during simultaneous file transfers")
         received = custom / "packet data (1).bin"
         returned = root / "downloads_a" / reverse.name
@@ -457,7 +467,15 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
         assert "@rm3\t" in own_history.read_text() and "@rm3\t" in peer_history.read_text()
         if proxy:
             assert proxy.file_lost == 2, "file packet loss was not exercised"
-        print("  files: bidirectional + live folder + SHA-256 + collisions + history: PASS", flush=True)
+        # Browse to the received file and open it with Enter; the desktop
+        # opener is a private stub, so no external app is launched in this test.
+        joiner.key('\x1b[F\r\x1b[A\r')
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline:
+            if str(received) in (root/'opened.log').read_text(): break
+            time.sleep(0.05)
+        else: raise AssertionError('Enter on downloaded file did not open its local path')
+        print("  files: consent + bidirectional + live folder + SHA-256 + collisions + history + Enter open: PASS", flush=True)
 
         host.key("iDraft:")
         host.key("\x1bOQ")  # F2, even while composing a message

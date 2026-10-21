@@ -33,7 +33,7 @@ def choose(client, root, who, path):
             cfg = tomllib.loads(config.read_text())
             if cfg.get('avatar_file') == str(path):
                 assert len(cfg['avatar']['pixels']) == cfg.get('avatar_resolution', 32)**2
-                assert len(cfg['avatar_original']['pixels']) == 128**2
+                assert len(cfg['avatar_original']['pixels']) == 256**2
                 assert len(cfg['avatar']['palette']) == 32
                 break
         except (OSError, tomllib.TOMLDecodeError):
@@ -55,13 +55,15 @@ def clear(client):
 def resolution(client, root, who, size):
     config = root / who / 'remember-me/config.toml'
     before = tomllib.loads(config.read_text())
-    sizes = [16, 32, 48, 64, 96, 128]
-    steps = (sizes.index(size) - sizes.index(before.get('avatar_resolution', 32))) % len(sizes)
+    sizes = [8, 12, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256]
+    delta = (sizes.index(size) - sizes.index(before.get('avatar_resolution', 32))) % len(sizes)
+    direction = '\x1b[C' if delta <= len(sizes)//2 else '\x1b[D'
+    steps = min(delta, len(sizes)-delta)
     client.key('\x1bOQ')
     time.sleep(0.12)
     client.key('\x1b[A' * 24 + '\x1b[B' * 19)
     for _ in range(steps):
-        client.key('\r')
+        client.key(direction)
         time.sleep(0.4)  # background resize, including on a slow debug build
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:

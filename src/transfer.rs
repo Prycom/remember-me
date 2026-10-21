@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 pub const CHUNK: usize = 1024;
 const WINDOW: usize = 32;
 const RETRY: Duration = Duration::from_millis(600);
+pub const OFFER_LIFETIME: Duration = Duration::from_secs(120);
 const TIMEOUT: Duration = Duration::from_secs(30);
 const OFFER_ACK: u32 = u32::MAX;
 const FINISH_ACK: u32 = u32::MAX - 1;
@@ -34,7 +35,7 @@ impl FilePacket {
     }
     pub fn encode(&self, out: &mut Vec<u8>) {
         let kind = match self {
-            Self::Offer { .. } => 1,
+            Self::Offer { .. } => 6, // Legacy clients must not auto-accept this offer.
             Self::Chunk { .. } => 2,
             Self::Finish { .. } => 3,
             Self::Ack { .. } => 4,
@@ -60,7 +61,7 @@ impl FilePacket {
         let id = u64::from_be_bytes(b.get(1..9)?.try_into().ok()?);
         let rest = b.get(9..)?;
         Some(match b[0] {
-            1 if (9..=263).contains(&rest.len()) => Self::Offer {
+            1 | 6 if (9..=263).contains(&rest.len()) => Self::Offer {
                 id,
                 size: u64::from_be_bytes(rest[..8].try_into().ok()?),
                 name: std::str::from_utf8(&rest[8..]).ok()?.to_owned(),
@@ -90,6 +91,9 @@ impl FilePacket {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Hash)]
 pub enum TransferStatus {
     Waiting,
+    Offered { expires_at: u64 },
+    Declined,
+    Expired,
     Active,
     Complete,
     Failed(String),
@@ -112,12 +116,18 @@ impl TransferUpdate {
     pub fn active(&self) -> bool {
         matches!(
             self.status,
-            TransferStatus::Waiting | TransferStatus::Active
+            TransferStatus::Waiting | TransferStatus::Offered { .. } | TransferStatus::Active
         )
     }
     pub fn label(&self) -> String {
         let state = match &self.status {
-            TransferStatus::Waiting => "ожидаем получателя".into(),
+            TransferStatus::Waiting => "ждём согласия · до 2 мин".into(),
+            TransferStatus::Offered { .. } => format!(
+                "предлагает файл · {} · Y скачать / N отказаться",
+                bytes(self.size)
+            ),
+            TransferStatus::Declined => "получатель отказался".into(),
+            TransferStatus::Expired => "предложение истекло".into(),
             TransferStatus::Active => format!(
                 "{} {}% · {} / {}",
                 if self.sending {
@@ -163,6 +173,8 @@ fn bytes(size: u64) -> String {
 pub enum Command {
     Send(PathBuf),
     Cancel(u64),
+    Accept(u64),
+    Decline(u64),
     Wire(FilePacket),
 }
 pub struct Worker {
@@ -193,6 +205,7 @@ pub fn spawn(directory: PathBuf) -> Worker {
             directory,
             outgoing: None,
             incoming: None,
+            offer: None,
             completed: VecDeque::new(),
             cancelled: VecDeque::new(),
             tx,
@@ -243,10 +256,16 @@ impl Drop for Incoming {
         let _ = std::fs::remove_file(&self.temp);
     }
 }
+struct Offer {
+    info: TransferUpdate,
+    created: Instant,
+}
+
 struct State {
     directory: std::sync::Arc<std::sync::RwLock<PathBuf>>,
     outgoing: Option<Outgoing>,
     incoming: Option<Incoming>,
+    offer: Option<Offer>,
     completed: VecDeque<(u64, [u8; 32])>,
     cancelled: VecDeque<(u64, String)>,
     tx: mpsc::Sender<FilePacket>,
@@ -261,6 +280,10 @@ impl State {
                 cmd = rx.recv() => match cmd {
                     Some(Command::Send(path)) => self.start_send(path).await,
                     Some(Command::Cancel(id)) => self.fail(id, "передача отменена".into(), true).await,
+                    Some(Command::Accept(id)) => {
+                        if let Err(error)=self.accept(id).await {self.fail(id,error,true).await;}
+                    }
+                    Some(Command::Decline(id)) => self.fail_as(id,"получатель отказался".into(),true,TransferStatus::Declined).await,
                     Some(Command::Wire(packet)) => {
                         let id = packet.id();
                         let offered=match &packet {FilePacket::Offer{name,size,..}=>Some((safe_name(name),*size)),_=>None};
@@ -273,7 +296,8 @@ impl State {
                     }
                     None => return,
                 },
-                _ = tick.tick(), if self.outgoing.is_some() || self.incoming.is_some() => {
+                _ = tick.tick(), if self.outgoing.is_some() || self.incoming.is_some() || self.offer.is_some() => {
+                    self.expire_offers().await;
                     if let Some(id) = self.incoming.as_ref().filter(|f| f.last_progress.elapsed()>TIMEOUT).map(|f|f.info.id) {
                         self.fail(id,"получатель: 30 с без данных".into(),true).await;
                     }
@@ -281,6 +305,36 @@ impl State {
                         && let Err(error) = self.send_tick().await { self.fail(id,error,true).await; }
                 }
             }
+        }
+    }
+    async fn expire_offers(&mut self) {
+        if let Some(id) = self
+            .offer
+            .as_ref()
+            .filter(|o| o.created.elapsed() >= OFFER_LIFETIME)
+            .map(|o| o.info.id)
+        {
+            self.fail_as(
+                id,
+                "предложение истекло".into(),
+                true,
+                TransferStatus::Expired,
+            )
+            .await;
+        }
+        if let Some(id) = self
+            .outgoing
+            .as_ref()
+            .filter(|o| !o.accepted && o.last_progress.elapsed() >= OFFER_LIFETIME)
+            .map(|o| o.info.id)
+        {
+            self.fail_as(
+                id,
+                "предложение истекло".into(),
+                true,
+                TransferStatus::Expired,
+            )
+            .await;
         }
     }
     async fn start_send(&mut self, path: PathBuf) {
@@ -346,7 +400,7 @@ impl State {
         let Some(f) = self.outgoing.as_mut() else {
             return Ok(());
         };
-        if f.last_progress.elapsed() > TIMEOUT {
+        if f.accepted && f.last_progress.elapsed() > TIMEOUT {
             return Err(
                 "30 с без подтверждений; обновите клиент собеседника и проверьте связь".into(),
             );
@@ -460,17 +514,27 @@ impl State {
                     if size.div_ceil(CHUNK as u64) >= FINISH_ACK as u64 {
                         return Err("слишком большой файл".into());
                     }
-                    let directory = self.directory.read().unwrap().clone();
-                    tokio::fs::create_dir_all(&directory)
-                        .await
-                        .map_err(|e| format!("папка загрузок: {e}"))?;
-                    let temp = directory.join(format!(".remember-me-{id:016x}.part"));
-                    let file = tokio::fs::OpenOptions::new()
-                        .create_new(true)
-                        .write(true)
-                        .open(&temp)
-                        .await
-                        .map_err(|e| format!("создать файл: {e}"))?;
+                    if let Some(offer) = &self.offer {
+                        if offer.info.id == id {
+                            if offer.info.size != size || offer.info.name != safe_name(&name) {
+                                return Err("параметры файла изменились".into());
+                            }
+                            return Ok(()); // Retries never extend the consent deadline.
+                        }
+                        let _ = self
+                            .tx
+                            .send(FilePacket::Cancel {
+                                id,
+                                reason: "получатель уже рассматривает другой файл".into(),
+                            })
+                            .await;
+                        return Ok(());
+                    }
+                    let expires_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        + OFFER_LIFETIME.as_secs();
                     let info = TransferUpdate {
                         id,
                         peer_id: None,
@@ -479,20 +543,15 @@ impl State {
                         name: safe_name(&name),
                         size,
                         done: 0,
-                        status: TransferStatus::Active,
+                        status: TransferStatus::Offered { expires_at },
                         path: None,
                     };
                     let _ = self.events.send(info.clone());
-                    self.incoming = Some(Incoming {
+                    self.offer = Some(Offer {
                         info,
-                        file: Some(file),
-                        temp,
-                        hash: Sha256::new(),
-                        next: 0,
-                        buffered: BTreeMap::new(),
-                        last_progress: Instant::now(),
-                        last_ui: Instant::now(),
+                        created: Instant::now(),
                     });
+                    return Ok(());
                 }
                 let _ = self
                     .tx
@@ -615,12 +674,68 @@ impl State {
                 }
             }
             FilePacket::Cancel { reason, .. } => {
-                self.fail(id, format!("собеседник: {reason}"), false).await
+                let status = match reason.as_str() {
+                    "получатель отказался" => TransferStatus::Declined,
+                    "предложение истекло" => TransferStatus::Expired,
+                    _ => TransferStatus::Failed(format!("собеседник: {reason}")),
+                };
+                self.fail_as(id, reason, false, status).await
             }
         }
         Ok(())
     }
+    async fn accept(&mut self, id: u64) -> Result<(), String> {
+        let Some(offer) = self.offer.as_ref().filter(|o| o.info.id == id) else {
+            return Ok(());
+        };
+        if offer.created.elapsed() >= OFFER_LIFETIME {
+            self.fail_as(
+                id,
+                "предложение истекло".into(),
+                true,
+                TransferStatus::Expired,
+            )
+            .await;
+            return Ok(());
+        }
+        let directory = self.directory.read().unwrap().clone();
+        tokio::fs::create_dir_all(&directory)
+            .await
+            .map_err(|e| format!("папка загрузок: {e}"))?;
+        let temp = directory.join(format!(".remember-me-{id:016x}.part"));
+        let file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .await
+            .map_err(|e| format!("создать файл: {e}"))?;
+        let mut info = self.offer.take().unwrap().info;
+        info.status = TransferStatus::Active;
+        let _ = self.events.send(info.clone());
+        self.incoming = Some(Incoming {
+            info,
+            file: Some(file),
+            temp,
+            hash: Sha256::new(),
+            next: 0,
+            buffered: BTreeMap::new(),
+            last_progress: Instant::now(),
+            last_ui: Instant::now(),
+        });
+        let _ = self
+            .tx
+            .send(FilePacket::Ack {
+                id,
+                index: OFFER_ACK,
+            })
+            .await;
+        Ok(())
+    }
     async fn fail(&mut self, id: u64, error: String, notify: bool) {
+        self.fail_as(id, error.clone(), notify, TransferStatus::Failed(error))
+            .await;
+    }
+    async fn fail_as(&mut self, id: u64, error: String, notify: bool, status: TransferStatus) {
         if !self.cancelled.iter().any(|(old, _)| *old == id) {
             self.cancelled.push_back((
                 id,
@@ -637,6 +752,10 @@ impl State {
             self.cancelled.pop_front();
         }
         for info in [
+            self.offer
+                .as_ref()
+                .filter(|f| f.info.id == id)
+                .map(|f| f.info.clone()),
             self.outgoing
                 .as_ref()
                 .filter(|f| f.info.id == id)
@@ -650,8 +769,11 @@ impl State {
         .flatten()
         {
             let mut info = info;
-            info.status = TransferStatus::Failed(error.clone());
+            info.status = status.clone();
             let _ = self.events.send(info);
+        }
+        if self.offer.as_ref().is_some_and(|f| f.info.id == id) {
+            self.offer = None;
         }
         if self.outgoing.as_ref().is_some_and(|f| f.info.id == id) {
             self.outgoing = None;
@@ -759,6 +881,142 @@ mod tests {
         }
     }
 
+    fn state(
+        directory: PathBuf,
+    ) -> (
+        State,
+        mpsc::Receiver<FilePacket>,
+        mpsc::UnboundedReceiver<TransferUpdate>,
+    ) {
+        let (tx, packets) = mpsc::channel(64);
+        let (events, updates) = mpsc::unbounded_channel();
+        (
+            State {
+                directory: std::sync::Arc::new(std::sync::RwLock::new(directory)),
+                outgoing: None,
+                incoming: None,
+                offer: None,
+                completed: VecDeque::new(),
+                cancelled: VecDeque::new(),
+                tx,
+                events,
+            },
+            packets,
+            updates,
+        )
+    }
+    #[tokio::test]
+    async fn offers_require_consent_retry_does_not_extend_deadline_and_expiry_cleans_both_sides() {
+        let dir = Directory::new();
+        let destination = dir.0.join("not-created");
+        let (mut receiver, mut packets, mut updates) = state(destination.clone());
+        let offer = FilePacket::Offer {
+            id: 7,
+            name: "offered.txt".into(),
+            size: 3,
+        };
+        let mut encoded = Vec::new();
+        offer.encode(&mut encoded);
+        assert_eq!(encoded[0], 6, "old clients must not auto-accept");
+        receiver.receive(offer.clone()).await.unwrap();
+        assert!(matches!(
+            updates.try_recv().unwrap().status,
+            TransferStatus::Offered { .. }
+        ));
+        assert!(!destination.exists());
+        assert!(packets.try_recv().is_err());
+        receiver
+            .receive(FilePacket::Chunk {
+                id: 7,
+                index: 0,
+                data: b"abc".to_vec(),
+            })
+            .await
+            .unwrap();
+        assert!(!destination.exists());
+        assert!(packets.try_recv().is_err());
+        receiver.offer.as_mut().unwrap().created = Instant::now() - OFFER_LIFETIME;
+        let created = receiver.offer.as_ref().unwrap().created;
+        receiver.receive(offer.clone()).await.unwrap();
+        assert_eq!(receiver.offer.as_ref().unwrap().created, created);
+        receiver.expire_offers().await;
+        assert_eq!(updates.try_recv().unwrap().status, TransferStatus::Expired);
+        assert!(receiver.offer.is_none() && !destination.exists());
+        assert!(matches!(
+            packets.try_recv().unwrap(),
+            FilePacket::Cancel { id: 7, .. }
+        ));
+        receiver.receive(offer).await.unwrap();
+        assert!(receiver.offer.is_none());
+        receiver.accept(7).await.unwrap();
+        assert!(!destination.exists());
+        let source = dir.0.join("source");
+        std::fs::write(&source, b"abc").unwrap();
+        let (mut sender, mut sent, mut progress) = state(dir.0.clone());
+        sender.start_send(source).await;
+        progress.try_recv().unwrap();
+        sender.send_tick().await.unwrap();
+        assert!(matches!(sent.try_recv().unwrap(), FilePacket::Offer { .. }));
+        assert!(sent.try_recv().is_err());
+        sender.outgoing.as_mut().unwrap().last_progress = Instant::now() - OFFER_LIFETIME;
+        sender.expire_offers().await;
+        assert_eq!(progress.try_recv().unwrap().status, TransferStatus::Expired);
+        assert!(sender.outgoing.is_none());
+    }
+    #[tokio::test]
+    async fn declining_one_recipient_does_not_prevent_another_from_accepting() {
+        let dir = Directory::new();
+        let (mut yes, mut yes_packets, _) = state(dir.0.join("yes"));
+        let (mut no, mut no_packets, mut no_updates) = state(dir.0.join("no"));
+        let offer = FilePacket::Offer {
+            id: 11,
+            name: "choice.txt".into(),
+            size: 3,
+        };
+        yes.receive(offer.clone()).await.unwrap();
+        no.receive(offer.clone()).await.unwrap();
+        no.fail_as(
+            11,
+            "получатель отказался".into(),
+            true,
+            TransferStatus::Declined,
+        )
+        .await;
+        no_updates.try_recv().unwrap();
+        assert_eq!(
+            no_updates.try_recv().unwrap().status,
+            TransferStatus::Declined
+        );
+        assert!(matches!(
+            no_packets.try_recv().unwrap(),
+            FilePacket::Cancel { .. }
+        ));
+        yes.accept(11).await.unwrap();
+        assert!(matches!(
+            yes_packets.try_recv().unwrap(),
+            FilePacket::Ack {
+                index: OFFER_ACK,
+                ..
+            }
+        ));
+        yes.receive(FilePacket::Chunk {
+            id: 11,
+            index: 0,
+            data: b"abc".to_vec(),
+        })
+        .await
+        .unwrap();
+        yes.receive(FilePacket::Finish {
+            id: 11,
+            hash: Sha256::digest(b"abc").into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(dir.0.join("yes/choice.txt")).unwrap(), b"abc");
+        no.receive(offer).await.unwrap();
+        no.accept(11).await.unwrap();
+        assert!(!dir.0.join("no").exists());
+    }
     #[tokio::test]
     async fn encrypted_transfer_recovers_loss_reordering_and_lost_completion_without_overwriting() {
         let dir = Directory::new();
@@ -818,6 +1076,7 @@ mod tests {
                     if update.status==TransferStatus::Complete{sender_done=true;assert_eq!(update.done,data.len() as u64);}
                 }
                 Some(update)=b.updates.recv()=>{
+                    if matches!(update.status,TransferStatus::Offered{..}){b.commands.send(Command::Accept(update.id)).await.unwrap();}
                     assert!(!matches!(update.status,TransferStatus::Failed(_)),"{update:?}");
                     if update.status==TransferStatus::Complete{received=update.path;completed_events+=1;}
                 }
@@ -856,6 +1115,7 @@ mod tests {
             .await
             .unwrap();
         worker.updates.recv().await.unwrap();
+        worker.commands.send(Command::Accept(1)).await.unwrap();
         worker
             .commands
             .send(Command::Wire(FilePacket::Chunk {
@@ -918,10 +1178,10 @@ mod tests {
             .send(Command::Wire(offer.clone()))
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             worker.updates.recv().await.unwrap().status,
-            TransferStatus::Active
-        );
+            TransferStatus::Offered { .. }
+        ));
         worker.commands.send(Command::Cancel(9)).await.unwrap();
         assert!(matches!(
             worker.updates.recv().await.unwrap().status,
@@ -963,6 +1223,7 @@ mod tests {
             }))
             .await
             .unwrap();
+        worker.commands.send(Command::Accept(1)).await.unwrap();
         worker
             .commands
             .send(Command::Wire(FilePacket::Finish {

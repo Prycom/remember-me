@@ -242,6 +242,7 @@ async fn session(
                 Some(NetCmd::Avatar(avatar))=>profile.set(avatar),
                 Some(NetCmd::DownloadDirectory(path))=>{download_dir=path;for p in peers.values(){p.files.set_directory(download_dir.clone());}}
                 Some(NetCmd::SendFile(path))=>{if peers.is_empty(){let _=events.send(NetEvent::Progress("в комнате пока нет получателей файла".into()));}for p in peers.values(){let _=p.files.commands.try_send(transfer::Command::Send(path.clone()));}}
+                Some(NetCmd::FileDecision{id,peer_id,accept})=>{if let Some(p)=peer_id.and_then(|id|peers.get(&id)){let _=p.files.commands.try_send(if accept {transfer::Command::Accept(id)} else {transfer::Command::Decline(id)});}}
                 Some(NetCmd::CancelFile(id))=>{for p in peers.values(){let _=p.files.commands.try_send(transfer::Command::Cancel(id));}}
                 Some(NetCmd::Text(text))=>{message_id=message_id.wrapping_add(1);let mut waiting=BTreeSet::new();for (id,p) in &mut peers{send(&socket,server,own_id,p,Packet::Text{msg_id:message_id,text:text.clone()}).await;waiting.insert(*id);}if waiting.is_empty(){let _=events.send(NetEvent::TextAck(message_id));}else{pending.push(Pending{id:message_id,text,waiting,sent:Instant::now(),tries:0});}}
                 _=>{}

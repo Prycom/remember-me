@@ -119,6 +119,8 @@ pub struct App {
     /// файл истории прошлого чата (per-peer), Some только в звонке
     pub peer_file: Option<String>,
     pub input: String,
+    pub input_cursor: usize,
+    pub chat_selected: Option<usize>,
     pub focus: Focus,
     pub home_sel: usize,
     pub call_sel: usize,
@@ -126,6 +128,7 @@ pub struct App {
     pub overlay: Option<Overlay>,
     pub log: Vec<String>,
     pub chat_scroll: usize,
+    pub chat_view_height: std::cell::Cell<usize>,
     pub file_input: Option<String>,
     pub chat_hits: RefCell<Vec<Hit>>,
     pub chat_layout: RefCell<Option<crate::chat_links::LayoutCache>>,
@@ -198,6 +201,8 @@ impl App {
             chat: Vec::new(),
             peer_file: None,
             input: String::new(),
+            input_cursor: 0,
+            chat_selected: None,
             focus: Focus::Pane(Pane::Main),
             home_sel: 0,
             call_sel: 0,
@@ -205,6 +210,7 @@ impl App {
             overlay: None,
             log: Vec::new(),
             chat_scroll: 0,
+            chat_view_height: std::cell::Cell::new(0),
             file_input: None,
             chat_hits: RefCell::new(Vec::new()),
             chat_layout: RefCell::new(None),
@@ -288,6 +294,7 @@ impl App {
                 self.peer = None;
                 self.group_room = None;
                 self.group_peers.clear();
+                self.chat_selected = None;
             }
         }
         for ev in inbox {
@@ -322,6 +329,8 @@ impl App {
             return;
         }
         let text = std::mem::take(&mut self.input);
+        self.input_cursor = 0;
+        self.chat_selected = None;
         if text.is_empty() {
             return;
         }
@@ -363,11 +372,14 @@ impl App {
         let target = self.chat_targets.borrow().get(index).cloned();
         if let Some(target) = target {
             self.selected_link = Some(index);
-            let tx = self.open_results.0.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(crate::chat_links::open(target));
-            });
+            self.open_target(target);
         }
+    }
+    fn open_target(&mut self, target: OpenTarget) {
+        let tx = self.open_results.0.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::chat_links::open(target));
+        });
     }
     fn interrupt_transfers(&mut self) {
         for line in &mut self.chat {
@@ -413,19 +425,25 @@ impl App {
         if let Some(key) = &self.peer_file {
             append_chat_log(key, false, &line.name, &line.text);
         }
-        self.chat_scroll = 0;
+        if self.chat_selected.is_none() {
+            self.chat_scroll = 0;
+        }
     }
     fn handle_net(&mut self, ev: NetEvent) {
         match ev {
             NetEvent::Transfer(update) => {
+                if matches!(update.status, TransferStatus::Offered { .. })
+                    && std::env::var("RM_DEBUG").ok().as_deref() == Some("1")
+                {
+                    eprintln!("[file] offer {} id={}", update.name, update.id);
+                }
                 self.chat_layout.get_mut().take();
                 let complete = !update.active();
                 let index = self.chat.iter().position(|line| {
                     line.mine == update.sending
-                        && line
-                            .attachment
-                            .as_ref()
-                            .is_some_and(|file| file.id == update.id)
+                        && line.attachment.as_ref().is_some_and(|file| {
+                            file.id == update.id && file.peer_id == update.peer_id
+                        })
                 });
                 let name = if update.sending {
                     self.cfg.name.clone()
@@ -510,6 +528,7 @@ impl App {
                 self.chat_layout.get_mut().take();
                 self.chat = load_chat_log(&self.peer_file.clone().unwrap(), &self.cfg.name);
                 self.chat_scroll = 0;
+                self.chat_selected = None;
                 let avatar = crate::avatar::display(None, &peer_name);
                 self.call_sel = 1;
                 self.peer = Some(PeerInfo {
@@ -539,6 +558,7 @@ impl App {
                 self.peer_file = Some(key);
                 self.group_room = Some(format!("{room}@{server}"));
                 self.group_peers.clear();
+                self.chat_selected = None;
                 self.peer = None;
                 self.pending.clear();
                 self.msg_id = 0;
@@ -630,6 +650,7 @@ impl App {
                 self.peer = None;
                 self.group_room = None;
                 self.group_peers.clear();
+                self.chat_selected = None;
                 self.incoming = None;
                 self.peer_file = None;
                 self.input.clear();
@@ -801,12 +822,110 @@ impl App {
 
     // чат-скролл
     pub fn scroll_chat(&mut self, up: bool) {
-        self.selected_link = None;
-        if up {
-            self.chat_scroll = self.chat_scroll.saturating_add(5);
-        } else {
-            self.chat_scroll = self.chat_scroll.saturating_sub(5);
+        let count = self.chat_layout.borrow().as_ref().map_or(0, |c| {
+            c.layout
+                .rows
+                .iter()
+                .filter(|r| Some(r.message) == self.chat_selected)
+                .count()
+        });
+        let height = self.chat_view_height.get().max(1);
+        if count > height {
+            let offset = if up {
+                self.chat_scroll.saturating_sub(height)
+            } else {
+                (self.chat_scroll + height).min(count - height)
+            };
+            if offset != self.chat_scroll {
+                self.chat_scroll = offset;
+                return;
+            }
         }
+        self.move_message(if up { -5 } else { 5 });
+    }
+    fn move_message(&mut self, delta: isize) {
+        self.chat_scroll = 0;
+        self.selected_link = None;
+        self.focus = Focus::Pane(Pane::Main);
+        if self.chat.is_empty() {
+            return;
+        }
+        let current = self.chat_selected.unwrap_or(self.chat.len() - 1);
+        self.chat_selected = Some(if self.chat_selected.is_none() {
+            current
+        } else {
+            current
+                .saturating_add_signed(delta)
+                .min(self.chat.len() - 1)
+        });
+    }
+    pub fn selected_file(&self) -> Option<&TransferUpdate> {
+        self.chat_selected
+            .and_then(|i| self.chat.get(i))
+            .and_then(|l| l.attachment.as_ref())
+    }
+    fn decide_file(&mut self, accept: bool) {
+        let Some(file) = self
+            .selected_file()
+            .filter(|f| !f.sending && matches!(f.status, TransferStatus::Offered { .. }))
+        else {
+            return;
+        };
+        if let Some(session) = &self.session {
+            session.send(NetCmd::FileDecision {
+                id: file.id,
+                peer_id: file.peer_id,
+                accept,
+            });
+        }
+    }
+    fn activate_message(&mut self) {
+        let Some(index) = self.chat_selected else {
+            return;
+        };
+        let Some(line) = self.chat.get(index) else {
+            return;
+        };
+        if let Some(file) = &line.attachment {
+            if matches!(file.status, TransferStatus::Offered { .. }) {
+                self.decide_file(true);
+            } else if file.status == TransferStatus::Complete
+                && let Some(path) = &file.path
+            {
+                self.open_target(OpenTarget::File(path.clone()));
+            }
+        } else if let Some((start, end)) = crate::chat_links::urls(&line.text).first() {
+            self.open_target(OpenTarget::Url(line.text[*start..*end].to_string()));
+        }
+    }
+    fn cursor(&self) -> usize {
+        let mut cursor = self.input_cursor.min(self.input.len());
+        while !self.input.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
+        cursor
+    }
+    fn edit_input(&mut self, action: Action) {
+        let cursor = self.cursor();
+        self.input_cursor = match action {
+            Action::Left => self.input[..cursor]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(i, _)| i),
+            Action::Right => self.input[cursor..]
+                .chars()
+                .next()
+                .map_or(cursor, |c| cursor + c.len_utf8()),
+            Action::Home => 0,
+            Action::End => self.input.len(),
+            Action::Delete => {
+                if let Some(c) = self.input[cursor..].chars().next() {
+                    self.input.replace_range(cursor..cursor + c.len_utf8(), "");
+                }
+                cursor
+            }
+            _ => cursor,
+        };
     }
 
     // ── клавиатура ─────────────────────────────────────────────────────────
@@ -1000,6 +1119,11 @@ impl App {
         match a {
             Action::Insert(c) => self.insert_char(c),
             Action::Backspace => self.backspace_char(),
+            a @ (Action::Left | Action::Right | Action::Home | Action::End | Action::Delete)
+                if self.screen == Screen::Call && self.focus == Focus::Input =>
+            {
+                self.edit_input(a)
+            }
             Action::Paste(s) => self.paste_text(s),
             _ => match self.screen {
                 Screen::Home => self.home_action(a),
@@ -1017,7 +1141,9 @@ impl App {
             self.conn_input.push(c);
         } else if self.screen == Screen::Call && self.focus == Focus::Input {
             if self.input.len() + c.len_utf8() <= crate::proto::TEXT_MAX {
-                self.input.push(c);
+                let cursor = self.cursor();
+                self.input.insert(cursor, c);
+                self.input_cursor = cursor + c.len_utf8();
             }
         }
     }
@@ -1026,7 +1152,11 @@ impl App {
         if self.screen == Screen::Connect {
             self.conn_input.pop();
         } else if self.screen == Screen::Call && self.focus == Focus::Input {
-            self.input.pop();
+            let cursor = self.cursor();
+            if let Some((prev, _)) = self.input[..cursor].char_indices().next_back() {
+                self.input.replace_range(prev..cursor, "");
+                self.input_cursor = prev;
+            }
         }
     }
 
@@ -1035,7 +1165,9 @@ impl App {
             self.conn_input.push_str(&s);
         } else if self.screen == Screen::Call && self.focus == Focus::Input {
             if self.input.len() + s.len() <= crate::proto::TEXT_MAX {
-                self.input.push_str(&s);
+                let cursor = self.cursor();
+                self.input.insert_str(cursor, &s);
+                self.input_cursor = cursor + s.len();
             }
         }
     }
@@ -1191,19 +1323,21 @@ impl App {
                 self.selected_link = None;
             }
             Action::CancelFile => {
-                if let Some(file) = self
-                    .chat
-                    .iter()
-                    .rev()
-                    .filter_map(|l| l.attachment.as_ref())
-                    .find(|f| f.active())
-                    && let Some(session) = &self.session
+                if let Some(file) = self.selected_file().filter(|f| f.active()).or_else(|| {
+                    self.chat
+                        .iter()
+                        .rev()
+                        .filter_map(|l| l.attachment.as_ref())
+                        .find(|f| f.active())
+                }) && let Some(session) = &self.session
                 {
                     session.send(NetCmd::CancelFile(file.id));
                 }
             }
+            Action::FileDecision(accept) => self.decide_file(accept),
             Action::OpenLink(index) => self.open_link(index),
             Action::NextLink(reverse) => {
+                self.chat_selected = None;
                 let count = self.chat_targets.borrow().len();
                 if count > 0 {
                     self.focus = Focus::Pane(Pane::Main);
@@ -1234,6 +1368,8 @@ impl App {
                     self.focus = Focus::Pane(Pane::Main);
                 } else if let Some(index) = self.selected_link {
                     self.open_link(index);
+                } else {
+                    self.activate_message();
                 }
             }
             Action::Cancel => {
@@ -1243,8 +1379,12 @@ impl App {
             }
             Action::FocusInput => {
                 self.engine.params.set_ptt_active(false);
+                if self.focus != Focus::Input {
+                    self.input_cursor = self.input.len();
+                }
                 self.focus = Focus::Input;
                 self.selected_link = None;
+                self.chat_selected = None;
                 self.chat_scroll = 0;
             }
             Action::NextPane => {
@@ -1258,13 +1398,31 @@ impl App {
             Action::Up => {
                 if self.focus == Focus::Pane(Pane::Side) {
                     self.call_sel = self.call_sel.saturating_sub(1);
+                } else {
+                    self.move_message(-1);
                 }
             }
             Action::Down => {
                 if self.focus == Focus::Pane(Pane::Side) {
                     self.call_sel =
                         (self.call_sel + 1).min(self.participant_count().saturating_sub(1));
+                } else {
+                    self.move_message(1);
                 }
+            }
+            Action::Home => {
+                self.focus = Focus::Pane(Pane::Main);
+                self.chat_scroll = 0;
+                if !self.chat.is_empty() {
+                    self.chat_selected = Some(0);
+                    self.selected_link = None;
+                }
+            }
+            Action::End => {
+                self.focus = Focus::Pane(Pane::Main);
+                self.chat_selected = self.chat.len().checked_sub(1);
+                self.chat_scroll = 0;
+                self.selected_link = None;
             }
             Action::PageUp => self.scroll_chat(true),
             Action::PageDown => self.scroll_chat(false),
@@ -1272,18 +1430,17 @@ impl App {
                 self.call_sel = i.min(self.participant_count().saturating_sub(1));
                 self.focus = Focus::Pane(Pane::Side);
             }
-            Action::Click(Pane::Main, _) => self.focus = Focus::Pane(Pane::Main),
+            Action::Click(Pane::Main, index) => {
+                self.chat_scroll = 0;
+                self.focus = Focus::Pane(Pane::Main);
+                self.selected_link = None;
+                self.chat_selected =
+                    (!self.chat.is_empty()).then_some(index.min(self.chat.len().saturating_sub(1)));
+            }
             Action::Scroll(pane, d) => {
                 self.focus = Focus::Pane(pane);
                 match pane {
-                    Pane::Main => {
-                        if d >= 0 {
-                            self.chat_scroll = self.chat_scroll.saturating_sub(d as usize);
-                        } else {
-                            self.chat_scroll =
-                                self.chat_scroll.saturating_add(d.unsigned_abs() as usize);
-                        }
-                    }
+                    Pane::Main => self.move_message(d as isize),
                     Pane::Side => {
                         self.call_sel = (self.call_sel as i16 + d.signum())
                             .clamp(0, self.participant_count().saturating_sub(1) as i16)
@@ -1576,7 +1733,7 @@ impl App {
         let index = sizes
             .iter()
             .position(|&n| n == self.cfg.avatar_resolution)
-            .unwrap_or(1);
+            .unwrap_or(4);
         let resolution = sizes[(index as i16 + direction).rem_euclid(sizes.len() as i16) as usize];
         if self.cfg.avatar.is_none() {
             self.cfg.avatar_resolution = resolution;
@@ -1587,7 +1744,7 @@ impl App {
             .cfg
             .avatar_original
             .as_ref()
-            .filter(|a| a.valid())
+            .filter(|a| a.valid() && a.side() >= resolution as usize)
             .cloned();
         let source = self.cfg.avatar_file.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1944,6 +2101,49 @@ mod tests {
     }
 
     #[test]
+    fn unicode_message_cursor_edits_in_place_and_preserves_draft_while_browsing() {
+        let mut app = App::for_test(Config::default());
+        app.screen = Screen::Call;
+        app.on_action(Action::FocusInput);
+        app.on_action(Action::Paste("А🙂界z".into()));
+        app.on_action(Action::Left);
+        app.on_action(Action::Left);
+        app.on_action(Action::Insert(':'));
+        assert_eq!(app.input, "А🙂:界z");
+        app.on_action(Action::Backspace);
+        app.on_action(Action::Delete);
+        assert_eq!(app.input, "А🙂z");
+        app.on_action(Action::Home);
+        app.on_action(Action::Backspace);
+        app.on_action(Action::Insert('X'));
+        app.on_action(Action::End);
+        app.on_action(Action::Paste("Ж".into()));
+        assert_eq!(app.input, "XА🙂zЖ");
+        app.on_action(Action::Cancel);
+        app.on_action(Action::Up);
+        assert_eq!(app.input, "XА🙂zЖ");
+    }
+    #[test]
+    fn message_selection_stays_on_history_when_new_messages_arrive() {
+        let mut app = App::for_test(Config::default());
+        app.screen = Screen::Call;
+        for n in 0..40 {
+            app.received_text("friend".into(), format!("message {n}"));
+        }
+        app.on_action(Action::Up);
+        assert_eq!(app.chat_selected, Some(39));
+        app.on_action(Action::PageUp);
+        assert_eq!(app.chat_selected, Some(34));
+        app.received_text("friend".into(), "new message".into());
+        assert_eq!(app.chat_selected, Some(34));
+        app.on_action(Action::Home);
+        assert_eq!(app.chat_selected, Some(0));
+        app.on_action(Action::Down);
+        assert_eq!(app.chat_selected, Some(1));
+        app.on_action(Action::End);
+        assert_eq!(app.chat_selected, Some(40));
+    }
+    #[test]
     fn repeating_backspace_works_in_address_and_settings_fields() {
         let mut app = App::for_test(Config::default());
         app.screen = Screen::Connect;
@@ -1991,8 +2191,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.avatar_load.is_none());
-        assert_eq!(app.cfg.avatar_resolution, 48);
-        assert_eq!(app.avatar.side(), 48);
+        assert_eq!(app.cfg.avatar_resolution, 40);
+        assert_eq!(app.avatar.side(), 40);
         assert_eq!(app.cfg.avatar_original.as_ref().unwrap().side(), 128);
         assert_eq!(app.session_screen(), Screen::Call);
         assert_eq!(app.input, "черновик");

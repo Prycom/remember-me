@@ -16,7 +16,7 @@ import threading
 import termios
 import time
 import avatar_helpers
-from voice_smoke import Client, LossyRelayProxy, free_port, pulse, tone, measure
+from voice_smoke import Client, LossyRelayProxy, free_port, pulse, tone, measure, file_consent
 
 
 def wait(predicate, label, timeout=10):
@@ -126,7 +126,7 @@ def main():
             proxy.impair_profiles = True
             avatar = root / "avatar.png"
             avatar_helpers.picture(avatar)
-            avatar_helpers.resolution(a, root, 'a', 128)
+            avatar_helpers.resolution(a, root, 'a', 256)
             avatar_helpers.choose(a, root, 'a', avatar)
             b.wait_log('avatar received from a revision=2')
             avatar.unlink()
@@ -136,13 +136,13 @@ def main():
                 client.wait_log("roster: 2 remote members")
             c.wait_log('avatar received from a revision=2')
             assert proxy.avatar_lost == 1 and proxy.avatar_ack_lost == 1
-            avatar_helpers.resolution(a, root, 'a', 64)
+            avatar_helpers.resolution(a, root, 'a', 224)
             for client in (b, c):
                 client.wait_log('avatar received from a revision=3')
             avatar_helpers.clear(a)
             for client in (b, c):
                 client.wait_log('avatar received from a revision=4')
-            print('  group 128px avatar: chunk/ACK loss, late join, cached resize, live reset: PASS', flush=True)
+            print('  group 256px avatar: chunk/ACK loss, late join, cached resize, live reset: PASS', flush=True)
             time.sleep(0.5)
             ui_stalls(root, names, a)
             if options.ui_stall_only:
@@ -177,10 +177,15 @@ def main():
             payload = random.Random(17).randbytes(256 * 1024 + 57)
             source.write_bytes(payload)
             a.key("\x1bOR\x1b[200~" + str(source) + "\x1b[201~\r")
-            wait(lambda: all((root / ("downloads_" + who) / source.name).exists() for who in "bc"), "group file missing")
-            for who in "bc":
-                assert hashlib.sha256((root / ("downloads_" + who) / source.name).read_bytes()).digest() == hashlib.sha256(payload).digest()
-            print("  named chat + file to every room member: PASS", flush=True)
+            for client in (b,c): client.wait_log('[file] offer '+source.name)
+            time.sleep(0.3)
+            assert not any((root / ('downloads_'+who) / source.name).exists() for who in 'bc')
+            file_consent(b,source.name)
+            file_consent(c,source.name,False)
+            wait(lambda:(root/'downloads_b'/source.name).exists(),"accepted group file missing")
+            assert hashlib.sha256((root/'downloads_b'/source.name).read_bytes()).digest()==hashlib.sha256(payload).digest()
+            assert not (root/'downloads_c').exists() or not list((root/'downloads_c').iterdir())
+            print("  group file: no download before consent, B accepts, C declines independently: PASS",flush=True)
             # Muting one participant affects only them; peers remain audible.
             a.key("m")
             time.sleep(0.5)

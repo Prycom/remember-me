@@ -16,8 +16,15 @@ const BAR_CELLS: usize = 6;
 
 pub fn render(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
     if area.width >= 86 {
-        let [left, right] =
-            Layout::horizontal([Constraint::Length(44), Constraint::Min(20)]).areas(area);
+        let [left, right] = Layout::horizontal([
+            Constraint::Length(
+                ((app.cfg.avatar_resolution / 4).clamp(6, 32) + 36)
+                    .max(44)
+                    .min(area.width / 2),
+            ),
+            Constraint::Min(20),
+        ])
+        .areas(area);
         participants(app, f, ui, left);
         chat(app, f, ui, right);
     } else {
@@ -109,22 +116,38 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
         });
     }
     let selected = app.call_sel.min(cards.len() - 1);
-    let portrait_height = if inner.height >= 28 && inner.width >= 32 {
+    let thumbnail = (if inner.height < 16 {
+        6
+    } else {
+        app.cfg.avatar_resolution / 4
+    })
+    .clamp(6, 32)
+    .min(inner.width.saturating_sub(22))
+        / 2
+        * 2;
+    let card_height = (thumbnail / 2).max(3);
+    let portrait_height = if inner.height >= (card_height * cards.len().min(3) as u16 + 18).max(28)
+        && inner.width >= 32
+    {
         ((cards[selected].avatar.side() as u16 / 2 + 2)
             .min(inner.width / 2 + 2)
-            .min(inner.height.saturating_sub((cards.len().min(3) * 3) as u16)))
+            .min(
+                inner
+                    .height
+                    .saturating_sub(cards.len().min(3) as u16 * card_height),
+            ))
         .max(18)
     } else {
         0
     };
     let list_height = inner.height.saturating_sub(portrait_height);
-    let visible = (list_height as usize / 3).max(1);
+    let visible = (list_height as usize / card_height as usize).max(1);
     let start = (selected + 1)
         .saturating_sub(visible)
         .min(cards.len().saturating_sub(visible));
     for (index, card) in cards.iter().enumerate().skip(start).take(visible) {
-        let y = inner.y + ((index - start) * 3) as u16;
-        let height = 3.min(inner.y + list_height - y);
+        let y = inner.y + (index - start) as u16 * card_height;
+        let height = card_height.min(inner.y + list_height - y);
         if height == 0 {
             continue;
         }
@@ -138,7 +161,7 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
             dim()
         };
         f.render_widget(
-            Paragraph::new("▎\n▎\n▎").style(marker),
+            Paragraph::new((0..height).map(|_| "▎").collect::<Vec<_>>().join("\n")).style(marker),
             Rect::new(row.x, row.y, 1, row.height),
         );
         f.render_widget(
@@ -146,14 +169,15 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
                 avatar: card.avatar,
                 mode: app.cfg.avatar_style,
             },
-            Rect::new(row.x + 1, row.y, 6, row.height),
+            Rect::new(row.x + 1, row.y, thumbnail, row.height),
         );
         ui.push(
-            Rect::new(row.x + 1, row.y, 6, row.height),
+            Rect::new(row.x + 1, row.y, thumbnail, row.height),
             Action::ShowProfile(index),
         );
-        let x = row.x + 8;
-        let width = row.width.saturating_sub(8);
+        let x = row.x + thumbnail + 2;
+        let width = row.width.saturating_sub(thumbnail + 2);
+        let text_y = y + height.saturating_sub(3) / 2;
         let name = pad_name(&card.name, width.saturating_sub(8) as usize);
         let header = Line::from(vec![
             Span::styled(
@@ -190,14 +214,14 @@ fn participants(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
         ]);
         f.render_widget(
             Paragraph::new(vec![header, states, meter]),
-            Rect::new(x, y, width, height),
+            Rect::new(x, text_y, width, 3.min(height)),
         );
         if index == 0 && height >= 2 {
             if width >= 9 {
-                ui.push(Rect::new(x, y + 1, 9, 1), Action::ToggleMute);
+                ui.push(Rect::new(x, text_y + 1, 9, 1), Action::ToggleMute);
             }
             if width >= 20 {
-                ui.push(Rect::new(x + 11, y + 1, 9, 1), Action::ToggleDeaf);
+                ui.push(Rect::new(x + 11, text_y + 1, 9, 1), Action::ToggleDeaf);
             }
         }
     }
@@ -389,6 +413,42 @@ fn level_bar(pct: u8) -> String {
     format!("{}{}", "█".repeat(n), "░".repeat(BAR_CELLS - n))
 }
 
+pub(super) fn input_window(text: &str, cursor: usize, cells: usize) -> (String, u16) {
+    if cells == 0 {
+        return (String::new(), 0);
+    }
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    let budget = if cursor == text.len() {
+        cells.saturating_sub(1)
+    } else {
+        cells / 2
+    };
+    let mut start = cursor;
+    let mut before = 0;
+    for (i, c) in text[..cursor].char_indices().rev() {
+        let width = c.width().unwrap_or(0);
+        if before + width > budget {
+            break;
+        }
+        before += width;
+        start = i;
+    }
+    let mut visible = String::new();
+    let mut used = 0;
+    for c in text[start..].chars() {
+        let width = c.width().unwrap_or(0);
+        if used + width > cells {
+            break;
+        }
+        visible.push(c);
+        used += width;
+    }
+    (visible, before as u16)
+}
+
 fn chat(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
     let focused = matches!(app.focus, Focus::Pane(Pane::Main) | Focus::Input);
     let block = Block::bordered()
@@ -415,44 +475,73 @@ fn chat(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
             Rect::new(inner.x, inner.y + inner.height - 2, inner.width, 1),
         );
     }
-    let visible: String = app
-        .input
-        .chars()
-        .rev()
-        .take(input.width.saturating_sub(3) as usize)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
+    let (visible, cursor) = input_window(
+        &app.input,
+        app.input_cursor,
+        input.width.saturating_sub(3) as usize,
+    );
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(
-                "> {visible}{}",
-                if app.focus == Focus::Input { "▏" } else { "" }
-            ),
-            if app.focus == Focus::Input {
-                strong()
-            } else {
-                dim()
-            },
-        ))),
+        Paragraph::new(format!("> {visible}")).style(if app.focus == Focus::Input {
+            strong()
+        } else {
+            dim()
+        }),
         input,
     );
+    if app.focus == Focus::Input
+        && app.overlay.is_none()
+        && app.file_input.is_none()
+        && input.width > 2
+    {
+        f.set_cursor_position((input.x + 2 + cursor, input.y));
+    }
+    if inner.height >= 3
+        && app.focus == Focus::Pane(Pane::Main)
+        && let Some(file) = app.selected_file()
+        && let crate::transfer::TransferStatus::Offered { expires_at } = file.status
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let seconds = expires_at.saturating_sub(now);
+        let label = format!(
+            "[ Y скачать ] [ N отказаться ] · {}:{:02}",
+            seconds / 60,
+            seconds % 60
+        );
+        let area = Rect::new(inner.x, input.y - 1, inner.width, 1);
+        f.render_widget(Paragraph::new(label).style(accent()), area);
+        ui.push(
+            Rect::new(area.x, area.y, 13.min(area.width), 1),
+            Action::FileDecision(true),
+        );
+        if area.width > 14 {
+            ui.push(
+                Rect::new(area.x + 14, area.y, 15.min(area.width - 14), 1),
+                Action::FileDecision(false),
+            );
+        }
+    }
     ui.push(input, Action::FocusInput);
-    ui.push(msg, Action::Click(Pane::Main, 0));
+    ui.push(
+        msg,
+        Action::Click(Pane::Main, app.chat.len().saturating_sub(1)),
+    );
     let text = Rect {
         width: msg.width.saturating_sub(1),
         ..msg
     };
+    let layout_width = text.width.saturating_sub(4);
     let mut cache = app.chat_layout.borrow_mut();
     if !cache.as_ref().is_some_and(|c| {
-        c.messages == app.chat.len() && c.width == text.width && c.selected == app.selected_link
+        c.messages == app.chat.len() && c.width == layout_width && c.selected == app.selected_link
     }) {
         *cache = Some(crate::chat_links::LayoutCache {
             messages: app.chat.len(),
-            width: text.width,
+            width: layout_width,
             selected: app.selected_link,
-            layout: crate::chat_links::layout(&app.chat, text.width, app.selected_link),
+            layout: crate::chat_links::layout(&app.chat, layout_width, app.selected_link),
         });
     }
     let layout = &cache.as_ref().unwrap().layout;
@@ -460,7 +549,21 @@ fn chat(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
         *app.chat_targets.borrow_mut() = layout.targets.clone();
     }
     let height = text.height as usize;
+    app.chat_view_height.set(height);
     let mut start = layout.rows.len().saturating_sub(height + app.chat_scroll);
+    if let Some(selected) = app.chat_selected {
+        let first = layout.rows.iter().position(|r| r.message == selected);
+        let last = layout.rows.iter().rposition(|r| r.message == selected);
+        if let (Some(first), Some(last)) = (first, last) {
+            if last - first + 1 > height {
+                start = first + app.chat_scroll.min(last - first + 1 - height);
+            } else if first < start {
+                start = first;
+            } else if last >= start + height {
+                start = (last + 1).saturating_sub(height).min(first);
+            }
+        }
+    }
     if let Some(index) = app.selected_link
         && let Some(&row) = layout.target_rows.get(index)
     {
@@ -477,14 +580,29 @@ fn chat(app: &App, f: &mut Frame, ui: &mut Ui, area: Rect) {
         .take(height)
         .enumerate()
         .map(|(y, row)| {
+            ui.push(
+                Rect::new(text.x, text.y + y as u16, text.width, 1),
+                Action::Click(Pane::Main, row.message),
+            );
             for &(x, width, index) in &row.hits {
-                let rect = Rect::new(text.x + x, text.y + y as u16, width, 1);
+                let rect = Rect::new(text.x + 2 + x, text.y + y as u16, width, 1);
                 app.chat_hits
                     .borrow_mut()
                     .push(crate::chat_links::Hit { area: rect, index });
                 ui.push(rect, Action::OpenLink(index));
             }
-            row.line.clone()
+            let selected =
+                app.chat_selected == Some(row.message) && app.focus == Focus::Pane(Pane::Main);
+            let mut line = row.line.clone();
+            line.spans.insert(
+                0,
+                Span::styled(if selected { "[ " } else { "  " }, accent()),
+            );
+            if selected {
+                line.spans.push(Span::styled(" ]", accent()));
+                line = line.style(Style::new().bg(ratatui::style::Color::Rgb(24, 35, 49)));
+            }
+            line
         })
         .collect::<Vec<_>>();
     if app.chat.is_empty() {
@@ -548,6 +666,135 @@ mod tests {
         (screen, ui)
     }
 
+    #[test]
+    fn page_navigation_reveals_the_end_of_a_wrapped_message() {
+        let mut app = app();
+        app.focus = Focus::Pane(Pane::Main);
+        app.chat_selected = Some(0);
+        app.chat.push(ChatLine {
+            mine: false,
+            name: "Friend".into(),
+            text: format!("{}LASTPART", "wrapped ".repeat(120)),
+            status: 3,
+            attachment: None,
+        });
+        let (before, _) = draw(&app, 100, 12);
+        assert!(!before.contains("LASTPART"));
+        let rows = app.chat_layout.borrow().as_ref().unwrap().layout.rows.len();
+        let height = app.chat_view_height.get();
+        for _ in 0..(rows - height).div_ceil(height) {
+            app.on_action(Action::PageDown);
+        }
+        let (after, _) = draw(&app, 100, 12);
+        assert!(after.contains("LASTPART"));
+        assert_eq!(app.chat_selected, Some(0));
+    }
+    #[test]
+    fn input_viewport_keeps_wide_unicode_cursor_inside_the_line() {
+        for text in ["А🙂界abcxyz", "abcdefghijklmnop", "é🙂"] {
+            for cursor in text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(text.len()))
+            {
+                for width in 1..12 {
+                    let (visible, column) = input_window(text, cursor, width);
+                    assert!(visible.width() <= width);
+                    assert!((column as usize) < width);
+                }
+            }
+        }
+    }
+    #[test]
+    fn history_selection_scrolls_highlights_and_offers_have_context_actions() {
+        let mut app = app();
+        for n in 0..40 {
+            app.chat.push(ChatLine {
+                mine: false,
+                name: "Friend".into(),
+                text: format!("message {n}"),
+                status: 3,
+                attachment: None,
+            });
+        }
+        app.chat_selected = Some(2);
+        app.focus = Focus::Pane(Pane::Main);
+        let (screen, _) = draw(&app, 120, 24);
+        assert!(screen.contains("[ Friend: message 2 ]"));
+        assert!(!screen.contains("message 39"));
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 120;
+        app.chat[2].attachment = Some(crate::transfer::TransferUpdate {
+            id: 22,
+            sending: false,
+            peer_id: Some(7),
+            peer_name: None,
+            name: "choice.txt".into(),
+            size: 12,
+            done: 0,
+            status: crate::transfer::TransferStatus::Offered { expires_at },
+            path: None,
+        });
+        app.chat_layout.get_mut().take();
+        let (screen, ui) = draw(&app, 140, 28);
+        assert!(screen.contains("[ Y скачать ]"));
+        let row = screen
+            .lines()
+            .position(|s| s.contains("[ Y скачать ]"))
+            .unwrap() as u16;
+        let line = screen.lines().nth(row as usize).unwrap();
+        let x = line.chars().position(|c| c == '[').unwrap() as u16;
+        assert_eq!(ui.hit(x + 2, row), Some(Action::FileDecision(true)));
+        app.chat[2].attachment.as_mut().unwrap().status = crate::transfer::TransferStatus::Complete;
+        app.chat[2].attachment.as_mut().unwrap().path =
+            Some(std::path::PathBuf::from("/tmp/choice.txt"));
+        app.chat_layout.get_mut().take();
+        let (_, ui) = draw(&app, 140, 28);
+        assert_eq!(
+            app.chat_targets.borrow().as_slice(),
+            &[crate::chat_links::OpenTarget::File(
+                std::path::PathBuf::from("/tmp/choice.txt")
+            )]
+        );
+        let hit = app.chat_hits.borrow().first().unwrap().clone();
+        assert_eq!(
+            ui.hit(hit.area.x, hit.area.y),
+            Some(Action::OpenLink(hit.index))
+        );
+    }
+    #[test]
+    fn increasing_resolution_gives_thumbnails_more_pixels_without_hiding_names_in_small_windows() {
+        use ratatui::style::Color;
+        let mut app = app();
+        app.avatar = std::sync::Arc::new(crate::avatar::Avatar::identicon("large").resized(256));
+        let count = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+            let mut ui = Ui::default();
+            terminal
+                .draw(|f| render(app, f, &mut ui, f.area()))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .filter(|c| matches!(c.fg, Color::Rgb(..)))
+                .count()
+        };
+        app.cfg.avatar_resolution = 32;
+        let small = count(&app);
+        app.cfg.avatar_resolution = 256;
+        let large = count(&app);
+        assert!(
+            large > small * 3,
+            "thumbnail did not gain detail: {small} -> {large}"
+        );
+        let (screen, _) = draw(&app, 80, 24);
+        assert!(screen.contains("Лексей (вы)"));
+    }
     #[test]
     fn shows_both_names_peer_mute_ping_and_chat_author() {
         let mut app = app();

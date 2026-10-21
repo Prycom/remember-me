@@ -16,8 +16,10 @@ use std::{
 
 pub const SIDE: usize = 32;
 pub const COLORS: usize = 32;
-pub const RESOLUTIONS: [u16; 6] = [16, 32, 48, 64, 96, 128];
-pub const MAX_SIDE: usize = 128;
+pub const RESOLUTIONS: [u16; 17] = [
+    8, 12, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256,
+];
+pub const MAX_SIDE: usize = 256;
 pub const MAX_BYTES: usize = COLORS * 3 + MAX_SIDE * MAX_SIDE;
 pub const CHUNK_BYTES: usize = 1024;
 pub const MAX_CHUNKS: usize = MAX_BYTES.div_ceil(CHUNK_BYTES);
@@ -82,7 +84,7 @@ impl Avatar {
     }
     pub fn load_at(path: &Path, resolution: u16) -> Result<Self, String> {
         if !RESOLUTIONS.contains(&resolution) {
-            return Err("размер аватарки: 16, 32, 48, 64, 96 или 128".into());
+            return Err("выберите размер аватарки от 8 до 256 в настройках".into());
         }
         let metadata = std::fs::metadata(path).map_err(|e| format!("картинка: {e}"))?;
         if !metadata.is_file() {
@@ -135,7 +137,7 @@ impl Avatar {
             .into_rgba8();
         Ok(Self::quantize(square.as_raw()))
     }
-    /// Rebuild from the cached 128px source; never repeatedly resize the thumbnail.
+    /// Rebuild from the cached source; never repeatedly resize the thumbnail.
     pub fn resized(&self, resolution: u16) -> Self {
         assert!(self.valid() && RESOLUTIONS.contains(&resolution));
         if self.side() == resolution as usize {
@@ -238,8 +240,11 @@ impl Avatar {
         }
         Self { palette, pixels }
     }
+    #[cfg(test)]
     fn color(&self, x: usize, y: usize) -> Option<[u8; 3]> {
-        let side = self.side();
+        self.color_at(x, y, self.side())
+    }
+    fn color_at(&self, x: usize, y: usize, side: usize) -> Option<[u8; 3]> {
         let radius = (side * 6 / 32) as i32;
         let dx = (radius - x as i32)
             .max(x as i32 - (side as i32 - radius - 1))
@@ -293,17 +298,20 @@ impl Widget for Portrait<'_> {
             return;
         }
         let height = width / 2;
+        let side = self.avatar.side();
         let left = area.x + (area.width - width) / 2;
         let top = area.y + (area.height - height) / 2;
         for y in 0..height {
             for x in 0..width {
-                let upper = self.avatar.color(
-                    x as usize * self.avatar.side() / width as usize,
-                    y as usize * 2 * self.avatar.side() / (height as usize * 2),
+                let upper = self.avatar.color_at(
+                    x as usize * side / width as usize,
+                    y as usize * 2 * side / (height as usize * 2),
+                    side,
                 );
-                let lower = self.avatar.color(
-                    x as usize * self.avatar.side() / width as usize,
-                    (y as usize * 2 + 1) * self.avatar.side() / (height as usize * 2),
+                let lower = self.avatar.color_at(
+                    x as usize * side / width as usize,
+                    (y as usize * 2 + 1) * side / (height as usize * 2),
+                    side,
                 );
                 let cell = &mut buffer[(left + x, top + y)];
                 if self.mode == AvatarStyle::Ascii {
@@ -632,7 +640,7 @@ mod tests {
         assert_eq!(old.avatar_resolution, 32);
         assert!(old.avatar_original.is_none());
         assert!(Avatar::decode(&vec![0; MAX_BYTES + 1]).is_none());
-        assert!(Avatar::load_at(Path::new("unused"), 256).is_err());
+        assert!(Avatar::load_at(Path::new("unused"), 512).is_err());
     }
     #[test]
     fn chunk_sync_survives_data_and_ack_loss_and_stays_within_vpn_mtu() {
