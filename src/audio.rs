@@ -34,6 +34,8 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const FRAME_SAMPLES: usize = 960; // 20 мс моно @48k
 pub const BITRATE: i32 = 32_000;
 pub const ECHO_DELAY_MS: u64 = 250;
+/// Never replay a long recording after a stalled network task.
+pub const MAX_PENDING_AUDIO: usize = 6;
 /// маркер «устройство ещё не подключено»
 const NEVER: &str = "\0";
 
@@ -135,7 +137,7 @@ impl Decoder {
 
     /// Preserve the codec timeline on packet loss. Recover the most recent
     /// missing frame using in-band FEC (PLC if absent), earlier ones by PLC.
-    fn decode_with_loss(&mut self, pkt: &[u8], missing: u32) -> Result<Vec<f32>, String> {
+    pub fn decode_with_loss(&mut self, pkt: &[u8], missing: u32) -> Result<Vec<f32>, String> {
         let missing = missing.min(3);
         let mut samples = Vec::with_capacity((missing as usize + 1) * FRAME_SAMPLES);
         for i in 0..missing {
@@ -688,10 +690,31 @@ fn st_push(st: &mut OutFeed, samples: &[f32]) {
 
 // ── Держатель всего звука ──────────────────────────────────────────────────
 
+type MediaTarget = Arc<Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>>;
+
+pub struct MediaRoute {
+    target: MediaTarget,
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl Drop for MediaRoute {
+    fn drop(&mut self) {
+        let mut target = self.target.lock().unwrap();
+        // An old session must not detach a newly started one.
+        if target
+            .as_ref()
+            .is_some_and(|s| s.same_channel(&self.sender))
+        {
+            *target = None;
+        }
+    }
+}
+
 pub struct AudioEngine {
     pub params: AudioParams,
     /// канал, куда кодер кладёт Opus-кадры (main pump шлёт их в net-сессию)
     pub encoded_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    media_target: MediaTarget,
     /// состояние «я говорю» (для UI/индикатора)
     pub self_speaking: Arc<AtomicBool>,
     out: Arc<Mutex<OutFeed>>,
@@ -705,6 +728,37 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
+    pub fn route_media(&self, sender: tokio::sync::mpsc::Sender<Vec<u8>>) -> MediaRoute {
+        *self.media_target.lock().unwrap() = Some(sender.clone());
+        MediaRoute {
+            target: self.media_target.clone(),
+            sender,
+        }
+    }
+
+    /// Runs on a runtime worker, independently of terminal input, rendering,
+    /// settings and chat history. No UI polling is needed to send voice.
+    pub async fn forward_encoded(
+        self: Arc<Self>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        while let Some(frame) = rx.recv().await {
+            let mut pending = VecDeque::from([frame]);
+            while let Ok(frame) = rx.try_recv() {
+                if pending.len() == MAX_PENDING_AUDIO {
+                    pending.pop_front();
+                }
+                pending.push_back(frame);
+            }
+            let target = self.media_target.lock().unwrap().clone();
+            if let Some(target) = target {
+                for frame in pending {
+                    let _ = target.try_send(frame);
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn for_test() -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
         let (encoded_tx, encoded_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -713,6 +767,7 @@ impl AudioEngine {
             Arc::new(Self {
                 params: AudioParams::new(100, 100, false, 25),
                 encoded_tx,
+                media_target: Arc::new(Mutex::new(None)),
                 self_speaking: Arc::new(AtomicBool::new(false)),
                 out: Arc::new(Mutex::new(OutFeed {
                     deq: VecDeque::new(),
@@ -999,17 +1054,20 @@ impl AudioEngine {
                             .store(clipping_hold > 0, Ordering::Relaxed);
                         filter.process(&mut frame, params.voice_filter());
                         let unsuppressed_rms = rms(&frame);
+                        let gain = params.gain_in() as f32 / 100.0;
+                        for sample in &mut frame {
+                            *sample *= gain;
+                        }
                         let speech_probability = denoiser
                             .process(&mut frame, params.noise_suppression() && !params.mute_mic());
                         // Keep suppressed residual noise out of VOX and AGC.
                         // The existing hangover still preserves quiet endings.
-                        let likely_speech = speech_probability.is_none_or(|p| p >= 0.6);
+                        let likely_speech = speech_probability.is_none_or(|p| p >= 0.35);
                         let continuing_speech = likely_speech
-                            || (was_speaking && speech_probability.is_some_and(|p| p >= 0.2));
-                        let gain = params.gain_in() as f32 / 100.0;
+                            || (was_speaking && speech_probability.is_some_and(|p| p >= 0.1));
                         // уровень микрофона для индикатора (RMS проценты)
                         {
-                            params.store_in_level((rms(&frame) * gain * 300.0).min(100.0) as u8);
+                            params.store_in_level((rms(&frame) * 300.0).min(100.0) as u8);
                         }
                         // Режимы как в Discord: mute перекрывает всё;
                         // PTT — говорим только при зажатом спейсе; VOX — по порогу
@@ -1019,11 +1077,7 @@ impl AudioEngine {
                         // in PTT. Zeroing individual quiet samples distorts
                         // zero crossings and makes fading words buzz.
                         let (speaking_now, strong_speech) = gate.update(
-                            if continuing_speech {
-                                rms(&frame) * gain
-                            } else {
-                                0.0
-                            },
+                            if continuing_speech { rms(&frame) } else { 0.0 },
                             vad_amplitude(params.vad_threshold()),
                             vox || params.noise_gate(),
                             ptt,
@@ -1037,17 +1091,13 @@ impl AudioEngine {
                             leveler.idle();
                             continue;
                         }
-                        if speech_probability.is_some() {
-                            leveler.process_with_reference(
-                                &mut frame,
-                                strong_speech && likely_speech,
-                                params.auto_gain(),
-                                gain,
-                                Some(unsuppressed_rms),
-                            );
-                        } else {
-                            leveler.process(&mut frame, strong_speech, params.auto_gain(), gain);
-                        }
+                        leveler.process_input(
+                            &mut frame,
+                            strong_speech && speech_probability.is_none_or(|p| p >= 0.6),
+                            params.auto_gain(),
+                            gain,
+                            speech_probability.map(|_| unsuppressed_rms),
+                        );
                         gate.apply(&mut frame);
                         params.store_in_level(level_percent(&frame));
                         let pcm_i16: Vec<i16> = frame.iter().map(|s| f32_to_i16(*s)).collect();
@@ -1140,6 +1190,7 @@ pub fn start(
     let engine = Arc::new(AudioEngine {
         params,
         encoded_tx,
+        media_target: Arc::new(Mutex::new(None)),
         self_speaking,
         out,
         echo_tx,
@@ -1165,6 +1216,52 @@ pub fn start(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn voice_routing_does_not_need_ui_polling_and_bounds_old_audio() {
+        let (engine, rx) = AudioEngine::for_test();
+        let (tx, mut media) = tokio::sync::mpsc::channel(MAX_PENDING_AUDIO);
+        let route = engine.route_media(tx);
+        // Simulate a delayed worker: keep the most recent 120 ms only.
+        for n in 0..100 {
+            engine.encoded_tx.send(vec![n]).unwrap();
+        }
+        let pump = tokio::spawn(engine.clone().forward_encoded(rx));
+        for n in 94..100 {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), media.recv())
+                    .await
+                    .unwrap(),
+                Some(vec![n])
+            );
+        }
+        engine.encoded_tx.send(vec![100]).unwrap();
+        assert_eq!(media.recv().await, Some(vec![100]));
+        drop(route);
+        assert!(media.recv().await.is_none());
+        pump.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_old_session_keeps_the_new_voice_route() {
+        let (engine, rx) = AudioEngine::for_test();
+        let (old_tx, _) = tokio::sync::mpsc::channel(MAX_PENDING_AUDIO);
+        let old = engine.route_media(old_tx);
+        let (new_tx, mut media) = tokio::sync::mpsc::channel(MAX_PENDING_AUDIO);
+        let new = engine.route_media(new_tx);
+        drop(old);
+        let pump = tokio::spawn(engine.clone().forward_encoded(rx));
+        engine.encoded_tx.send(vec![42]).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), media.recv())
+                .await
+                .unwrap(),
+            Some(vec![42])
+        );
+        drop(new);
+        assert!(media.recv().await.is_none());
+        pump.abort();
+    }
+
     fn encoder() -> (
         AudioParams,
         mpsc::SyncSender<Vec<f32>>,
@@ -1176,6 +1273,7 @@ mod tests {
         let engine = AudioEngine {
             params: params.clone(),
             encoded_tx,
+            media_target: Arc::new(Mutex::new(None)),
             self_speaking: Arc::new(AtomicBool::new(false)),
             out: Arc::new(Mutex::new(output(SAMPLE_RATE))),
             echo_tx,
@@ -1255,6 +1353,51 @@ mod tests {
             "quiet speech no longer audible: {}",
             rms(&output)
         );
+    }
+
+    #[tokio::test]
+    async fn input_preamp_changes_decoded_volume_with_and_without_denoising_and_agc() {
+        let mut input = crate::noise_suppress::tests::reference_speech();
+        input.truncate(4 * SAMPLE_RATE as usize + 1);
+        let scale = 0.006 / rms(&input);
+        for sample in &mut input {
+            *sample *= scale;
+        }
+        for denoise in [false, true] {
+            for automatic in [false, true] {
+                let mut levels = Vec::new();
+                for gain in [0, 50, 100, 200] {
+                    let (params, tx, mut rx) = encoder();
+                    params.set_noise_suppression(denoise);
+                    params.set_auto_gain(automatic);
+                    params.set_gain_in(gain);
+                    params.set_vox_mode(false);
+                    params.set_ptt_active(true);
+                    tx.send(input.clone()).unwrap();
+                    drop(tx);
+                    let mut decoder = Decoder::new().unwrap();
+                    let mut output = Vec::new();
+                    while let Some(packet) =
+                        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                            .await
+                            .unwrap()
+                    {
+                        output.extend(decoder.decode(&packet).unwrap());
+                    }
+                    assert!(output.len() > 3 * SAMPLE_RATE as usize);
+                    levels.push(rms(&output[SAMPLE_RATE as usize..]));
+                }
+                println!("preamp denoise={denoise} auto={automatic}: {levels:?}");
+                assert!(levels[0] < 0.0001, "0% must silence the input");
+                for pair in levels[1..].windows(2) {
+                    let ratio = pair[1] / pair[0];
+                    assert!(
+                        (1.65..2.25).contains(&ratio),
+                        "preamp cancelled or applied twice: {ratio}, denoise={denoise} auto={automatic}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,43 @@
+name: Build and publish test binaries
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release-test
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install audio and static server build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev libpulse-dev libasound2-dev pkg-config musl-tools
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl
+      - name: Test
+        run: cargo test --locked
+      - name: Build client and static relay
+        run: |
+          cargo build --release --locked --bin remember-me
+          cargo build --release --locked --no-default-features --bin remember-me-server --target x86_64-unknown-linux-musl
+          python3 tests/update_smoke.py
+          python3 scripts/release_manifest.py target/release/remember-me target/release
+      - name: Publish stable test URLs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view test --repo "$GITHUB_REPOSITORY" >/dev/null || gh release create test --repo "$GITHUB_REPOSITORY" --prerelease --title "Test build" --notes "Rolling test binaries. See README for installation and update instructions."
+          gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/test" --method PATCH -f sha="$GITHUB_SHA" -F force=true
+          gh release upload test target/release/remember-me target/release/remember-me.sha256 target/x86_64-unknown-linux-musl/release/remember-me-server --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload test target/release/remember-me.manifest.toml --repo "$GITHUB_REPOSITORY" --clobber
+          cp .github/test-release-notes.md "$RUNNER_TEMP/release-notes.md"
+          printf '\nBuilt from commit: %s\n' "$GITHUB_SHA" >> "$RUNNER_TEMP/release-notes.md"
+          gh release edit test --repo "$GITHUB_REPOSITORY" --prerelease --title "Test build ${GITHUB_SHA:0:7}" --notes-file "$RUNNER_TEMP/release-notes.md"

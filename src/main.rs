@@ -11,14 +11,18 @@
 
 mod app;
 mod audio;
+mod chat_links;
 mod config;
+mod group;
 mod net;
 mod noise_suppress;
 mod proto;
+mod transfer;
 mod ui;
+mod update;
 mod voice_level;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use argh::FromArgs;
 use crossterm::event::{
@@ -34,6 +38,14 @@ use remember_me::server;
 #[derive(FromArgs)]
 #[argh(description = "remember-me: P2P voice call + text chat")]
 struct Opts {
+    /// скачать и атомарно установить обновление из GitHub Release test
+    #[argh(switch)]
+    update: bool,
+
+    /// версия, время сборки и платформа, без звука и UI
+    #[argh(switch)]
+    build_info: bool,
+
     /// сразу в режим прослушивания (host)
     #[argh(switch, short = 'H')]
     host: bool,
@@ -61,6 +73,21 @@ struct Opts {
 
 fn main() {
     let opts: Opts = argh::from_env();
+    if opts.build_info {
+        print!("{}", update::build_info());
+        return;
+    }
+    if opts.update {
+        match update::run() {
+            Ok(Some(message)) => println!("{message}"),
+            Ok(None) => println!("установлена актуальная сборка"),
+            Err(error) => {
+                eprintln!("обновление: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     if let Some(target) = opts.check_server {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -129,7 +156,8 @@ async fn run(
     encoded_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     direct: Option<(bool, Option<String>)>,
 ) {
-    let mut app = App::new(cfg, engine, encoded_rx);
+    let audio_pump = tokio::spawn(engine.clone().forward_encoded(encoded_rx));
+    let mut app = App::new(cfg, engine);
     if let Some(err) = config::parse_error() {
         app.status = format!("внимание: конфиг не разобран ({err}) — настройки по умолчанию");
     }
@@ -148,6 +176,8 @@ async fn run(
     // на терминалах без поддержки тихо игнорируется
     let _ = crossterm::execute!(
         std::io::stdout(),
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
@@ -157,15 +187,22 @@ async fn run(
     );
 
     let mut res: std::io::Result<()> = Ok(());
+    let frame_period = Duration::from_millis(33);
+    let mut next_draw = Instant::now();
     loop {
         app.poll();
         app.tick_toast();
 
-        // вычитываем всё, что накопилось, в один кадр
-        loop {
-            match crossterm::event::poll(Duration::from_millis(10)) {
+        // Bound event draining: holding a key / moving the mouse must not
+        // postpone polling and drawing indefinitely. Render at most 30 FPS.
+        for _ in 0..64 {
+            match crossterm::event::poll(next_draw.saturating_duration_since(Instant::now())) {
                 Ok(true) => {}
-                _ => break,
+                Ok(false) => break,
+                Err(error) => {
+                    res = Err(error);
+                    break;
+                }
             }
             match crossterm::event::read() {
                 Ok(ev) => {
@@ -179,20 +216,41 @@ async fn run(
                     break;
                 }
             }
+            if Instant::now() >= next_draw {
+                break;
+            }
         }
         if app.quit || res.is_err() {
             break;
         }
 
-        res = term.draw(|f| ui::render(&app, f)).map(|_| ());
-        if res.is_err() {
-            break;
+        if Instant::now() >= next_draw {
+            let draw_started = Instant::now();
+            res = term.draw(|f| ui::render(&app, f)).map(|_| ());
+            if draw_started.elapsed() > Duration::from_millis(100)
+                && std::env::var("RM_DEBUG").ok().as_deref() == Some("1")
+            {
+                eprintln!(
+                    "[ui] slow terminal/render: {} ms",
+                    draw_started.elapsed().as_millis()
+                );
+            }
+            next_draw = Instant::now() + frame_period;
+            if res.is_err() {
+                break;
+            }
         }
     }
 
-    let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        PopKeyboardEnhancementFlags,
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
+    );
     ratatui::restore();
     app.stop_session();
+    audio_pump.abort();
     if let Err(e) = res {
         eprintln!("терминал: {e}");
     }

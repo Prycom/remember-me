@@ -1,7 +1,7 @@
 //! Speech level control at 48 kHz. Update AGC only on detected speech so
 //! silence/hangover does not progressively amplify microphone noise.
 
-const TARGET_RMS: f32 = 0.12; // about -18 dBFS, before the user's volume control
+const TARGET_RMS: f32 = 0.12; // about -18 dBFS at unity input gain
 const MAX_GAIN: f32 = 48.0;
 const PEAK_LIMIT: f32 = 0.95;
 
@@ -142,25 +142,31 @@ impl SpeechLeveler {
         *self = Self::default();
     }
 
+    #[cfg(test)]
     pub fn process(&mut self, frame: &mut [f32], speech: bool, automatic: bool, volume: f32) {
-        self.process_with_reference(frame, speech, automatic, volume, None);
+        for sample in frame.iter_mut() {
+            *sample *= volume;
+        }
+        self.process_input(frame, speech, automatic, volume, None);
     }
 
-    /// With denoising, estimate gain from the unsuppressed microphone level.
-    /// Otherwise small residual noise can be normalized back to full volume.
-    pub fn process_with_reference(
+    /// The input preamp has already been applied before denoising/VOX.
+    /// Measure AGC in original microphone units so it cannot cancel the user's
+    /// input gain. The raw reference prevents boosting suppressed noise.
+    pub fn process_input(
         &mut self,
         frame: &mut [f32],
         speech: bool,
         automatic: bool,
-        volume: f32,
+        input_gain: f32,
         reference_rms: Option<f32>,
     ) {
         let mut start = self.gain;
         if !automatic {
             self.gain = 1.0;
         } else if speech && !frame.is_empty() {
-            let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
+            let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt()
+                / input_gain.max(0.0001);
             let rms = reference_rms
                 .filter(|s| s.is_finite())
                 .map_or(rms, |reference| reference.max(rms));
@@ -186,14 +192,13 @@ impl SpeechLeveler {
         }
         let count = frame.len().max(1) as f32;
         for (i, sample) in frame.iter_mut().enumerate() {
-            // Ramp between frames to avoid gain-change clicks. Manual volume
-            // follows AGC, so it remains effective at both 0% and 200%.
+            // Ramp automatic gain without applying the input preamp twice.
             let gain = if automatic {
                 start + (self.gain - start) * (i + 1) as f32 / count
             } else {
                 1.0
             };
-            *sample *= gain * volume;
+            *sample *= gain;
         }
         self.limiter.process(frame);
     }

@@ -2,3 +2,5 @@
 
 mod relay_state;
 pub mod server;
+
+pub mod group_relay;

@@ -3,9 +3,27 @@
 
 use nnnoiseless::{DenoiseState, RnnModel};
 
-#[derive(Default)]
+// Calibrate the model eight times below full i16 scale. At full scale it
+// mistakes louder clean speech for noise. The inverse scale preserves level
+// and leaves headroom for the user's input preamp.
+const MODEL_SCALE: f32 = 4_096.0;
+
 pub struct NoiseSuppressor {
     state: Option<Box<DenoiseState<'static>>>,
+    dry_delay: [f32; 480],
+    speech_hold: u8,
+    dry_mix: f32,
+}
+
+impl Default for NoiseSuppressor {
+    fn default() -> Self {
+        Self {
+            state: None,
+            dry_delay: [0.0; 480],
+            speech_hold: 0,
+            dry_mix: 0.0,
+        }
+    }
 }
 
 impl NoiseSuppressor {
@@ -14,7 +32,9 @@ impl NoiseSuppressor {
     /// Disabled mode is an exact bypass and releases per-stream RNN state.
     pub fn process(&mut self, samples: &mut [f32], enabled: bool) -> Option<f32> {
         if !enabled {
-            self.state = None;
+            if self.state.is_some() {
+                *self = Self::default();
+            }
             return None;
         }
         debug_assert_eq!(samples.len() % DenoiseState::FRAME_SIZE, 0);
@@ -30,15 +50,36 @@ impl NoiseSuppressor {
         for chunk in samples.chunks_exact_mut(DenoiseState::FRAME_SIZE) {
             for (dst, src) in input.iter_mut().zip(chunk.iter()) {
                 *dst = if src.is_finite() {
-                    src.clamp(-1.0, 1.0) * 32_768.0
+                    src.clamp(-8.0, 8.0) * MODEL_SCALE
                 } else {
                     0.0
                 };
             }
-            probability = probability.max(state.process_frame(&mut output, &input));
-            for (dst, src) in chunk.iter_mut().zip(output) {
-                *dst = if src.is_finite() { src / 32_768.0 } else { 0.0 };
+            let p = state.process_frame(&mut output, &input);
+            probability = probability.max(p);
+            if p >= 0.6 {
+                self.speech_hold = 20;
+            } else {
+                self.speech_hold = self.speech_hold.saturating_sub(1);
             }
+            // Preserve natural dynamics during speech instead of letting an
+            // occasional erroneous band mask erase a syllable. Background-only
+            // frames remain fully denoised. Align the dry path to RNNoise's
+            // 10 ms delay; an unaligned mix causes comb filtering/buzz.
+            let target = if self.speech_hold > 0 { 0.35 } else { 0.0 };
+            let step = (target - self.dry_mix) / chunk.len() as f32;
+            for (i, (dst, wet)) in chunk.iter_mut().zip(output).enumerate() {
+                self.dry_mix += step;
+                let dry = self.dry_delay[i];
+                self.dry_delay[i] = input[i] / MODEL_SCALE;
+                let wet = if wet.is_finite() {
+                    wet / MODEL_SCALE
+                } else {
+                    0.0
+                };
+                *dst = wet * (1.0 - self.dry_mix) + dry * self.dry_mix;
+            }
+            self.dry_mix = target;
         }
         Some(probability)
     }
@@ -83,6 +124,63 @@ pub(crate) mod tests {
         pcm.windows(2)
             .flat_map(|s| [s[0], (2.0 * s[0] + s[1]) / 3.0, (s[0] + 2.0 * s[1]) / 3.0])
             .collect()
+    }
+
+    #[test]
+    fn clean_speech_preserves_level_and_quiet_syllables_across_input_levels() {
+        let speech = reference_speech();
+        let original_rms = rms(&speech);
+        for target in [0.001, 0.002, 0.006, 0.02, 0.06] {
+            let mut suppressor = NoiseSuppressor::default();
+            let input: Vec<_> = speech.iter().map(|s| s * target / original_rms).collect();
+            let mut output = Vec::new();
+            for frame in input.chunks_exact(960) {
+                let mut frame = frame.to_vec();
+                suppressor.process(&mut frame, true);
+                output.extend(frame);
+            }
+            let ratio = rms(&output) / target;
+            assert!(
+                (0.78..1.1).contains(&ratio),
+                "input {target}: retained {ratio}"
+            );
+            // Compare aligned 100 ms syllables, rather than masking lost words
+            // behind a single average over the whole recording. Exclude the
+            // final second of recording tail/background rather than speech.
+            let mut retained = 0;
+            let mut active = 0;
+            let mut envelopes = Vec::new();
+            for start in (4_800..output.len() - 48_000).step_by(4_800) {
+                let before = rms(&input[start..start + 4_800]);
+                if before > target * 0.2 {
+                    active += 1;
+                    let after = rms(&output[start + 480..start + 5_280]);
+                    envelopes.push((before, after));
+                    if after / before > 0.5 {
+                        retained += 1;
+                    }
+                }
+            }
+            envelopes.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            let quarter = envelopes.len() / 4;
+            let average = |part: &[(f32, f32)]| -> (f32, f32) {
+                let input = part.iter().map(|p| p.0).sum::<f32>();
+                let output = part.iter().map(|p| p.1).sum::<f32>();
+                (input, output)
+            };
+            let quiet = average(&envelopes[..quarter]);
+            let loud = average(&envelopes[envelopes.len() - quarter..]);
+            let dynamics_change = 20.0 * ((loud.1 / quiet.1) / (loud.0 / quiet.0)).log10();
+            assert!(
+                dynamics_change.abs() < 3.0,
+                "dynamic range changed by {dynamics_change} dB at {target}"
+            );
+            println!("clean {target}: retained level {ratio:.3}, syllables {retained}/{active}");
+            assert!(
+                retained * 100 >= active * 95,
+                "lost syllables at {target}: {retained}/{active}"
+            );
+        }
     }
 
     #[test]

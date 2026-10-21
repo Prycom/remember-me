@@ -13,7 +13,7 @@ pub struct Config {
     /// id выбранного устройства ввода "(дефолт)" / имя устройства
     pub input_device: String,
     pub output_device: String,
-    /// громкость микрофона 0..200 (%)
+    /// Усиление входного сигнала до шумодава и VOX, 0..200 (%).
     pub gain_in: u8,
     /// громкость собеседника 0..200 (%)
     pub gain_peer: u8,
@@ -31,6 +31,10 @@ pub struct Config {
     pub noise_suppression: bool,
     /// адрес ретранслятора для звонков по коду комнаты ("1.2.3.4:51900")
     pub server_addr: String,
+    /// Empty uses the platform Downloads directory.
+    pub download_dir: String,
+    /// Check the fixed GitHub test channel once at startup; replace atomically.
+    pub auto_update: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +65,8 @@ impl Default for Config {
             voice_filter: false,
             noise_suppression: false,
             server_addr: String::new(),
+            download_dir: String::new(),
+            auto_update: true,
         }
     }
 }
@@ -73,18 +79,80 @@ pub fn parse_error() -> Option<&'static String> {
     PARSE_ERR.get()
 }
 
+pub fn home_directory() -> PathBuf {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+pub fn expand_path(value: &str) -> PathBuf {
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(value);
+    if value == "~" {
+        home_directory()
+    } else if let Some(suffix) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        home_directory().join(suffix)
+    } else {
+        PathBuf::from(value)
+    }
+}
+
 impl Config {
+    pub fn download_directory(&self) -> PathBuf {
+        if !self.download_dir.trim().is_empty() {
+            let path = expand_path(&self.download_dir);
+            return if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            };
+        }
+        // Honour Linux's localized XDG Downloads directory without invoking a shell.
+        let user_dirs = Self::path()
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("user-dirs.dirs"));
+        if let Some(text) = user_dirs.and_then(|p| std::fs::read_to_string(p).ok()) {
+            for line in text.lines() {
+                if let Some(value) = line.trim().strip_prefix("XDG_DOWNLOAD_DIR=") {
+                    let value = value.trim().trim_matches('"');
+                    if value == "$HOME" {
+                        return home_directory();
+                    }
+                    if let Some(suffix) = value.strip_prefix("$HOME/") {
+                        return home_directory().join(suffix);
+                    }
+                    let path = PathBuf::from(value);
+                    if path.is_absolute() {
+                        return path;
+                    }
+                }
+            }
+        }
+        home_directory().join("Downloads")
+    }
     pub fn path() -> PathBuf {
-        let dir = std::env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .ok()
-            .filter(|p| !p.as_os_str().is_empty())
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| PathBuf::from(h).join(".config"))
-            })
-            .unwrap_or_else(|| PathBuf::from("."));
+        let dir = std::env::var(if cfg!(windows) {
+            "APPDATA"
+        } else {
+            "XDG_CONFIG_HOME"
+        })
+        .map(PathBuf::from)
+        .ok()
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
         dir.join("remember-me").join("config.toml")
     }
 

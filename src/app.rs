@@ -7,12 +7,15 @@
 //   Текст поверх звонка          ↔  переписка (DM)
 //   Настройки сохраняются сразу  ↔  appSettings.set (см. config.rs)
 
+use crate::chat_links::{Hit, OpenTarget};
+use crate::transfer::{TransferStatus, TransferUpdate};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use tokio::sync::mpsc;
 
 use crate::audio::{AudioEngine, DeviceList};
@@ -49,12 +52,15 @@ pub struct PeerInfo {
 }
 
 /// status для своих сообщений: 0 напоследок, 1 доставлено, 2 не доставлено
+#[derive(serde::Serialize, serde::Deserialize, Hash)]
 pub struct ChatLine {
     pub mine: bool,
     pub name: String,
     pub text: String,
     /// 0 напоследок, 1 доставлено, 2 не доставлено, 3 без статуса
     pub status: u8,
+    #[serde(default)]
+    pub attachment: Option<TransferUpdate>,
 }
 pub struct DevPick {
     pub input: bool,
@@ -76,7 +82,9 @@ pub const ROW_SERVER: usize = 10;
 pub const ROW_AUTO_GAIN: usize = 11;
 pub const ROW_FILTER: usize = 12;
 pub const ROW_DENOISE: usize = 13;
-pub const SETTINGS_ROWS: usize = 14;
+pub const ROW_DOWNLOAD: usize = 14;
+pub const ROW_AUTO_UPDATE: usize = 15;
+pub const SETTINGS_ROWS: usize = 16;
 
 const PENDING_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DIAL_MAX_TXT: &str = "60";
@@ -88,8 +96,9 @@ pub struct App {
     pub mode: Option<Mode>,
     pub screen: Screen,
     pub session: Option<Session>,
-    encoded_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     pub peer: Option<PeerInfo>,
+    pub group_room: Option<String>,
+    pub group_peers: Vec<crate::group::Participant>,
     pub incoming: Option<(String, String)>,
     pub status: String,
     pub hint_addrs: Vec<String>,
@@ -100,6 +109,15 @@ pub struct App {
     pub input: String,
     pub input_focus: bool,
     pub chat_scroll: usize,
+    pub file_input: Option<String>,
+    pub chat_hits: RefCell<Vec<Hit>>,
+    pub chat_layout: RefCell<Option<crate::chat_links::LayoutCache>>,
+    pub chat_targets: RefCell<Vec<OpenTarget>>,
+    pub selected_link: Option<usize>,
+    open_results: (
+        std::sync::mpsc::Sender<Result<(), String>>,
+        std::sync::mpsc::Receiver<Result<(), String>>,
+    ),
     pub msg_id: u32,
     pending: HashMap<u32, (usize, Instant)>,
     pub settings_sel: usize,
@@ -110,24 +128,28 @@ pub struct App {
     pub arm_hangup: bool,
     pub toast: Option<(String, Instant)>,
     pub quit: bool,
+    update_result: Option<(
+        bool,
+        std::sync::mpsc::Receiver<Result<Option<String>, String>>,
+    )>,
 }
 
 impl App {
-    pub fn new(
-        cfg: Config,
-        engine: Arc<AudioEngine>,
-        encoded_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    ) -> App {
-        Self::with_devices(cfg, engine, encoded_rx, crate::audio::list_devices())
+    pub fn new(cfg: Config, engine: Arc<AudioEngine>) -> App {
+        let automatic = cfg.auto_update;
+        let mut app = Self::with_devices(cfg, engine, crate::audio::list_devices());
+        if automatic {
+            app.start_update(false);
+        }
+        app
     }
 
     #[cfg(test)]
     pub fn for_test(cfg: Config) -> App {
-        let (engine, encoded_rx) = AudioEngine::for_test();
+        let (engine, _encoded_rx) = AudioEngine::for_test();
         Self::with_devices(
             cfg,
             engine,
-            encoded_rx,
             DeviceList {
                 inputs: vec![],
                 outputs: vec![],
@@ -135,12 +157,7 @@ impl App {
         )
     }
 
-    fn with_devices(
-        cfg: Config,
-        engine: Arc<AudioEngine>,
-        encoded_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-        devices: DeviceList,
-    ) -> App {
+    fn with_devices(cfg: Config, engine: Arc<AudioEngine>, devices: DeviceList) -> App {
         App {
             cfg,
             engine,
@@ -148,8 +165,9 @@ impl App {
             mode: None,
             screen: Screen::Home,
             session: None,
-            encoded_rx,
             peer: None,
+            group_room: None,
+            group_peers: Vec::new(),
             incoming: None,
             status: String::new(),
             hint_addrs: Vec::new(),
@@ -159,6 +177,12 @@ impl App {
             input: String::new(),
             input_focus: false,
             chat_scroll: 0,
+            file_input: None,
+            chat_hits: RefCell::new(Vec::new()),
+            chat_layout: RefCell::new(None),
+            chat_targets: RefCell::new(Vec::new()),
+            selected_link: None,
+            open_results: std::sync::mpsc::channel(),
             msg_id: 0,
             pending: HashMap::new(),
             settings_sel: 0,
@@ -169,12 +193,30 @@ impl App {
             arm_hangup: false,
             toast: None,
             quit: false,
+            update_result: None,
         }
     }
 
     // ── главный тик: события сети + перекачка аудио ─────────────────────────
 
     pub fn poll(&mut self) {
+        if let Some((manual, rx)) = &self.update_result
+            && let Ok(result) = rx.try_recv()
+        {
+            let manual = *manual;
+            self.update_result = None;
+            match result {
+                Ok(Some(message)) => self.set_toast(message),
+                Ok(None) if manual => self.set_toast("установлена актуальная сборка".into()),
+                Err(error) if manual => self.set_toast(error),
+                _ => {}
+            }
+        }
+        while let Ok(result) = self.open_results.1.try_recv() {
+            if let Err(error) = result {
+                self.set_toast(error);
+            }
+        }
         // события net (лежат внутри Session); собираем в буфер, чтобы не
         // конфликтовать с handle_net по &mut self
         let mut inbox: Vec<NetEvent> = Vec::new();
@@ -198,19 +240,12 @@ impl App {
                 self.set_session_screen(Screen::Home);
                 self.input_focus = false;
                 self.peer = None;
+                self.group_room = None;
+                self.group_peers.clear();
             }
         }
         for ev in inbox {
             self.handle_net(ev);
-        }
-        // аудио: кодированные кадры → net-сессия
-        while let Ok(frame) = self.encoded_rx.try_recv() {
-            // Drop audio captured before a call is accepted.
-            if let Some(sess) = &self.session
-                && self.peer.is_some()
-            {
-                let _ = sess.media_tx.send(frame);
-            }
         }
         // «не доставлено» по времени
         let now = Instant::now();
@@ -224,11 +259,22 @@ impl App {
             self.pending.remove(&id);
             if let Some(line) = self.chat.get_mut(idx) {
                 line.status = 2;
+                self.chat_layout.get_mut().take();
             }
         }
     }
 
     pub fn send_chat(&mut self) {
+        if let Some(path) = self.input.strip_prefix("/file ") {
+            let path = path.to_owned();
+            self.send_file(&path);
+            self.input.clear();
+            return;
+        }
+        if self.input.len() > crate::proto::TEXT_MAX {
+            self.set_toast(format!("сообщение длиннее {} байт", crate::proto::TEXT_MAX));
+            return;
+        }
         let text = std::mem::take(&mut self.input);
         if text.is_empty() {
             return;
@@ -241,11 +287,13 @@ impl App {
         let id = self.msg_id;
         let _ = tx.send(NetCmd::Text(text.clone()));
         let idx = self.chat.len();
+        self.chat_layout.get_mut().take();
         self.chat.push(ChatLine {
             mine: true,
             name: self.cfg.name.clone(),
             text,
             status: 0,
+            attachment: None,
         });
         self.pending.insert(id, (idx, Instant::now()));
         if let Some(k) = self.peer_file.clone() {
@@ -254,8 +302,122 @@ impl App {
         self.chat_scroll = 0;
     }
 
+    fn send_file(&mut self, path: &str) {
+        if path.trim().is_empty() {
+            self.set_toast("укажите путь к файлу".into());
+            return;
+        }
+        if let Some(session) = &self.session {
+            if !session.send(NetCmd::SendFile(crate::config::expand_path(path))) {
+                self.set_toast("сессия закрыта".into());
+            }
+        }
+    }
+    fn open_link(&mut self, index: usize) {
+        let target = self.chat_targets.borrow().get(index).cloned();
+        if let Some(target) = target {
+            self.selected_link = Some(index);
+            let tx = self.open_results.0.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::chat_links::open(target));
+            });
+        }
+    }
+    fn interrupt_transfers(&mut self) {
+        for line in &mut self.chat {
+            if let Some(file) = &mut line.attachment
+                && file.active()
+            {
+                file.status = TransferStatus::Failed("сессия завершена".into());
+                self.chat_layout.get_mut().take();
+                line.text = file.label();
+                if let Some(key) = &self.peer_file {
+                    append_file_log(key, line);
+                }
+            }
+        }
+    }
+
+    pub fn start_update(&mut self, manual: bool) {
+        if self.update_result.is_some() {
+            if manual {
+                self.set_toast("обновление уже проверяется".into());
+            }
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.update_result = Some((manual, rx));
+        if manual {
+            self.set_toast("скачиваем обновление из GitHub…".into());
+        }
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::update::run());
+        });
+    }
+    fn received_text(&mut self, name: String, text: String) {
+        self.chat_layout.get_mut().take();
+        self.chat.push(ChatLine {
+            mine: false,
+            name,
+            text,
+            status: 3,
+            attachment: None,
+        });
+        let line = self.chat.last().unwrap();
+        if let Some(key) = &self.peer_file {
+            append_chat_log(key, false, &line.name, &line.text);
+        }
+        self.chat_scroll = 0;
+    }
     fn handle_net(&mut self, ev: NetEvent) {
         match ev {
+            NetEvent::Transfer(update) => {
+                self.chat_layout.get_mut().take();
+                let complete = !update.active();
+                let index = self.chat.iter().position(|line| {
+                    line.mine == update.sending
+                        && line
+                            .attachment
+                            .as_ref()
+                            .is_some_and(|file| file.id == update.id)
+                });
+                let name = if update.sending {
+                    self.cfg.name.clone()
+                } else {
+                    update
+                        .peer_name
+                        .clone()
+                        .or_else(|| self.peer.as_ref().map(|p| p.name.clone()))
+                        .unwrap_or_else(|| "собеседник".into())
+                };
+                let line = ChatLine {
+                    mine: update.sending,
+                    name,
+                    text: update.label(),
+                    status: 3,
+                    attachment: Some(update.clone()),
+                };
+                let index = if let Some(i) = index {
+                    self.chat[i] = line;
+                    i
+                } else {
+                    self.chat.push(line);
+                    self.chat.len() - 1
+                };
+                if complete && let Some(key) = &self.peer_file {
+                    append_file_log(key, &self.chat[index]);
+                }
+                if update.status == TransferStatus::Complete && !update.sending {
+                    self.set_toast(format!(
+                        "файл сохранён: {}",
+                        update
+                            .path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    ));
+                }
+            }
             NetEvent::Progress(message) => self.status = message,
             NetEvent::Waiting { local_addrs } => {
                 self.hint_addrs = local_addrs;
@@ -295,6 +457,7 @@ impl App {
                 // история этого собеседника (у каждого свой файл — тогда в
                 // переписке не мелькают чужие/прошлые разговоры)
                 self.peer_file = Some(chat_peer_key(&peer_name));
+                self.chat_layout.get_mut().take();
                 self.chat = load_chat_log(&self.peer_file.clone().unwrap(), &self.cfg.name);
                 self.chat_scroll = 0;
                 self.peer = Some(PeerInfo {
@@ -310,6 +473,45 @@ impl App {
                 self.set_session_screen(Screen::Call);
                 self.status = "в звонке".into();
             }
+            NetEvent::GroupEntered { room, server } => {
+                use sha2::{Digest, Sha256};
+                self.interrupt_transfers();
+                let suffix = Sha256::digest(format!("{room}@{server}"));
+                let key = format!(
+                    "group-{room}-{:02x}{:02x}{:02x}{:02x}",
+                    suffix[0], suffix[1], suffix[2], suffix[3]
+                );
+                self.chat_layout.get_mut().take();
+                self.chat = load_chat_log(&key, &self.cfg.name);
+                self.peer_file = Some(key);
+                self.group_room = Some(format!("{room}@{server}"));
+                self.group_peers.clear();
+                self.peer = None;
+                self.pending.clear();
+                self.msg_id = 0;
+                self.chat_scroll = 0;
+                self.set_session_screen(Screen::Call);
+                self.status = format!("Комната {room}@{server} · код можно отправить друзьям");
+            }
+            NetEvent::GroupRoster(peers) => {
+                for line in &mut self.chat {
+                    if let Some(file) = &mut line.attachment
+                        && file.active()
+                        && file
+                            .peer_id
+                            .is_some_and(|id| !peers.iter().any(|p| p.id == id))
+                    {
+                        file.status = TransferStatus::Failed("участник вышел из комнаты".into());
+                        self.chat_layout.get_mut().take();
+                        line.text = file.label();
+                        if let Some(key) = &self.peer_file {
+                            append_file_log(key, line);
+                        }
+                    }
+                }
+                self.group_peers = peers;
+            }
+            NetEvent::GroupText { name, text } => self.received_text(name, text),
             NetEvent::Rtt(rtt) => {
                 if let Some(p) = self.peer.as_mut() {
                     p.rtt = Some(rtt);
@@ -338,27 +540,23 @@ impl App {
                     .as_ref()
                     .map(|p| p.name.clone())
                     .unwrap_or_else(|| "собеседник".into());
-                self.chat.push(ChatLine {
-                    mine: false,
-                    name,
-                    text,
-                    status: 3,
-                });
-                let line = self.chat.last().unwrap();
-                if let Some(k) = self.peer_file.clone() {
-                    append_chat_log(&k, false, &line.name, &line.text);
-                }
-                self.chat_scroll = 0;
+                self.received_text(name, text);
             }
             NetEvent::TextAck(id) => {
                 if let Some((idx, _)) = self.pending.remove(&id) {
                     if let Some(l) = self.chat.get_mut(idx) {
                         l.status = 1;
+                        self.chat_layout.get_mut().take();
                     }
                 }
             }
             NetEvent::CallEnded(msg) => {
+                self.interrupt_transfers();
+                self.file_input = None;
+                self.selected_link = None;
                 self.peer = None;
+                self.group_room = None;
+                self.group_peers.clear();
                 self.incoming = None;
                 self.peer_file = None;
                 self.input.clear();
@@ -419,12 +617,16 @@ impl App {
     }
 
     pub fn stop_session(&mut self) {
+        self.interrupt_transfers();
+        self.file_input = None;
         if let Some(s) = self.session.as_mut() {
             s.stop();
         }
         self.session = None;
         self.mode = None;
         self.peer = None;
+        self.group_room = None;
+        self.group_peers.clear();
         self.incoming = None;
         self.peer_file = None;
         self.input_focus = false;
@@ -524,6 +726,7 @@ impl App {
 
     // чат-скролл
     pub fn scroll_chat(&mut self, up: bool) {
+        self.selected_link = None;
         if up {
             self.chat_scroll = self.chat_scroll.saturating_add(5);
         } else {
@@ -559,6 +762,129 @@ impl App {
     }
 
     pub fn on_event(&mut self, ev: Event) {
+        if let Event::Key(k) = &ev
+            && k.code == KeyCode::F(5)
+            && k.kind == KeyEventKind::Press
+        {
+            self.start_update(true);
+            return;
+        }
+        if let Event::Paste(text) = &ev {
+            if let Some(path) = &mut self.file_input {
+                path.push_str(text.trim_end_matches(['\r', '\n']));
+            } else if let Some((_, buf)) = &mut self.edit {
+                if buf.len() + text.len() <= 4096 {
+                    buf.push_str(text);
+                }
+            } else if self.screen == Screen::Call && self.input_focus {
+                if self.input.len() + text.len() <= crate::proto::TEXT_MAX {
+                    self.input.push_str(text);
+                }
+            } else if self.screen == Screen::Connect {
+                self.conn_input.push_str(text.trim());
+            }
+            return;
+        }
+        if self.file_input.is_some() {
+            if let Event::Key(k) = ev {
+                if k.kind == KeyEventKind::Release {
+                    return;
+                }
+                match k.code {
+                    KeyCode::Esc => self.file_input = None,
+                    KeyCode::Enter => {
+                        let path = self.file_input.take().unwrap();
+                        self.send_file(&path);
+                    }
+                    KeyCode::Backspace => {
+                        self.file_input.as_mut().unwrap().pop();
+                    }
+                    KeyCode::Char(c)
+                        if !k
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        let path = self.file_input.as_mut().unwrap();
+                        if path.len() < 4096 {
+                            push_text_key(path, c, k.modifiers);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        if self.screen == Screen::Call {
+            if let Event::Mouse(mouse) = &ev {
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let index = self
+                            .chat_hits
+                            .borrow()
+                            .iter()
+                            .find(|hit| hit.area.contains((mouse.column, mouse.row).into()))
+                            .map(|hit| hit.index);
+                        if let Some(index) = index {
+                            self.open_link(index);
+                        }
+                    }
+                    MouseEventKind::ScrollUp => self.scroll_chat(true),
+                    MouseEventKind::ScrollDown => self.scroll_chat(false),
+                    _ => {}
+                }
+                return;
+            }
+            if let Event::Key(k) = &ev
+                && k.kind == KeyEventKind::Press
+            {
+                if k.code == KeyCode::F(3) {
+                    self.file_input = Some(String::new());
+                    self.selected_link = None;
+                    self.engine.params.set_ptt_active(false);
+                    return;
+                }
+                if k.code == KeyCode::F(4) {
+                    if let Some(file) = self
+                        .chat
+                        .iter()
+                        .rev()
+                        .filter_map(|line| line.attachment.as_ref())
+                        .find(|file| file.active())
+                        && let Some(session) = &self.session
+                    {
+                        session.send(NetCmd::CancelFile(file.id));
+                    }
+                    return;
+                }
+                if !self.input_focus {
+                    if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+                        let count = self.chat_targets.borrow().len();
+                        if count > 0 {
+                            let reverse = k.code == KeyCode::BackTab
+                                || k.modifiers.contains(KeyModifiers::SHIFT);
+                            self.selected_link = Some(match self.selected_link {
+                                Some(i) => {
+                                    if reverse {
+                                        (i + count - 1) % count
+                                    } else {
+                                        (i + 1) % count
+                                    }
+                                }
+                                None => self.chat_hits.borrow().first().map_or(0, |h| h.index),
+                            });
+                        }
+                        return;
+                    }
+                    if k.code == KeyCode::Enter
+                        && let Some(index) = self.selected_link
+                    {
+                        self.open_link(index);
+                        return;
+                    }
+                }
+            }
+        }
+
         if let Event::Key(k) = &ev {
             if k.code == KeyCode::F(2) && k.kind == KeyEventKind::Press {
                 self.open_settings();
@@ -747,6 +1073,8 @@ impl App {
                 (KeyCode::Char('t') | KeyCode::Char('е'), _) => {
                     self.engine.params.set_ptt_active(false);
                     self.input_focus = true;
+                    self.selected_link = None;
+                    self.chat_scroll = 0;
                 }
                 (KeyCode::Char('a') | KeyCode::Char('ф'), _) => {
                     let enabled = !self.engine.params.auto_gain();
@@ -838,6 +1166,12 @@ impl App {
                                     self.cfg.port = p;
                                 }
                             }
+                        } else if row == ROW_DOWNLOAD {
+                            self.cfg.download_dir = buf.trim().to_owned();
+                            if let Some(session) = &self.session {
+                                session
+                                    .send(NetCmd::DownloadDirectory(self.cfg.download_directory()));
+                            }
                         } else if row == ROW_SERVER {
                             let v = buf.trim().to_string();
                             // пусто = прямой режим; иначе ip:порт или host:порт
@@ -855,7 +1189,7 @@ impl App {
                                 return;
                             }
                         }
-                        if buf.len() < 64 {
+                        if buf.len() < if *row == ROW_DOWNLOAD { 4096 } else { 64 } {
                             push_text_key(buf, c, k.modifiers);
                         }
                     }
@@ -916,11 +1250,12 @@ impl App {
                 _ => {}
             }
             match sel {
-                ROW_NAME | ROW_PORT | ROW_SERVER => {
+                ROW_NAME | ROW_PORT | ROW_SERVER | ROW_DOWNLOAD => {
                     if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
                         let val = match sel {
                             ROW_NAME => self.cfg.name.clone(),
                             ROW_PORT => self.cfg.port.to_string(),
+                            ROW_DOWNLOAD => self.cfg.download_directory().display().to_string(),
                             _ => self.cfg.server_addr.clone(),
                         };
                         self.edit = Some((sel, val));
@@ -1024,6 +1359,12 @@ impl App {
                             .params
                             .set_noise_suppression(!self.engine.params.noise_suppression());
                         self.cfg_save_state();
+                    }
+                }
+                ROW_AUTO_UPDATE => {
+                    if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                        self.cfg.auto_update = !self.cfg.auto_update;
+                        self.cfg.save();
                     }
                 }
                 ROW_AUTO_GAIN => {
@@ -1183,11 +1524,28 @@ fn append_chat_log(key: &str, mine: bool, name: &str, text: &str) {
     }
 }
 
+fn append_file_log(key: &str, line: &ChatLine) {
+    if let Ok(record) = toml::to_string(line)
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(chat_path(key))
+    {
+        let _ = writeln!(file, "[{}] @rm3\t{}", fmt_ts(), escape_log(&record));
+    }
+}
+
 fn parse_chat_log(body: &str, my_name: &str) -> Vec<ChatLine> {
     body.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let rest = line.split_once("] ").map(|(_, r)| r).unwrap_or(line);
+            if let Some(record) = rest.strip_prefix("@rm3\t")
+                && let Ok(mut line) = toml::from_str::<ChatLine>(&unescape_log(record))
+            {
+                line.status = 3;
+                return line;
+            }
             if let Some(fields) = rest.strip_prefix("@rm2\t") {
                 let mut fields = fields.splitn(3, '\t');
                 let mine = fields.next() == Some("1");
@@ -1198,6 +1556,7 @@ fn parse_chat_log(body: &str, my_name: &str) -> Vec<ChatLine> {
                     name,
                     text,
                     status: 3,
+                    attachment: None,
                 }
             } else {
                 // Legacy logs stored only "Я" for own messages. The historical
@@ -1213,6 +1572,7 @@ fn parse_chat_log(body: &str, my_name: &str) -> Vec<ChatLine> {
                     },
                     text: text.to_string(),
                     status: 3,
+                    attachment: None,
                 }
             }
         })
@@ -1228,6 +1588,65 @@ fn load_chat_log(key: &str, my_name: &str) -> Vec<ChatLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachments_keep_real_names_and_local_paths_in_history() {
+        let line = ChatLine {
+            mine: false,
+            name: "Друг".into(),
+            text: "файл".into(),
+            status: 3,
+            attachment: Some(TransferUpdate {
+                id: 17,
+                peer_id: None,
+                peer_name: None,
+                sending: false,
+                name: "имя файла.txt".into(),
+                size: 5,
+                done: 5,
+                status: TransferStatus::Complete,
+                path: Some(std::path::PathBuf::from("/tmp/downloads/имя файла.txt")),
+            }),
+        };
+        let body = format!(
+            "[12:00] @rm3\t{}\n",
+            escape_log(&toml::to_string(&line).unwrap())
+        );
+        let restored = parse_chat_log(&body, "ЯСейчас");
+        assert_eq!(restored[0].name, "Друг");
+        let file = restored[0].attachment.as_ref().unwrap();
+        assert_eq!(file.status, TransferStatus::Complete);
+        assert_eq!(file.path, line.attachment.unwrap().path);
+        assert_eq!(restored[0].status, 3);
+    }
+
+    #[test]
+    fn file_prompt_preserves_chat_draft_and_bracketed_paste() {
+        let mut app = App::for_test(Config::default());
+        app.screen = Screen::Call;
+        app.input_focus = true;
+        app.input = "черновик".into();
+        key(
+            &mut app,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        );
+        app.on_event(Event::Paste("'/tmp/файл с пробелами.txt'".into()));
+        assert_eq!(
+            app.file_input.as_deref(),
+            Some("'/tmp/файл с пробелами.txt'")
+        );
+        key(
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        );
+        assert!(app.file_input.is_none());
+        assert_eq!(app.input, "черновик");
+        assert!(app.input_focus);
+    }
     use crossterm::event::KeyEvent;
 
     fn key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) {

@@ -9,8 +9,8 @@ default = ["client"]
 client = [
     "dep:ratatui", "dep:crossterm", "dep:cpal", "dep:opusic-sys",
     "dep:chacha20poly1305", "dep:x25519-dalek", "dep:sha2",
-    "dep:serde", "dep:toml", "dep:libc", "dep:nnnoiseless",
-    "tokio/sync", "tokio/signal", "tokio/fs",
+    "dep:serde", "dep:toml", "dep:libc", "dep:nnnoiseless", "dep:unicode-width",
+    "tokio/sync", "tokio/signal", "tokio/fs", "tokio/io-util",
 ]
 
 [[bin]]
@@ -31,6 +31,7 @@ name = "pulse_probe"
 required-features = ["client"]
 
 [dependencies]
+unicode-width = { version = "0.2.2", optional = true }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }

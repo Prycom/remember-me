@@ -62,9 +62,10 @@ pub async fn run_relay_with_options(port: u16, verbose: bool) -> Result<(), Stri
         socket.local_addr().unwrap().port()
     );
     println!(
-        "регистрация двух адресов не подтверждает установление звонка; пакеты HELLO/ACCEPT и счётчики пересылки показаны ниже"
+        "групповые комнаты: до 16 участников; регистрация не подтверждает получение голоса, состояние и пинг видны в клиентах"
     );
     let mut state = RelayState::default();
+    let mut groups = crate::group_relay::Rooms::default();
     let mut buf = [0u8; 1500];
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -75,6 +76,7 @@ pub async fn run_relay_with_options(port: u16, verbose: bool) -> Result<(), Stri
             _ = tick.tick() => None,
         };
         let now = Instant::now();
+        groups.expire(&socket, now).await;
         for (code, addr) in state.expire(now) {
             println!(
                 "комната {}: участник {addr} удалён — 20 с без его пакетов",
@@ -103,6 +105,9 @@ pub async fn run_relay_with_options(port: u16, verbose: bool) -> Result<(), Stri
         }
         let Some((n, from)) = received else { continue };
         let wire = &buf[..n];
+        if groups.receive(&socket, wire, from, now).await {
+            continue;
+        }
         if n == 9 && wire[0] == OP_PROBE {
             let mut reply = [0u8; 9];
             reply.copy_from_slice(wire);

@@ -12,6 +12,7 @@
 //   clear_header = [op][ssrc u32BE][seq u32BE]              (OP_AUDIO)
 //   clear_header = [op][counter u64BE]                      (остальные)
 //   nonce = prefix(16) || counter(8 BE), aad = clear_header
+//   v1: high counter bit is set for control, clear for audio (no nonce reuse).
 //   заголовок op/ssrc/seq остаётся открытым, как RTP header в Discord.
 //   Ответные пакеты — строго нарастающие counter'ы: replay/дубли отбрасываются.
 
@@ -29,11 +30,13 @@ pub const OP_AUDIO: u8 = 7;
 pub const OP_TEXT: u8 = 8;
 pub const OP_ACK: u8 = 9;
 pub const OP_STATUS: u8 = 10; // mute_mic / deafen (для отображения у собеседника)
+pub const OP_FILE: u8 = 12;
 pub const OP_BYE: u8 = 11;
 pub use remember_me::server::OP_RELAY_REG;
 
 /// Крипто-режим (список по аналогии с getEncryptionModes у Discord)
-pub const MODE_XCHACHA20POLY1305: u8 = 0;
+// v1 separates audio/control nonce domains. Both clients must support v1.
+pub const MODE_XCHACHA20POLY1305: u8 = 1;
 
 pub const NAME_BYTES: usize = 32;
 pub const TEXT_MAX: usize = 1200;
@@ -42,6 +45,7 @@ pub const AUDIO_PAYLOAD_MAX: usize = 400;
 pub const REASON_DECLINED: u8 = 0;
 pub const REASON_BUSY: u8 = 1;
 pub const REASON_TIMEOUT: u8 = 2;
+pub const REASON_VERSION: u8 = 3;
 pub const REASON_HANGUP: u8 = 0;
 
 #[derive(Debug, Clone)]
@@ -86,6 +90,7 @@ pub enum Packet {
         seq: u32,
         payload: Vec<u8>,
     },
+    File(crate::transfer::FilePacket),
     Text {
         msg_id: u32,
         text: String,
@@ -120,7 +125,7 @@ pub fn classify(b: &[u8]) -> WireClass {
         Some(OP_HELLO) | Some(OP_INCOMING) | Some(OP_ACCEPT) | Some(OP_DECLINE)
         | Some(OP_RELAY_REG) => WireClass::Open,
         Some(OP_PING) | Some(OP_PONG) | Some(OP_AUDIO) | Some(OP_TEXT) | Some(OP_ACK)
-        | Some(OP_STATUS) | Some(OP_BYE) => WireClass::Secure,
+        | Some(OP_STATUS) | Some(OP_BYE) | Some(OP_FILE) => WireClass::Secure,
         Some(_) => WireClass::Unknown,
         None => WireClass::Unknown,
     }
@@ -250,6 +255,10 @@ impl Cipher {
                 pt.extend_from_slice(&msg_id.to_be_bytes());
                 pt.extend_from_slice(&ts_ms.to_be_bytes());
             }
+            Packet::File(file) => {
+                pt.push(OP_FILE);
+                file.encode(&mut pt);
+            }
             Packet::Text { msg_id, text } => {
                 pt.push(OP_TEXT);
                 pt.extend_from_slice(&msg_id.to_be_bytes());
@@ -276,7 +285,7 @@ impl Cipher {
             }
             _ => {}
         }
-        self.encrypt_with(counter, &clear, &pt)
+        self.encrypt_with(counter | (1 << 63), &clear, &pt)
     }
 }
 
@@ -284,6 +293,7 @@ fn op_of(p: &Packet) -> u8 {
     match p {
         Packet::Ping { .. } => OP_PING,
         Packet::Pong { .. } => OP_PONG,
+        Packet::File(_) => OP_FILE,
         Packet::Text { .. } => OP_TEXT,
         Packet::Ack { .. } => OP_ACK,
         Packet::Status { .. } => OP_STATUS,
@@ -442,14 +452,14 @@ impl Packet {
                     payload: pt[1..].to_vec(),
                 })
             }
-            OP_PING | OP_PONG | OP_TEXT | OP_ACK | OP_STATUS | OP_BYE => {
+            OP_PING | OP_PONG | OP_TEXT | OP_ACK | OP_STATUS | OP_BYE | OP_FILE => {
                 let mut b = [0u8; 8];
                 b.copy_from_slice(&clear[1..9]);
                 let counter = u64::from_be_bytes(b);
                 if counter <= *last_ctl {
                     return None;
                 }
-                let pt = Cipher::decrypt_borrow(c, counter, clear, ct)?;
+                let pt = Cipher::decrypt_borrow(c, counter | (1 << 63), clear, ct)?;
                 if pt.len() < 1 {
                     return None;
                 }
@@ -459,6 +469,7 @@ impl Packet {
                 }
                 *last_ctl = counter;
                 match op {
+                    OP_FILE => Some(Packet::File(crate::transfer::FilePacket::decode(body)?)),
                     OP_PING => {
                         if body.len() < 16 {
                             return None;
@@ -539,6 +550,43 @@ mod tests {
     use x25519_dalek::{PublicKey, StaticSecret};
 
     #[test]
+    fn audio_and_file_packets_never_share_a_nonce_keystream() {
+        let mut cipher = Cipher::new(&[17; 32], &[23; 32], true);
+        let audio = Packet::encrypt_wire(
+            &mut cipher,
+            &Packet::Audio {
+                ssrc: 1,
+                seq: 2,
+                payload: vec![0; 64],
+            },
+        );
+        let file = crate::transfer::FilePacket::Chunk {
+            id: 1,
+            index: 0,
+            data: vec![0; 64],
+        };
+        let mut plaintext = vec![OP_FILE];
+        file.encode(&mut plaintext);
+        // Both use counter 2, but the control domain's high nonce bit differs.
+        let wire = Packet::encrypt_wire(&mut cipher, &Packet::File(file));
+        assert_ne!(
+            audio[10..42].to_vec(),
+            wire[10..42]
+                .iter()
+                .zip(&plaintext[1..33])
+                .map(|(c, p)| c ^ p)
+                .collect::<Vec<_>>()
+        );
+        let receiver = Cipher::new(&[17; 32], &[23; 32], false);
+        let (mut ctl, mut seq) = (0, 0);
+        assert!(matches!(
+            Packet::decrypt_wire(&receiver, &wire, &mut ctl, &mut seq),
+            Some(Packet::File(_))
+        ));
+        assert!(Packet::decrypt_wire(&receiver, &wire, &mut ctl, &mut seq).is_none());
+    }
+
+    #[test]
     fn microphone_and_sound_status_survive_encryption_at_all_levels() {
         let mut sender = Cipher::new(&[7; 32], &[9; 32], true);
         let receiver = Cipher::new(&[7; 32], &[9; 32], false);
@@ -588,7 +636,7 @@ mod tests {
         let mut pf = [0u8; 32];
         rand_bytes(&mut pf);
         let mut a = Cipher::new(&sh_a, &pf, true);
-        let mut b = Cipher::new(&sh_b, &pf, false);
+        let b = Cipher::new(&sh_b, &pf, false);
 
         let p1 = Packet::Text {
             msg_id: 7,

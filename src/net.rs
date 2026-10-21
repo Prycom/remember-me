@@ -62,6 +62,15 @@ pub enum NetEvent {
         peer_name: String,
         peer_addr: String,
     },
+    GroupEntered {
+        room: String,
+        server: String,
+    },
+    GroupRoster(Vec<crate::group::Participant>),
+    GroupText {
+        name: String,
+        text: String,
+    },
     Rtt(u16),
     PeerStatus {
         mute_mic: bool,
@@ -70,6 +79,7 @@ pub enum NetEvent {
     },
     PeerSpeaking(bool),
     Text(String),
+    Transfer(crate::transfer::TransferUpdate),
     /// наше сообщение доставлено
     TextAck(u32),
     CallEnded(String),
@@ -83,6 +93,9 @@ pub enum NetCmd {
     AcceptCall,
     DeclineCall,
     Text(String),
+    SendFile(std::path::PathBuf),
+    DownloadDirectory(std::path::PathBuf),
+    CancelFile(u64),
     HangUp { reason: u8 },
     Stop,
 }
@@ -90,8 +103,6 @@ pub enum NetCmd {
 pub struct Session {
     pub events: mpsc::UnboundedReceiver<NetEvent>,
     pub cmd_tx: mpsc::UnboundedSender<NetCmd>,
-    /// канал, через который app пересылает в эту сессию аудио-кадры
-    pub media_tx: mpsc::UnboundedSender<Vec<u8>>,
     pub killed: Arc<AtomicBool>,
     handle: tokio::task::JoinHandle<()>,
 }
@@ -123,23 +134,44 @@ pub enum Start {
 pub fn spawn(start: Start, engine: Arc<AudioEngine>) -> Session {
     let (events_tx, events) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let (media_tx, media_rx) = mpsc::unbounded_channel();
+    let (media_tx, media_rx) = mpsc::channel(crate::audio::MAX_PENDING_AUDIO);
     let killed = Arc::new(AtomicBool::new(false));
     let k2 = killed.clone();
     let handle = tokio::spawn(async move {
+        let _media_route = engine.route_media(media_tx);
         match start {
             Start::Host { cfg } => {
-                run_host(cfg, events_tx, cmd_rx, media_rx, engine, k2).await;
+                if !cfg.server_addr.trim().is_empty() {
+                    let server = cfg.server_addr.clone();
+                    crate::group::run(
+                        cfg,
+                        room_code(),
+                        server,
+                        events_tx,
+                        cmd_rx,
+                        media_rx,
+                        engine,
+                    )
+                    .await;
+                } else {
+                    run_host(cfg, events_tx, cmd_rx, media_rx, engine, k2).await;
+                }
             }
             Start::Joiner { cfg, target } => {
-                run_joiner(cfg, target, events_tx, cmd_rx, media_rx, engine, k2).await;
+                let (room, server) = split_room_target(&target);
+                if let Some(room) = room {
+                    crate::group::run(cfg, room, server, events_tx, cmd_rx, media_rx, engine).await;
+                } else if target.contains('@') {
+                    let _ = events_tx.send(NetEvent::Fatal("неверный код комнаты".into()));
+                } else {
+                    run_joiner(cfg, target, events_tx, cmd_rx, media_rx, engine, k2).await;
+                }
             }
         }
     });
     Session {
         events,
         cmd_tx,
-        media_tx,
         killed,
         handle,
     }
@@ -209,7 +241,7 @@ fn rnd_vec(n: usize) -> Vec<u8> {
     buf
 }
 
-fn rnd32() -> [u8; 32] {
+pub(crate) fn rnd32() -> [u8; 32] {
     let v = rnd_vec(32);
     let mut a = [0u8; 32];
     a.copy_from_slice(&v);
@@ -261,10 +293,13 @@ async fn run_established(
     ssrc_self: u32,
     events: mpsc::UnboundedSender<NetEvent>,
     cmd_rx: &mut mpsc::UnboundedReceiver<NetCmd>,
-    media_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    media_rx: &mut mpsc::Receiver<Vec<u8>>,
     engine: Arc<AudioEngine>,
     accepted_hello: Option<([u8; 32], Packet)>,
+    download_directory: &mut std::path::PathBuf,
 ) -> Outcome {
+    let mut files = crate::transfer::spawn(download_directory.clone());
+    let mut seen_text = VecDeque::new();
     let mut peer = peer0;
     let mut last_ctl_rx: u64 = 0;
     let mut last_audio_seq_rx: u32 = 0;
@@ -282,6 +317,7 @@ async fn run_established(
     let mut last_my_status = (engine.params.mute_mic(), engine.params.deaf());
     let mut buf = vec![0u8; MTU];
 
+    while media_rx.try_recv().is_ok() {}
     engine.prefill_out();
     let mut maintenance = tokio::time::interval(MINOR_SLOT);
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -331,6 +367,7 @@ async fn run_established(
                     eprintln!("[net] rx {} {} от {}", kind, classify(&buf[..n]) == WireClass::Secure, from);
                 }
                 match pkt {
+                    Some(Packet::File(packet)) => { let _ = files.commands.try_send(crate::transfer::Command::Wire(packet)); }
                     Some(Packet::Audio { payload, seq, .. }) => {
                         if payload.len() <= AUDIO_PAYLOAD_MAX {
                             last_audio_seen = Instant::now();
@@ -360,7 +397,11 @@ async fn run_established(
                     }
                     Some(Packet::Text { msg_id, text }) => {
                         send_secure(&sock, &mut cipher, peer, &Packet::Ack { msg_id }).await;
-                        let _ = events.send(NetEvent::Text(text));
+                        if !seen_text.contains(&msg_id) {
+                            seen_text.push_back(msg_id);
+                            if seen_text.len()>256 { seen_text.pop_front(); }
+                            let _ = events.send(NetEvent::Text(text));
+                        }
                     }
                     Some(Packet::Ack { msg_id }) => {
                         let _ = events.send(NetEvent::TextAck(msg_id));
@@ -398,6 +439,11 @@ async fn run_established(
             Some(cmd) = cmd_rx.recv() => {
                 dbg_net!("← cmd {:?}", cmd);
                 match cmd {
+                    NetCmd::SendFile(path) => {
+                        if files.commands.try_send(crate::transfer::Command::Send(path)).is_err() { let _ = events.send(NetEvent::Progress("очередь передачи занята, повторите отправку".into())); }
+                    }
+                    NetCmd::DownloadDirectory(path) => { *download_directory=path.clone(); files.set_directory(path); }
+                    NetCmd::CancelFile(id) => { let _ = files.commands.try_send(crate::transfer::Command::Cancel(id)); }
                     NetCmd::Text(t) => {
                         msg_counter += 1;
                         pending_text.push_back((msg_counter, t.clone(), Instant::now(), 0));
@@ -417,6 +463,11 @@ async fn run_established(
                     NetCmd::AcceptCall | NetCmd::DeclineCall => {}
                 }
             }
+
+            Some(packet) = files.packets.recv() => {
+                send_secure(&sock, &mut cipher, peer, &Packet::File(packet)).await;
+            }
+            Some(update) = files.updates.recv() => { let _ = events.send(NetEvent::Transfer(update)); }
 
             // ── мелкие периодические дела ───────────────────────────────────
             _ = maintenance.tick() => {
@@ -507,7 +558,7 @@ async fn run_host(
     cfg: Config,
     events_tx: mpsc::UnboundedSender<NetEvent>,
     mut cmd_rx: mpsc::UnboundedReceiver<NetCmd>,
-    mut media_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut media_rx: mpsc::Receiver<Vec<u8>>,
     engine: Arc<AudioEngine>,
     killed: Arc<AtomicBool>,
 ) {
@@ -524,6 +575,7 @@ async fn run_host(
         local_addrs: local_addrs(cfg.port),
     });
 
+    let mut download_directory = cfg.download_directory();
     let mut buf = vec![0u8; MTU];
 
     // серверная комната (если настроена): код + периодическая регистрация
@@ -587,6 +639,7 @@ async fn run_host(
                     }
                 }
                 maybe = cmd_rx.recv() => match maybe {
+                    Some(NetCmd::DownloadDirectory(path))=>download_directory=path,
                     Some(NetCmd::Stop) | None => return,
                     _ => {}
                 },
@@ -605,12 +658,15 @@ async fn run_host(
         let (name, pub_key, modes, from) = incoming.unwrap();
 
         if !modes.contains(&MODE_XCHACHA20POLY1305) {
+            let _ = events.send(NetEvent::Progress(
+                "несовместимая версия: обновите клиент у обоих участников".into(),
+            ));
             // несовпадение набора encryption modes (как у Discord) — отклоняем
             send_open(
                 &sock,
                 from,
                 &Packet::Decline {
-                    reason: REASON_DECLINED,
+                    reason: REASON_VERSION,
                 },
             )
             .await;
@@ -640,6 +696,7 @@ async fn run_host(
         while accepted.is_none() {
             tokio::select! {
                 maybe = cmd_rx.recv() => match maybe {
+                    Some(NetCmd::DownloadDirectory(path))=>download_directory=path,
                     Some(NetCmd::AcceptCall) => accepted = Some(true),
                     Some(NetCmd::DeclineCall) => accepted = Some(false),
                     Some(NetCmd::Stop) | None => {
@@ -732,6 +789,7 @@ async fn run_host(
             &mut media_rx,
             engine.clone(),
             Some((pub_key, acc)),
+            &mut download_directory,
         )
         .await;
 
@@ -750,7 +808,7 @@ async fn run_joiner(
     target: String,
     events_tx: mpsc::UnboundedSender<NetEvent>,
     mut cmd_rx: mpsc::UnboundedReceiver<NetCmd>,
-    mut media_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut media_rx: mpsc::Receiver<Vec<u8>>,
     engine: Arc<AudioEngine>,
     killed: Arc<AtomicBool>,
 ) {
@@ -779,6 +837,7 @@ async fn run_joiner(
         );
     }
 
+    let mut download_directory = cfg.download_directory();
     let mut buf = vec![0u8; MTU];
     let relay_addr = if room.is_some() {
         select_addr(&addr_str)
@@ -872,6 +931,7 @@ async fn run_joiner(
                         }
                     }
                     maybe = cmd_rx.recv() => match maybe {
+                    Some(NetCmd::DownloadDirectory(path))=>download_directory=path,
                         Some(NetCmd::Stop | NetCmd::HangUp { .. }) | None => break 'outer,
                         _ => {},
                     },
@@ -910,6 +970,8 @@ async fn run_joiner(
                     Some(Packet::Decline { reason }) => {
                         let msg = if reason == REASON_BUSY {
                             "хост занят другим звонком".to_string()
+                        } else if reason == REASON_VERSION {
+                            "несовместимая версия: обновите клиент у обоих участников".to_string()
                         } else if reason == REASON_TIMEOUT {
                             "хост не подтвердил вызов".to_string()
                         } else {
@@ -968,6 +1030,7 @@ async fn run_joiner(
             &mut media_rx,
             engine.clone(),
             None,
+            &mut download_directory,
         )
         .await;
 

@@ -53,6 +53,10 @@ fn centered_rect(f: &Frame, w: u16, h: u16) -> Rect {
 }
 
 pub fn render(app: &App, f: &mut Frame) {
+    app.chat_hits.borrow_mut().clear();
+    if app.screen != Screen::Call {
+        app.chat_targets.borrow_mut().clear();
+    }
     match app.screen {
         Screen::Home => render_home(app, f),
         Screen::Connect => render_connect(app, f),
@@ -62,6 +66,31 @@ pub fn render(app: &App, f: &mut Frame) {
         Screen::Settings => render_settings(app, f),
     }
     footer(f, app);
+    if let Some(path) = &app.file_input {
+        let area = centered_rect(f, 80, 6);
+        let visible: String = path
+            .chars()
+            .rev()
+            .take(area.width.saturating_sub(5) as usize)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from("Путь к файлу (можно вставить; поддерживается ~/):"),
+                Line::from(format!("{visible}▏")),
+                Line::from("Enter — отправить · Esc — отменить"),
+            ])
+            .block(
+                Block::bordered()
+                    .title(" Отправить файл ")
+                    .border_style(accent()),
+            ),
+            area,
+        );
+    }
 }
 
 // ── HOME ───────────────────────────────────────────────────────────────────
@@ -85,7 +114,10 @@ fn render_home(app: &App, f: &mut Frame) {
         ]),
         Line::from(vec![
             Span::styled(" [S]", accent()),
-            Span::styled("  настройки: громкости, микрофон, устройства", Style::new()),
+            Span::styled(
+                "  настройки: звук, файлы, автообновление · F5 обновить",
+                Style::new(),
+            ),
         ]),
         Line::from(vec![
             Span::styled(" [Q]", accent()),
@@ -250,7 +282,11 @@ fn render_call(app: &App, f: &mut Frame) {
         ..f.area()
     };
     let chunks = Layout::vertical([
-        Constraint::Length(5),
+        Constraint::Length(
+            (4 + app.group_peers.len() as u16)
+                .max(5)
+                .min(area.height.saturating_sub(10).max(5)),
+        ),
         Constraint::Min(4),
         Constraint::Length(2),
         Constraint::Length(3),
@@ -271,31 +307,55 @@ fn render_call(app: &App, f: &mut Frame) {
         if p.mute_mic() { 0 } else { p.in_level() },
         compact,
     )];
-    let ping = match &app.peer {
-        Some(peer) => {
+    let ping = if app.group_room.is_some() {
+        for peer in &app.group_peers {
             rows.push(participant_row(
-                peer.name.clone(),
-                peer.status_known.then_some(peer.mute_mic || peer.deaf),
-                peer.status_known.then_some(peer.deaf),
+                format!(
+                    "{} · {}",
+                    peer.name,
+                    peer.rtt
+                        .map(|n| format!("{n} мс"))
+                        .unwrap_or_else(|| "пинг…".into())
+                ),
+                peer.known.then_some(peer.mute || peer.deaf),
+                peer.known.then_some(peer.deaf),
                 peer.speaking,
-                if peer.mute_mic { 0 } else { p.out_level() },
+                peer.level,
                 compact,
             ));
-            match peer.rtt {
-                Some(ms) => format!("пинг соединения: {ms} мс"),
-                None => "пинг: измеряем…".into(),
-            }
         }
-        None => {
-            rows.push(participant_row(
-                "Ожидаем собеседника".into(),
-                None,
-                None,
-                false,
-                0,
-                compact,
-            ));
-            "соединяемся…".into()
+        format!(
+            "{} участников · {}",
+            app.group_peers.len() + 1,
+            app.group_room.as_deref().unwrap_or_default()
+        )
+    } else {
+        match &app.peer {
+            Some(peer) => {
+                rows.push(participant_row(
+                    peer.name.clone(),
+                    peer.status_known.then_some(peer.mute_mic || peer.deaf),
+                    peer.status_known.then_some(peer.deaf),
+                    peer.speaking,
+                    if peer.mute_mic { 0 } else { p.out_level() },
+                    compact,
+                ));
+                match peer.rtt {
+                    Some(ms) => format!("пинг соединения: {ms} мс"),
+                    None => "пинг: измеряем…".into(),
+                }
+            }
+            None => {
+                rows.push(participant_row(
+                    "Ожидаем собеседника".into(),
+                    None,
+                    None,
+                    false,
+                    0,
+                    compact,
+                ));
+                "соединяемся…".into()
+            }
         }
     };
     let (headers, widths) = if compact {
@@ -328,40 +388,63 @@ fn render_call(app: &App, f: &mut Frame) {
     );
 
     // ── чат
-    let mut lines: Vec<Line> = Vec::new();
-    for l in &app.chat {
-        let who = if l.mine {
-            format!("{} (вы)", l.name)
-        } else {
-            l.name.clone()
-        };
-        let style = if l.mine { accent() } else { green() };
-        let mut spans = vec![
-            Span::styled(format!("{who}:"), style),
-            Span::styled(" ", dim()),
-            Span::raw(l.text.clone()),
-        ];
-        if l.mine {
-            let st = match l.status {
-                0 => Span::styled(" …", dim()),
-                1 => Span::styled(" ✓", green()),
-                2 => Span::styled(" ✗не доставлено", bad()),
-                _ => Span::raw(""),
-            };
-            spans.push(st);
+    let chat_area = chunks[1];
+    let inner = Block::bordered().inner(chat_area);
+    let mut cache = app.chat_layout.borrow_mut();
+    if !cache.as_ref().is_some_and(|c| {
+        c.messages == app.chat.len() && c.width == inner.width && c.selected == app.selected_link
+    }) {
+        let layout = crate::chat_links::layout(&app.chat, inner.width, app.selected_link);
+        *cache = Some(crate::chat_links::LayoutCache {
+            messages: app.chat.len(),
+            width: inner.width,
+            selected: app.selected_link,
+            layout,
+        });
+    }
+    let layout = &cache.as_ref().unwrap().layout;
+    // Targets are only cloned after content/layout changes, not every frame.
+    if app.chat_targets.borrow().as_slice() != layout.targets.as_slice() {
+        *app.chat_targets.borrow_mut() = layout.targets.clone();
+    }
+    let height = inner.height as usize;
+    let mut start = layout.rows.len().saturating_sub(height + app.chat_scroll);
+    if let Some(index) = app.selected_link
+        && let Some(&row) = layout.target_rows.get(index)
+    {
+        if row < start {
+            start = row;
+        } else if row >= start + height {
+            start = row.saturating_sub(height.saturating_sub(1));
         }
-        lines.push(Line::from(spans));
     }
-    let inner_h = chunks[1].height.saturating_sub(2) as usize;
-    let total = lines.len();
-    let start = total.saturating_sub(inner_h + app.chat_scroll);
-    let mut para = Paragraph::new(lines)
-        .block(Block::bordered().title(" переписка  [T] писать · [PgUp/PgDn] листать "))
-        .scroll((start as u16, 0));
-    if app.input_focus {
-        para = para.block(Block::bordered().title(" переписка (ввод) ".fg(Color::Cyan).bold()));
-    }
-    f.render_widget(para, chunks[1]);
+    let mut hits = Vec::new();
+    let lines: Vec<_> = layout
+        .rows
+        .iter()
+        .skip(start)
+        .take(height)
+        .enumerate()
+        .map(|(y, row)| {
+            for &(x, width, index) in &row.hits {
+                hits.push(crate::chat_links::Hit {
+                    area: Rect::new(inner.x + x, inner.y + y as u16, width, 1),
+                    index,
+                });
+            }
+            row.line.clone()
+        })
+        .collect();
+    *app.chat_hits.borrow_mut() = hits;
+    let title = if app.input_focus {
+        " переписка (ввод) "
+    } else {
+        " чат · T текст · F3 файл · F4 отмена · Tab/Enter ссылки "
+    };
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(title)),
+        chat_area,
+    );
 
     // ── ввод/статус
     let (ci, co) = app.engine.current_devices();
@@ -383,7 +466,7 @@ fn render_call(app: &App, f: &mut Frame) {
         ))
     } else {
         Line::from(Span::styled(
-            "[F2] настройки  [T] чат  [M] микро  [D] звук  [U,Y] завершить",
+            "[F2] настройки  [F5] обновить  [T] чат  [M] микро  [D] звук  [U,Y] выйти",
             dim(),
         ))
     };
@@ -396,7 +479,7 @@ fn render_call(app: &App, f: &mut Frame) {
         Span::styled("  [I] сменить", dim()),
     ]);
     let volume_keys = Line::from(Span::styled(
-        "[↑/↓] громкость собеседника  [ / ] микрофон  [A] автогромкость",
+        "[↑/↓] громкость входящего звука  [ / ] усиление входа  [A] автогромкость",
         dim(),
     ));
     f.render_widget(Paragraph::new(vec![line, volume_keys]), chunks[2]);
@@ -411,7 +494,7 @@ fn render_call(app: &App, f: &mut Frame) {
         ),
         Span::styled(
             format!(
-                "Микрофон: {}%  Собеседник: {}%  ",
+                "Усиление входа: {}%  Входящий звук: {}%  ",
                 p.gain_in(),
                 p.gain_peer()
             ),
@@ -439,7 +522,7 @@ fn render_call(app: &App, f: &mut Frame) {
         app.peer
             .as_ref()
             .map(|peer| format!("Соединение: {}", peer.addr))
-            .unwrap_or_else(|| app.status.clone()),
+            .unwrap_or_else(|| app.group_room.clone().unwrap_or_else(|| app.status.clone())),
         dim(),
     ));
     f.render_widget(Paragraph::new(vec![levels, devline, connection]), chunks[3]);
@@ -507,9 +590,12 @@ fn render_settings(app: &App, f: &mut Frame) {
     let rows: Vec<(String, String)> = vec![
         ("имя".into(), cfg.name.clone()),
         ("порт".into(), cfg.port.to_string()),
-        ("громкость микрофона".into(), format!("{}%", p.gain_in())),
         (
-            "громкость собеседника".into(),
+            "усиление входного сигнала".into(),
+            format!("{}%", p.gain_in()),
+        ),
+        (
+            "громкость входящего звука".into(),
             format!("{}%", p.gain_peer()),
         ),
         (
@@ -568,6 +654,18 @@ fn render_settings(app: &App, f: &mut Frame) {
         "шумоподавление".into(),
         if p.noise_suppression() {
             "ВКЛ".into()
+        } else {
+            "ВЫКЛ".into()
+        },
+    ));
+    rows.push((
+        "папка загрузок".into(),
+        cfg.download_directory().display().to_string(),
+    ));
+    rows.push((
+        "автообновление [F5]".into(),
+        if cfg.auto_update {
+            "ВКЛ: GitHub Release test".into()
         } else {
             "ВЫКЛ".into()
         },
@@ -640,6 +738,11 @@ fn render_settings(app: &App, f: &mut Frame) {
     let scroll = (app.settings_sel + 1).saturating_sub(parts[1].height as usize);
     f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), parts[1]);
     let help = match app.settings_sel {
+        crate::app::ROW_AUTO_UPDATE => {
+            "Enter: проверять при запуске · F5: обновить сейчас · перезапуск после звонка"
+        }
+        crate::app::ROW_DOWNLOAD => "Enter: папка для новых файлов · пусто = системная Downloads",
+        crate::app::ROW_GAIN_IN => "←/→: усиление до шумодава и VOX · 100% = ×1, 200% = ×2",
         crate::app::ROW_VAD => "← выше чувствительность · → меньше фонового шума",
         crate::app::ROW_DENOISE => "Enter: подавлять фон и клавиши · обработка на этом ПК",
         crate::app::ROW_FILTER => "Enter: фильтр гула/шипения 80–8000 Гц, без нейросети",
@@ -732,6 +835,52 @@ mod tests {
     use crate::config::Config;
     use ratatui::{Terminal, backend::TestBackend};
 
+    #[test]
+    fn links_have_mouse_hitboxes_and_keyboard_focus_after_scrolling_and_resize() {
+        let mut app = app();
+        app.screen = Screen::Call;
+        for i in 0..20 {
+            app.chat.push(ChatLine {
+                mine: false,
+                name: "Друг".into(),
+                text: format!("строка {i}"),
+                status: 3,
+                attachment: None,
+            });
+        }
+        app.chat.push(ChatLine {
+            mine: false,
+            name: "界".into(),
+            text: "https://example.org/длинная-ссылка?x=1&y=2".into(),
+            status: 3,
+            attachment: None,
+        });
+        draw_size(&app, 40, 20);
+        assert_eq!(app.chat_targets.borrow().len(), 1);
+        assert!(
+            app.chat_hits.borrow().len() >= 2,
+            "wrapped link should have several hitboxes"
+        );
+        for hit in app.chat_hits.borrow().iter() {
+            assert!(hit.area.x + hit.area.width <= 39);
+        }
+        app.on_event(crossterm::event::Event::Key(
+            crossterm::event::KeyCode::Tab.into(),
+        ));
+        assert_eq!(app.selected_link, Some(0));
+        app.chat_scroll = 100;
+        let screen = draw_size(&app, 80, 20);
+        assert!(
+            screen.contains("https://example.org"),
+            "keyboard selection must reveal a scrolled link"
+        );
+        app.scroll_chat(true);
+        assert!(app.selected_link.is_none());
+        app.open_settings();
+        draw(&app, 80);
+        assert!(app.chat_hits.borrow().is_empty());
+    }
+
     fn draw(app: &App, width: u16) -> String {
         draw_size(app, width, 24)
     }
@@ -808,6 +957,7 @@ mod tests {
             name: "Лексей".into(),
             text: "Привет!".into(),
             status: 1,
+            attachment: None,
         });
         for width in [50, 80, 120] {
             let screen = draw(&app, width);

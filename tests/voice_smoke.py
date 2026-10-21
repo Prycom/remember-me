@@ -9,6 +9,7 @@ Run after cargo build --release: python3 tests/voice_smoke.py
 import argparse
 import array
 import fcntl
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import re
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import threading
@@ -43,15 +45,18 @@ class Client:
         self.master = master
         self.log_path = root / (name + ".log")
         self.log_file = self.log_path.open("wb")
-        env = dict(os.environ, XDG_CONFIG_HOME=str(root / name), RM_DEBUG="1", TERM="xterm-256color")
+        env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ.get("PATH", ""),
+                   RM_OPEN_LOG=str(root / "opened.log"), XDG_CONFIG_HOME=str(root / name), RM_DEBUG="1", TERM="xterm-256color")
         self.proc = subprocess.Popen([str(binary), *args], stdin=slave, stdout=slave,
                                      stderr=self.log_file, env=env)
         os.close(slave)
+        self.output_enabled = threading.Event()
+        self.output_enabled.set()
         # A real terminal continuously consumes the rendered TUI as well.
         def drain():
             try:
                 while os.read(master, 65536):
-                    pass
+                    self.output_enabled.wait()
             except OSError:
                 pass
         self.reader = threading.Thread(target=drain, daemon=True)
@@ -74,6 +79,7 @@ class Client:
         raise AssertionError(f"did not see {text!r}: {self.log()[-4000:]}")
 
     def close(self):
+        self.output_enabled.set()
         if self.proc.poll() is None:
             self.proc.terminate()
         try:
@@ -87,7 +93,7 @@ class Client:
 
 
 class LossyRelayProxy:
-    """Preserve separate relay endpoints, and drop exactly the first ACCEPT."""
+    """Preserve relay endpoints; lose the first handshake/roster and file packets."""
     def __init__(self, target):
         self.target = target
         self.front = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -100,6 +106,7 @@ class LossyRelayProxy:
         self.dropped = False
         self.impair_audio = False
         self.audio_lost = 0
+        self.file_lost = 0
         self.threads = []
         self.thread = threading.Thread(target=self.forward, daemon=True)
         self.thread.start()
@@ -118,6 +125,10 @@ class LossyRelayProxy:
                 thread = threading.Thread(target=self.backward, args=(upstream, client), daemon=True)
                 thread.start()
                 self.threads.append(thread)
+            payload = data[17:] if data[:1] == b"\x1b" else data
+            if payload[:1] == b"\x0c" and self.file_lost < 2:
+                self.file_lost += 1
+                continue
             self.upstreams[client].sendto(data, self.target)
 
     def backward(self, upstream, client):
@@ -128,10 +139,11 @@ class LossyRelayProxy:
             except socket.timeout:
                 continue
             with self.lock:
-                if data[:1] == b"\x03" and not self.dropped:
+                if data[:1] in (b"\x03", b"\x1a") and not self.dropped:
                     self.dropped = True
                     continue
-            if self.impair_audio and data[:1] == b"\x07":
+            payload = data[17:] if data[:1] == b"\x1b" else data
+            if self.impair_audio and payload[:1] == b"\x07":
                 audio_count += 1
                 if audio_count % 37 == 0:
                     self.audio_lost += 1
@@ -286,6 +298,10 @@ def check_phrase_envelope(samples):
 
 def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
     root.mkdir()
+    (root / "bin").mkdir()
+    opener = root / "bin" / "xdg-open"
+    opener.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$RM_OPEN_LOG\"\n")
+    opener.chmod(0o700)
     prefix = f"rm_voice_test_{os.getpid()}_{mode}"
     names = {key: f"{prefix}_{key}" for key in ("mic_a", "mic_b", "out_a", "out_b")}
     modules, clients = [], []
@@ -314,7 +330,8 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
             cfg = root / who / "remember-me" / "config.toml"
             cfg.parent.mkdir(parents=True)
             cfg.write_text(f'name = "{who}"\nport = {port}\n'
-                           'noise_gate = true\n'
+                           'noise_gate = true\nauto_update = false\n'
+                           f'download_dir = "{root / ("downloads_" + who)}"\n'
                            f'input_device = "Monitor of {names["mic_" + who]}"\n'
                            f'output_device = "{names["out_" + who]}"\n'
                            f'server_addr = "{server if who == "a" else ""}"\n')
@@ -371,6 +388,56 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
         assert "@rm2\t0\ta\tA:Ж" in peer_history.read_text()
         print("  actual terminal Shift/punctuation/Unicode/repeating Backspace + named history: PASS", flush=True)
 
+        # Open a real chat link by SGR mouse and by keyboard. The opener is a
+        # private test stub: no browser or external network is launched.
+        url = "https://example.org/voice?a=1&b=2"
+        host.key("t\x1b[200~" + url + "\x1b[201~\r")
+        time.sleep(0.3)
+        joiner.key("\x1b[<0;10;8M\x1b[<0;10;8m")
+        host.key("\t\r")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            opened = root / "opened.log"
+            if opened.exists() and opened.read_text().splitlines().count(url) == 2:
+                break
+            time.sleep(0.05)
+        assert opened.read_text().splitlines() == [url, url], "mouse/keyboard link opener lost URL arguments"
+        print("  chat links: mouse + Tab/Enter open exact browser URL: PASS", flush=True)
+        # Change the receiver directory live; then transfer in both directions
+        # while audio is active. Existing names must be preserved.
+        custom = root / "chosen downloads"
+        custom.mkdir()
+        joiner.key("\x1bOQ")
+        time.sleep(0.15)
+        joiner.key("\x1b[B" * 14 + "\r")
+        time.sleep(0.15)
+        joiner.key("\x7f" * len(str(root / "downloads_b")))
+        joiner.key("\x1b[200~" + str(custom) + "\x1b[201~\r\x1b")
+        time.sleep(0.2)
+        cfg_b = tomllib.loads((root / "b" / "remember-me" / "config.toml").read_text())
+        assert cfg_b["download_dir"] == str(custom), cfg_b
+        source = root / "packet data.bin"
+        source.write_bytes(random.Random(42).randbytes(1024 * 1024 + 57))
+        reverse = root / "ответ.bin"
+        reverse.write_bytes(random.Random(17).randbytes(384 * 1024 + 1))
+        (custom / source.name).write_bytes(b"keep existing file")
+        host.key("\x1bOR\x1b[200~" + str(source) + "\x1b[201~\r")
+        joiner.key("\x1bOR\x1b[200~" + str(reverse) + "\x1b[201~\r")
+        measure(root, names["mic_a"], names["out_b"], long, True, "voice during simultaneous file transfers")
+        received = custom / "packet data (1).bin"
+        returned = root / "downloads_a" / reverse.name
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (received.exists() and returned.exists()):
+            time.sleep(0.05)
+        assert hashlib.sha256(received.read_bytes()).digest() == hashlib.sha256(source.read_bytes()).digest()
+        assert hashlib.sha256(returned.read_bytes()).digest() == hashlib.sha256(reverse.read_bytes()).digest()
+        assert (custom / source.name).read_bytes() == b"keep existing file"
+        assert not list(custom.glob("*.part"))
+        assert "@rm3\t" in own_history.read_text() and "@rm3\t" in peer_history.read_text()
+        if proxy:
+            assert proxy.file_lost == 2, "file packet loss was not exercised"
+        print("  files: bidirectional + live folder + SHA-256 + collisions + history: PASS", flush=True)
+
         host.key("tDraft:")
         host.key("\x1bOQ")  # F2, even while composing a message
         time.sleep(0.2)
@@ -401,7 +468,7 @@ def scenario(binary, root, mode, relay_binary=None, drop_first_accept=False):
         after = noise_metrics(measure(root, names["mic_a"], names["out_b"], noisy,
                                       None, "speech + background/keys, suppression ON", allow_pauses=True))
         assert after[0] < max(0.0005, before[0] * 0.15), f"residual background: {before} -> {after}"
-        assert after[1] > 0.04, f"speech damaged: {after}"
+        assert after[1] > max(0.04, before[1] * 0.75), f"speech damaged: {before} -> {after}"
         print(f"  denoiser: background {before[0]:.6f} -> {after[0]:.6f}, "
               f"speech {before[1]:.4f} -> {after[1]:.4f}: PASS", flush=True)
         host.key("\r")  # exact bypass: existing synthetic-tone tests still pass
@@ -476,13 +543,18 @@ def main():
     parser.add_argument("--relay-binary", type=Path,
                         help="use a standalone remember-me-server for relay mode")
     parser.add_argument("--drop-first-accept", action="store_true",
-                        help="simulate losing the initial ACCEPT in relay mode")
+                        help="legacy alias; the group scenario always exercises roster/file/audio packet loss")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     relay_binary = args.relay_binary.resolve(strict=True) if args.relay_binary else None
     with tempfile.TemporaryDirectory(prefix="remember-me-voice-") as tmp:
         for mode in ("direct", "relay") if args.mode == "both" else (args.mode,):
-            scenario(binary, Path(tmp) / mode, mode, relay_binary, args.drop_first_accept)
+            if mode=="relay":
+                command=[sys.executable,str(Path(__file__).with_name("group_smoke.py")),"--binary",str(binary)]
+                if relay_binary:command += ["--relay-binary",str(relay_binary)]
+                subprocess.run(command,check=True)
+            else:
+                scenario(binary, Path(tmp) / mode, mode, relay_binary, args.drop_first_accept)
 
 
 if __name__ == "__main__":
