@@ -142,6 +142,14 @@ impl SpeechLeveler {
         *self = Self::default();
     }
 
+    /// Bootstrap an utterance from its unsuppressed, preamp-independent level.
+    /// Earlier buffered consonants use this same gain, without learning noise.
+    pub fn prime(&mut self, reference_rms: f32, automatic: bool) {
+        if automatic && self.count == 0 && reference_rms.is_finite() && reference_rms > 0.0001 {
+            self.gain = (TARGET_RMS / reference_rms).clamp(0.125, MAX_GAIN);
+        }
+    }
+
     #[cfg(test)]
     pub fn process(&mut self, frame: &mut [f32], speech: bool, automatic: bool, volume: f32) {
         for sample in frame.iter_mut() {

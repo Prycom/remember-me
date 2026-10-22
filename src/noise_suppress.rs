@@ -1,53 +1,83 @@
-//! Optional local RNNoise denoising. All processing stays on the encoder
-//! thread; the built-in quantized model is part of the executable.
-
+//! Local RNNoise plus a bounded, independent check for quiet voiced onsets.
 use nnnoiseless::{DenoiseState, RnnModel};
 
-// Calibrate the model eight times below full i16 scale. At full scale it
-// mistakes louder clean speech for noise. The inverse scale preserves level
-// and leaves headroom for the user's input preamp.
+// Keep the established model calibration: changing this also changes its masks.
 const MODEL_SCALE: f32 = 4_096.0;
 
 pub struct NoiseSuppressor {
     state: Option<Box<DenoiseState<'static>>>,
     dry_delay: [f32; 480],
+    history: [f32; 160],
+    aligned: Vec<f32>,
     speech_hold: u8,
+    attack: u8,
+    quiet_blocks: u16,
     dry_mix: f32,
+    noise_rms: f32,
+    background_mean: f32,
+    background_variance: f32,
+    background_age: u16,
+    activity: f32,
+    reference: f32,
 }
-
 impl Default for NoiseSuppressor {
     fn default() -> Self {
         Self {
             state: None,
             dry_delay: [0.0; 480],
+            history: [0.0; 160],
+            aligned: Vec::new(),
             speech_hold: 0,
+            attack: 0,
+            quiet_blocks: 0,
             dry_mix: 0.0,
+            noise_rms: 0.0,
+            background_mean: 0.0,
+            background_variance: 0.0,
+            background_age: 0,
+            activity: 0.0,
+            reference: 0.0,
         }
     }
 }
-
 impl NoiseSuppressor {
-    /// Input/output are normalized 48 kHz mono PCM. RNNoise works on 10 ms
-    /// blocks in i16-scale floats, with one block of algorithmic delay.
-    /// Disabled mode is an exact bypass and releases per-stream RNN state.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+    pub fn activity_level(&self) -> f32 {
+        self.activity
+    }
+    pub fn reference_rms(&self) -> f32 {
+        self.reference
+    }
+    pub fn aligned_input(&self) -> &[f32] {
+        &self.aligned
+    }
+
+    /// Probability is advisory: weak RNNoise confidence must not veto a voiced
+    /// onset. All evidence and the dry path refer to the same delayed samples.
+    /// Disabled mode is bit-exact. Steady-state processing allocates nothing.
     pub fn process(&mut self, samples: &mut [f32], enabled: bool) -> Option<f32> {
         if !enabled {
             if self.state.is_some() {
-                *self = Self::default();
+                self.reset();
             }
             return None;
         }
         debug_assert_eq!(samples.len() % DenoiseState::FRAME_SIZE, 0);
-        let state = self.state.get_or_insert_with(|| {
-            DenoiseState::from_model(
+        self.aligned.resize(samples.len(), 0.0);
+        if self.state.is_none() {
+            self.state = Some(DenoiseState::from_model(
                 RnnModel::from_static_bytes(include_bytes!("../assets/voice.rnn"))
                     .expect("bundled voice model"),
-            )
-        });
+            ));
+        }
         let mut probability = 0.0_f32;
-        let mut input = [0.0; DenoiseState::FRAME_SIZE];
-        let mut output = [0.0; DenoiseState::FRAME_SIZE];
-        for chunk in samples.chunks_exact_mut(DenoiseState::FRAME_SIZE) {
+        let mut reference_energy = 0.0;
+        let mut activity_energy = 0.0;
+        let mut input = [0.0; 480];
+        let mut output = [0.0; 480];
+        for (block, chunk) in samples.chunks_exact_mut(480).enumerate() {
             for (dst, src) in input.iter_mut().zip(chunk.iter()) {
                 *dst = if src.is_finite() {
                     src.clamp(-8.0, 8.0) * MODEL_SCALE
@@ -55,22 +85,130 @@ impl NoiseSuppressor {
                     0.0
                 };
             }
-            let p = state.process_frame(&mut output, &input);
+            // RNNoise does not update its GRU on digital silence. Clear a
+            // previous background's recurrent context after a quiet pause.
+            if input.iter().all(|s| s.abs() < MODEL_SCALE * 0.00002) {
+                self.quiet_blocks = self.quiet_blocks.saturating_add(1);
+                if self.quiet_blocks == 50 {
+                    self.state = Some(DenoiseState::from_model(
+                        RnnModel::from_static_bytes(include_bytes!("../assets/voice.rnn"))
+                            .expect("bundled voice model"),
+                    ));
+                }
+            } else {
+                self.quiet_blocks = 0;
+            }
+            let p = self
+                .state
+                .as_mut()
+                .unwrap()
+                .process_frame(&mut output, &input);
             probability = probability.max(p);
-            if p >= 0.6 {
+            let raw = (self.dry_delay.iter().map(|s| s * s).sum::<f32>() / 480.0).sqrt();
+            let wet = (output
+                .iter()
+                .filter(|s| s.is_finite())
+                .map(|s| (s / MODEL_SCALE).powi(2))
+                .sum::<f32>()
+                / 480.0)
+                .sqrt();
+            let retention = wet / raw.max(1e-9);
+            // A disappearing fan must not leave a stale high floor that rejects
+            // the next quiet reply. This path can only lower the estimate.
+            if raw < self.noise_rms {
+                let rate = if raw < self.noise_rms * 0.5 {
+                    0.2
+                } else {
+                    0.005
+                };
+                self.noise_rms += (raw - self.noise_rms) * rate;
+            }
+
+            // A fan/hum may be periodic too. Learn an uncertain but sustained,
+            // stationary background over 600 ms, never from a short answer.
+            if self.background_mean == 0.0 {
+                self.background_mean = raw;
+            }
+            let delta = raw - self.background_mean;
+            self.background_mean += delta * 0.02;
+            self.background_variance += (delta * delta - self.background_variance) * 0.02;
+            let stationary = self.background_variance.sqrt() < self.background_mean * 0.35;
+            if p >= 0.15 || raw < 0.00005 {
+                self.background_age = 0;
+            } else if stationary {
+                self.background_age = (self.background_age + 1).min(200);
+            } else {
+                self.background_age = self.background_age.saturating_sub(4);
+            }
+            if self.background_age >= 60 && stationary && p < 0.15 {
+                self.noise_rms = self.noise_rms.max(self.background_mean * 0.85);
+            }
+
+            self.history.copy_within(80..160, 0);
+            for (dst, group) in self.history[80..]
+                .iter_mut()
+                .zip(self.dry_delay.chunks_exact(6))
+            {
+                *dst = group.iter().sum::<f32>() / 6.0;
+            }
+            // Skip the autocorrelation work on a confidently classified frame
+            // or a strongly suppressed background. 8 kHz / 20 ms history.
+            let periodicity = if p < 0.35 && raw > 0.0001 && retention > 0.04 {
+                periodicity(&self.history)
+            } else {
+                0.0
+            };
+            let tonal = ((periodicity - 0.35) / 0.3).clamp(0.0, 1.0);
+            let retained = ((retention - 0.04) / 0.10).clamp(0.0, 1.0);
+            let snr = if self.noise_rms > 0.00001 {
+                ((raw / self.noise_rms - 1.3) / 1.7).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let evidence = ((p - 0.025) / 0.25)
+                .clamp(0.0, 1.0)
+                .max(tonal * retained * snr);
+            // Do not learn rejected, but periodic, speech as the noise floor.
+            if self.background_age >= 30
+                && stationary
+                && p < 0.05
+                && periodicity < 0.35
+                && retention < 0.08
+            {
+                if self.noise_rms == 0.0 {
+                    self.noise_rms = raw;
+                } else {
+                    self.noise_rms +=
+                        (raw - self.noise_rms) * if raw < self.noise_rms { 0.1 } else { 0.005 };
+                }
+            }
+            self.attack = if evidence >= 0.25 {
+                (self.attack + 1).min(3)
+            } else {
+                self.attack.saturating_sub(1)
+            };
+            let voiced_onset = periodicity > 0.6 && evidence > 0.15 && snr > 0.5;
+            let detected = self.attack >= 2 || p >= 0.6 || voiced_onset;
+            if detected {
                 self.speech_hold = 20;
             } else {
                 self.speech_hold = self.speech_hold.saturating_sub(1);
             }
-            // Preserve natural dynamics during speech instead of letting an
-            // occasional erroneous band mask erase a syllable. Background-only
-            // frames remain fully denoised. Align the dry path to RNNoise's
-            // 10 ms delay; an unaligned mix causes comb filtering/buzz.
-            let target = if self.speech_hold > 0 { 0.35 } else { 0.0 };
-            let step = (target - self.dry_mix) / chunk.len() as f32;
+            reference_energy += raw * raw * 480.0;
+            let activity_weight = if detected { 1.0 } else { 0.0 };
+            activity_energy += raw * raw * activity_weight * activity_weight * 480.0;
+            let target = if self.speech_hold > 0 {
+                // Keep the established cleaning during confident speech. Add
+                // protection only for an independently verified weak onset.
+                0.35 + 0.15 * tonal * retained * snr
+            } else {
+                0.0
+            };
+            let step = (target - self.dry_mix) / 480.0;
             for (i, (dst, wet)) in chunk.iter_mut().zip(output).enumerate() {
                 self.dry_mix += step;
                 let dry = self.dry_delay[i];
+                self.aligned[block * 480 + i] = dry;
                 self.dry_delay[i] = input[i] / MODEL_SCALE;
                 let wet = if wet.is_finite() {
                     wet / MODEL_SCALE
@@ -81,13 +219,36 @@ impl NoiseSuppressor {
             }
             self.dry_mix = target;
         }
+        self.reference = (reference_energy / samples.len().max(1) as f32).sqrt();
+        self.activity = (activity_energy / samples.len().max(1) as f32).sqrt();
         Some(probability)
     }
+}
+
+fn periodicity(samples: &[f32; 160]) -> f32 {
+    // Whiten first: a slowly changing fan/AR noise is correlated at short
+    // lags too. Pre-emphasis removes that slope before measuring coherence.
+    let mut whitened = [0.0_f32; 160];
+    for i in 1..160 {
+        whitened[i] = samples[i] - 0.95 * samples[i - 1];
+    }
+    let mut best = 0.0_f32;
+    for lag in 12..80 {
+        let (mut ab, mut aa, mut bb) = (0.0, 0.0, 0.0);
+        for (a, b) in whitened[1..].iter().zip(whitened[1 + lag..].iter()) {
+            ab += a * b;
+            aa += a * a;
+            bb += b * b;
+        }
+        best = best.max(ab / (aa * bb).sqrt().max(1e-12));
+    }
+    best
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    include!("noise_regressions.rs");
 
     fn noise_frame(seed: &mut u32) -> Vec<f32> {
         (0..960)

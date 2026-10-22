@@ -1,10 +1,11 @@
 Rolling test builds for Linux x86_64 and Windows 10/11 x64.
 
-- GIF frames are prepared before playback starts; resizing prepares the new size before animation resumes. No coarse placeholder frames during the first loop.
-- Clipboard pictures use temporary files, deleted on normal exit or cancelled insertion. Choose their folder in F2 settings.
-- Chat history lives in platform state storage, separate from settings. Existing logs and permanent clipboard attachments migrate without being discarded.
-- Repository cleanup, concise README and automatic privacy checks. Commit identities use GitHub noreply addresses.
-- Group voice for up to 16 participants, chat, consent-based file transfers, terminal media previews and customizable avatars remain available.
+- Short replies no longer depend on RNNoise reaching a fixed speech-probability threshold before VOX or automatic gain can work. Quiet voiced onsets have an independent lightweight check.
+- VOX retains up to 60 ms before an onset. The bounded burst fits the existing media queue; microphone gain still affects the result.
+- Background estimates adapt to stationary noise and recover when the noise disappears. Established cleaning remains unchanged during confident speech; extra preservation is limited to weak voiced onsets.
+- Mute, PTT, device and capture-setting changes invalidate queued PCM, resampler state and onset buffers. Previously blocked speech is not replayed after re-enabling the microphone.
+- Regression coverage includes isolated 80/160/320 ms speech through Opus, low-pitch signals, changing backgrounds, hum, keyboard impacts and the actual media queue.
+- Existing group rooms, chat, consent-based files, terminal media previews and avatars remain available.
 
 Update the clients with F5 and restart. No relay update is required for these changes.
 

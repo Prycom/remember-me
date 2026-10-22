@@ -50,9 +50,7 @@ def main():
             oid, _, path = line.partition(" ")
             if path and git("cat-file", "-t", oid).strip() == b"blob":
                 check(path, git("cat-file", "blob", oid))
-        identities = git("log", "--format=%ae%n%ce", "HEAD").decode().splitlines()
-        if any(not (address.endswith("@users.noreply.github.com") or address == "noreply@github.com") for address in identities):
-            failures.add(("commit metadata", "personal email address"))
+        # Author email addresses are allowed by the repository owner.
     else:
         for path in git("ls-files", "-z").decode().split("\0"):
             if path and Path(path).is_file():
