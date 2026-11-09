@@ -1,0 +1,29 @@
+[Unit]
+Description=remember-me-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Пользователь, от которого работает сервис (поменяй при необходимости)
+User=rememberme
+Group=rememberme
+
+# Путь к бинарнику и рабочая директория (поменяй под своё расположение)
+WorkingDirectory=/opt/remember-me
+ExecStart=/opt/remember-me/remember-me-server
+
+# Перезапуск при падении
+Restart=on-failure
+RestartSec=5
+
+# Логи уходят в journald: journalctl -u remember-me-server -f
+
+# Базовое ограничение прав
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
